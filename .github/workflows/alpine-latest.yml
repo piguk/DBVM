@@ -1,0 +1,72 @@
+name: Alpine latest-stable
+
+# Weekly regression against whatever Alpine currently ships as latest-stable.
+# On success it refreshes the "最近验证" marker in docs/vm.md and opens a PR.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: alpine-latest
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-and-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+      - name: Fetch latest Alpine minirootfs
+        run: scripts/fetch-alpine-rootfs.sh "$RUNNER_TEMP" | tee -a "$GITHUB_ENV"
+
+      - name: Import, verify and execute
+        run: |
+          db="$RUNNER_TEMP/alpine.vm.db"
+          ./target/release/self vm-init "$db" --force
+          ./target/release/self vm-import-rootfs "$db" "$ALPINE_TARBALL"
+          ./target/release/self vm-verify "$db"
+          got=$(./target/release/self vm-cat "$db" /etc/alpine-release | tr -d '[:space:]')
+          [ "$got" = "$ALPINE_VERSION" ]
+          [ "$(./target/release/self vm-exec "$db" /bin/busybox -- echo ok)" = "ok" ]
+
+      - name: Open PR when the verified version moved
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          marker='最近验证：Alpine '
+          current=$(sed -n "s/.*${marker}\([0-9][0-9.]*\)。.*/\1/p" docs/vm.md)
+          if [ "$current" = "$ALPINE_VERSION" ]; then
+            echo "docs already record ${ALPINE_VERSION}"
+            exit 0
+          fi
+
+          branch="docs/alpine-${ALPINE_VERSION}"
+          # Never force-push: an existing branch means the PR is already open.
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "branch ${branch} already exists, leaving it alone"
+            exit 0
+          fi
+
+          sed -i "s/${marker}${current}。/${marker}${ALPINE_VERSION}。/" docs/vm.md
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          git commit -am "docs: alpine latest-stable is now ${ALPINE_VERSION}"
+          git push -u origin "$branch"
+          gh pr create \
+            --title "docs: alpine latest-stable is now ${ALPINE_VERSION}" \
+            --body "\`latest-stable\` moved ${current} -> ${ALPINE_VERSION} (${ALPINE_BRANCH}). Import, \`vm-verify\` and \`vm-exec\` passed on this run.
+
+          Counts and sizes quoted elsewhere in the docs are from an older release and were not re-measured."

@@ -31,4 +31,4 @@ echo "VM   $(stat -c%s "$VM") bytes  (vm_fs=$(sqlite3 "$VM" 'SELECT count(*) FRO
 "$SELF" vm-checkpoint "$VM" bench --note "size.sh" >/dev/null 2>&1 || true
 "$SELF" vm-verify "$VM" | sed 's/^/VM verify: /'
 
-ls -lh /tmp/c.db | awk '{print "size",$5}'
+echo "closure db $(stat -c%s /tmp/c.db) bytes"
