@@ -68,15 +68,21 @@ dbvm snapshot before-upgrade --file      # 另存整库 -> <db>.snap.before-upgr
 dbvm restore before-upgrade
 ```
 
-## dbvm run 需要 bwrap、unshare 或 root
+## 运行 guest 程序需要 Linux
 
-进入实例要用命名空间。容器、CI、macOS 上往往三者都不可用，这时用 `dbvm exec` 执行单个程序：
+`dbvm run` 要进入命名空间，需要 bwrap、unshare 或 root。容器和 CI 里这三者常常都不可用，
+可以用 `dbvm exec` 执行单个程序，它不需要任何权限：
 
 ```sh
 dbvm exec /bin/busybox -- echo hi
 ```
 
-`exec` 只把目标二进制与其依赖库落盘，无需任何权限，代价是看不到实例里的其他文件。
+代价是只把目标二进制与其依赖库落盘，看不到实例里的其他文件。
+
+**macOS 上 `run` 和 `exec` 都不可用**：实例里是 Linux ELF，XNU 只能执行 Mach-O，装 bwrap 也没有用
+（它本身就是 Linux user namespaces 的封装）。其余命令在 macOS 上正常工作——建库、导入、查看、
+提取、快照、校验都可以，只是不能运行里面的程序。要真正运行，用 Linux 主机或虚拟机
+（OrbStack、Lima、Docker、UTM）。
 
 ## 多个实例
 

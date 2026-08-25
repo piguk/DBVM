@@ -237,6 +237,33 @@ fn open_for_write(db: &str) -> anyhow::Result<Connection> {
     dbvm::vm::init_vm_db(db, true)
 }
 
+fn is_elf(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && &magic == b"\x7fELF"
+}
+
+/// Entering the instance needs Linux namespaces, and the guest binaries are Linux ELF.
+/// Neither exists on other kernels, so say that instead of suggesting bwrap.
+#[cfg(not(target_os = "linux"))]
+fn require_linux() -> anyhow::Result<()> {
+    anyhow::bail!(
+        "`dbvm run` needs a Linux kernel: the instance holds Linux ELF binaries, which {} \
+         cannot execute, and there are no user namespaces to enter.\n\
+         Working here: ls, cat, stat, cp, extract, materialize, import, snapshot, verify.\n\
+         To run the userland, use a Linux host or a VM (OrbStack, Lima, Docker, UTM).",
+        std::env::consts::OS
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn require_linux() -> anyhow::Result<()> {
+    Ok(())
+}
+
 /// Run `argv` with output discarded and report whether it succeeded.
 fn probe(argv: &[&str]) -> bool {
     let Some((prog, args)) = argv.split_first() else {
@@ -777,9 +804,21 @@ fn exec_binary(conn: &Connection, vm_path: &str, argv: &[String]) -> anyhow::Res
     } else {
         format!("{}:{}:{}", tmp.to_string_lossy(), vm_ld, env_ld)
     };
+    // Without this the failure surfaces as sh trying to parse the ELF: execvp falls
+    // back to /bin/sh on ENOEXEC, which then reports "cannot execute binary file".
+    if !cfg!(target_os = "linux") && is_elf(&host_bin) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        anyhow::bail!(
+            "{} is a Linux ELF binary and this host is {}, which cannot execute it.\n\
+             Use a Linux host or a VM (OrbStack, Lima, Docker, UTM); `dbvm cat` and \
+             `dbvm extract` work here regardless.",
+            vm_path,
+            std::env::consts::OS
+        );
+    }
     let mut args = Vec::new();
     args.extend(rest.clone());
-    let exe = std::env::var("SELF_EXEC").unwrap_or_else(|_| "target/release/self-exec".to_string());
+    let exe = self_exec_path();
     let is_self = {
         let mut f = std::fs::File::open(&host_bin).unwrap();
         use std::io::{Read, Seek, SeekFrom};
@@ -848,6 +887,7 @@ fn run_in_instance(
     argv: &[String],
     verbose: bool,
 ) -> anyhow::Result<i32> {
+    require_linux()?;
     let c = conn;
     let (cmd, rest): (String, Vec<String>) = match argv.split_first() {
         Some((first, tail)) => (first.clone(), tail.to_vec()),

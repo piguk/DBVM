@@ -45,13 +45,21 @@ dbvm -v run true                            # 打印 scratch 目录、后端、s
 ```
 
 `dbvm exec` 是无权限的替代路径：只 materialize 目标二进制与其依赖库，不进命名空间，
-因此 guest 的 rootfs 与 PATH 不可见。CI 与 macOS 上用它。
+因此 guest 的 rootfs 与 PATH 不可见。CI 等拿不到命名空间的 Linux 环境里用它。
 
 ```sh
 dbvm exec /bin/busybox -- echo hi
 dbvm exec /sbin/apk -- --version
 # musl: /lib/ld-musl-<arch>.so.1（与 glibc 不同，LD_LIBRARY_PATH 仅对二次库生效，主解释器需显式派遣）
 ```
+
+### 非 Linux 主机
+
+macOS 上 `run` 和 `exec` 都会直接报错：guest 是 Linux ELF，XNU 只执行 Mach-O，
+且没有 user namespaces 可进（bwrap 是 Linux namespaces 的封装，装不了也没有意义）。
+不执行 guest 代码的命令不受影响——`init`/`import-rootfs`/`ls`/`cat`/`stat`/`cp`/`extract`/
+`materialize`/`snapshot`/`restore`/`verify`/`gc` 都可用，可以在 macOS 上构建与检查实例，
+再拿到 Linux 上运行。
 
 ## 导入 Alpine
 
