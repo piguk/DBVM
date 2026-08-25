@@ -1,11 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
-use rusqlite::{Connection, params};
-use rustc_hash::FxHashMap;
-use selfdb::{
+use dbvm::{
     db::create_self_db,
     elf::{ElfMeta, parse_elf},
 };
+use rusqlite::{Connection, params};
+use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -48,11 +48,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn bundle_closure(
-    input: &str,
-    output: &str,
-    info: &selfdb::elf::ElfInfo,
-) -> Result<(usize, usize)> {
+fn bundle_closure(input: &str, output: &str, info: &dbvm::elf::ElfInfo) -> Result<(usize, usize)> {
     let inp_real = std::fs::canonicalize(input).unwrap_or(PathBuf::from(input));
     let interp = info.interp.clone();
     let conn = Connection::open(output)?;
@@ -68,7 +64,7 @@ fn bundle_closure(
     let mut seen: FxHashMap<PathBuf, String> = FxHashMap::default();
     let mut order: Vec<(PathBuf, Option<String>, String)> = Vec::new();
     let soname_of_cached = |path: &Path, cache: &mut FxHashMap<PathBuf, ElfMeta>| {
-        selfdb::elf::soname_for_path_cached(path, cache)
+        dbvm::elf::soname_for_path_cached(path, cache)
     };
     let add = |path: PathBuf,
                kind: &str,
@@ -111,19 +107,19 @@ fn bundle_closure(
     while qh < qvec.len() {
         let cur = qvec[qh].clone();
         qh += 1;
-        let sdirs = selfdb::closure::search_dirs_for_cached(
+        let sdirs = dbvm::closure::search_dirs_for_cached(
             &cur,
             &[],
             &mut meta_cache,
             &mut search_cache,
             &ld_dirs,
         );
-        let search_hash = selfdb::closure::search_dirs_hash(&sdirs);
-        let needed = selfdb::elf::meta_for_path_cached(&cur, &mut meta_cache)
+        let search_hash = dbvm::closure::search_dirs_hash(&sdirs);
+        let needed = dbvm::elf::meta_for_path_cached(&cur, &mut meta_cache)
             .needed
             .clone();
         for soname in needed {
-            if let Some(rp) = selfdb::closure::resolve_soname_cached(
+            if let Some(rp) = dbvm::closure::resolve_soname_cached(
                 &soname,
                 &sdirs,
                 &mut resolve_cache,
@@ -164,21 +160,21 @@ fn bundle_closure(
     let mut needs = 0;
     for (rp, _, _) in &order {
         if let Some(oid) = path_to_id.get(rp) {
-            let sdirs = selfdb::closure::search_dirs_for_cached(
+            let sdirs = dbvm::closure::search_dirs_for_cached(
                 rp,
                 &[],
                 &mut meta_cache,
                 &mut search_cache,
                 &ld_dirs,
             );
-            let search_hash = selfdb::closure::search_dirs_hash(&sdirs);
-            for (n, soname) in selfdb::elf::meta_for_path_cached(rp, &mut meta_cache)
+            let search_hash = dbvm::closure::search_dirs_hash(&sdirs);
+            for (n, soname) in dbvm::elf::meta_for_path_cached(rp, &mut meta_cache)
                 .needed
                 .clone()
                 .iter()
                 .enumerate()
             {
-                let resolved = selfdb::closure::resolve_soname_cached(
+                let resolved = dbvm::closure::resolve_soname_cached(
                     soname,
                     &sdirs,
                     &mut resolve_cache,

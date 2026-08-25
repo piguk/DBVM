@@ -33,16 +33,16 @@ type VmResolveRow = (String, Option<Vec<u8>>, Option<String>, i64, Option<i64>);
 type VmFsEntry = (String, Option<Vec<u8>>, Option<String>, i64);
 
 fn cache_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("SELF_VM_CACHE") {
+    if let Ok(p) = std::env::var("DBVM_CACHE") {
         return PathBuf::from(p);
     }
     if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(x).join("self-vm");
+        return PathBuf::from(x).join("dbvm/blobs");
     }
     if let Ok(h) = std::env::var("HOME") {
-        return PathBuf::from(h).join(".cache/self-vm");
+        return PathBuf::from(h).join(".cache/dbvm/blobs");
     }
-    PathBuf::from("/tmp/self-vm-cache")
+    PathBuf::from("/tmp/dbvm-blobs")
 }
 fn cache_path_for_hash(hash: &str) -> PathBuf {
     let dir = cache_dir();
@@ -430,13 +430,8 @@ pub fn vm_import_closure(conn: &Connection, host_elf: &str, vm_prefix: &str) -> 
 }
 pub fn vm_ls(conn: &Connection, vm_path: &str) -> Result<Vec<VmDirEntry>> {
     let p = normalize_vm_path(vm_path);
-    let cnt: i64 = conn.query_row(
-        "SELECT count(*) FROM vm_fs WHERE path=?1",
-        params![p],
-        |r| r.get(0),
-    )?;
-    if cnt > 0 {
-        let row: VmDirEntry = conn.query_row(
+    let entry: Option<VmDirEntry> = conn
+        .query_row(
             "SELECT path,kind,mode,size,coalesce(hash,'') FROM vm_fs WHERE path=?1",
             params![p],
             |r| {
@@ -448,8 +443,13 @@ pub fn vm_ls(conn: &Connection, vm_path: &str) -> Result<Vec<VmDirEntry>> {
                     r.get::<_, String>(4)?,
                 ))
             },
-        )?;
-        return Ok(vec![row]);
+        )
+        .optional()?;
+    // A directory lists its children; anything else lists as itself.
+    match &entry {
+        Some((_, kind, ..)) if kind != "dir" => return Ok(vec![entry.unwrap()]),
+        None if p != "/" => return Err(anyhow!("not found: {}", p)),
+        _ => {}
     }
     let like = if p == "/" {
         "/%".to_string()
@@ -550,7 +550,7 @@ pub fn vm_resolve(conn: &Connection, vm_path: &str) -> Result<VmResolved> {
             .optional()?;
         let (kind, content_opt, link, mode, compressed) = match row {
             Some(x) => x,
-            None => return Err(anyhow!("not found in VM: {}", cur)),
+            None => return Err(anyhow!("not found: {}", cur)),
         };
         if kind != "symlink" {
             let content = match content_opt {

@@ -68,31 +68,48 @@ jobs:
         run: scripts/fetch-alpine-rootfs.sh "$RUNNER_TEMP" | tee -a "$GITHUB_ENV"
 
       - name: Import and verify
+        env:
+          DBVM_DB: ${{ runner.temp }}/alpine.vm.db
         run: |
-          db="$RUNNER_TEMP/alpine.vm.db"
-          ./target/release/self vm-init "$db" --force
-          ./target/release/self vm-import-rootfs "$db" "$ALPINE_TARBALL"
-          ./target/release/self vm-verify "$db"
+          dbvm=./target/release/dbvm
+          $dbvm import-rootfs "$ALPINE_TARBALL"
+          $dbvm verify
+          $dbvm status
 
       - name: Guest filesystem matches the imported release
+        env:
+          DBVM_DB: ${{ runner.temp }}/alpine.vm.db
         run: |
-          db="$RUNNER_TEMP/alpine.vm.db"
-          got=$(./target/release/self vm-cat "$db" /etc/alpine-release | tr -d '[:space:]')
+          dbvm=./target/release/dbvm
+          got=$($dbvm cat /etc/alpine-release | tr -d '[:space:]')
           echo "/etc/alpine-release = $got (expected $ALPINE_VERSION)"
           [ "$got" = "$ALPINE_VERSION" ]
-          ./target/release/self vm-ls "$db" /bin | head -20
+          $dbvm ls /bin | head -20
 
-      - name: Execute a guest binary (single-file mode)
+      - name: Execute a guest binary without a namespace
+        env:
+          DBVM_DB: ${{ runner.temp }}/alpine.vm.db
         run: |
-          db="$RUNNER_TEMP/alpine.vm.db"
-          got=$(./target/release/self vm-exec "$db" /bin/busybox -- echo ok)
-          echo "vm-exec busybox echo -> $got"
+          got=$(./target/release/dbvm exec /bin/busybox -- echo ok)
+          echo "dbvm exec busybox echo -> $got"
           [ "$got" = "ok" ]
 
-      # bwrap needs unprivileged user namespaces, which the runner's AppArmor policy
-      # may refuse. Reported but not gating: vm-exec above already covers execution.
-      - name: Execute via chroot mode (best effort)
+      # `dbvm run` needs bwrap, unshare or root; the runner's AppArmor policy may
+      # refuse unprivileged user namespaces. Reported but not gating -- `dbvm exec`
+      # above already covers execution.
+      - name: Enter the instance (best effort)
         continue-on-error: true
+        env:
+          DBVM_DB: ${{ runner.temp }}/alpine.vm.db
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
-          ./target/release/self vm-chroot "$RUNNER_TEMP/alpine.vm.db" /bin/sh -- -c 'cat /etc/alpine-release; uname -m'
+          ./target/release/dbvm -v run sh -c 'cat /etc/alpine-release; uname -m'
+
+      # First use with no instance must provision itself from latest-stable.
+      - name: Provision from scratch
+        env:
+          DBVM_DB: ${{ runner.temp }}/fresh.vm.db
+        run: |
+          ./target/release/dbvm init
+          ./target/release/dbvm status
+          [ "$(./target/release/dbvm exec /bin/busybox -- echo ok)" = "ok" ]

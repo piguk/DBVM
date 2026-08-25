@@ -24,4 +24,4 @@ SELF stripped  172032 bytes
 
 `scan` / `userland` 已会在聚合库上输出与原文一致的 headline 查询（distinct soname、top sonames、unresolved needs）。
 动态与多对象场景的时延未在本 demo 中定量复现。
-`vm` (新增)：`self vm-init/vm-import/vm-exec` 为单文件 VM，`vm-exec` 按需 materialize 到 `mkdtemp`，`--version` 约 6.6 ms（见 README 单文件 VM 一节）。
+`vm` (新增)：`dbvm init/import/exec` 为单文件 VM，`dbvm exec` 按需 materialize 到 `mkdtemp`，`--version` 约 6.6 ms（见 README 单文件 VM 一节）。

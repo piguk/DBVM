@@ -4,7 +4,7 @@
 
 1. 正常动态链接：`make && LD_LIBRARY_PATH=. ./app` 输出 `Hello, world, from a SQLite library!`
 2. 删掉 `.so` 后失败：`mv libgreet.so.1 libgreet.so.1.bak && LD_LIBRARY_PATH=. ./app` 报错 `cannot open shared libraries`
-3. closure 仍可查询：`self closure ./app /tmp/greet_closure.db` 后 `SELECT ... FROM needs` 可看到 `libgreet.so.1 -> /.../libgreet.so.1`
+3. closure 仍可查询：`dbvm self closure ./app /tmp/greet_closure.db` 后 `SELECT ... FROM needs` 可看到 `libgreet.so.1 -> /.../libgreet.so.1`
 4. 若有 `LD_AUDIT=libself-audit.so`（`la_objsearch` 桩在 `libself-audit.c`），则 `SELF_SYSTEM_DB=/tmp/greet_closure.db LD_AUDIT=./libself-audit.so ./app` 会在不依赖文件系统寻库的情况下由 SQL 回答寻库，`ld.so` 仍负责重定位/TLS/IFUNC。
 
 5. 自包含 bundle（无需原 `.so` 即可运行，`--bundle`）：

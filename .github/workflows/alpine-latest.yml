@@ -32,14 +32,15 @@ jobs:
         run: scripts/fetch-alpine-rootfs.sh "$RUNNER_TEMP" | tee -a "$GITHUB_ENV"
 
       - name: Import, verify and execute
+        env:
+          DBVM_DB: ${{ runner.temp }}/alpine.vm.db
         run: |
-          db="$RUNNER_TEMP/alpine.vm.db"
-          ./target/release/self vm-init "$db" --force
-          ./target/release/self vm-import-rootfs "$db" "$ALPINE_TARBALL"
-          ./target/release/self vm-verify "$db"
-          got=$(./target/release/self vm-cat "$db" /etc/alpine-release | tr -d '[:space:]')
+          dbvm=./target/release/dbvm
+          $dbvm import-rootfs "$ALPINE_TARBALL"
+          $dbvm verify
+          got=$($dbvm cat /etc/alpine-release | tr -d '[:space:]')
           [ "$got" = "$ALPINE_VERSION" ]
-          [ "$(./target/release/self vm-exec "$db" /bin/busybox -- echo ok)" = "ok" ]
+          [ "$($dbvm exec /bin/busybox -- echo ok)" = "ok" ]
 
       - name: Open PR when the verified version moved
         env:
@@ -67,6 +68,6 @@ jobs:
           git push -u origin "$branch"
           gh pr create \
             --title "docs: alpine latest-stable is now ${ALPINE_VERSION}" \
-            --body "\`latest-stable\` moved ${current} -> ${ALPINE_VERSION} (${ALPINE_BRANCH}). Import, \`vm-verify\` and \`vm-exec\` passed on this run.
+            --body "\`latest-stable\` moved ${current} -> ${ALPINE_VERSION} (${ALPINE_BRANCH}). Import, \`dbvm verify\` and \`dbvm exec\` passed on this run.
 
           Counts and sizes quoted elsewhere in the docs are from an older release and were not re-measured."

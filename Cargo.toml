@@ -1,14 +1,14 @@
 [package]
-name = "selfdb"
+name = "dbvm"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88" # edition 2024 + let-chains
-description = "SELF: Your executable is a SQLite database — Rust port"
+description = "DBVM: a SQLite database is the whole system — filesystem, memory image and snapshots"
 license = "MIT"
 
 [[bin]]
-name = "self"
-path = "src/bin/self.rs"
+name = "dbvm"
+path = "src/bin/dbvm.rs"
 
 [[bin]]
 name = "elf2self"
@@ -19,7 +19,7 @@ name = "self-exec"
 path = "src/bin/self-exec.rs"
 
 [lib]
-name = "selfdb"
+name = "dbvm"
 path = "src/lib.rs"
 
 [dependencies]
@@ -33,6 +33,7 @@ rustc-hash = "2.1"
 walkdir = "2.5"
 tar = "0.4"
 flate2 = "1.0"
+sha2 = "0.11.0"
 
 [profile.release]
 lto = true
