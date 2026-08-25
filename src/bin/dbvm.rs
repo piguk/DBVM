@@ -868,6 +868,18 @@ fn run_in_instance(
     for d in ["proc", "sys", "dev", "tmp"] {
         let _ = std::fs::create_dir_all(tmp.join(d));
     }
+    // Alpine's minirootfs ships no /etc/resolv.conf, so the guest would have no DNS
+    // and `apk add` would fail. Lend the host's for the session; it is removed again
+    // before the sync so the instance does not capture host network config.
+    let resolv = tmp.join("etc/resolv.conf");
+    let lent_resolv = if resolv.exists() {
+        None
+    } else {
+        let _ = std::fs::create_dir_all(tmp.join("etc"));
+        std::fs::read("/etc/resolv.conf")
+            .ok()
+            .filter(|content| std::fs::write(&resolv, content).is_ok())
+    };
     let full_cmd = if cmd.is_empty() {
         "/bin/sh".to_string()
     } else {
@@ -940,6 +952,12 @@ fn run_in_instance(
             std::process::exit(127)
         })
     };
+    // Only reclaim the lent file if the session left it untouched.
+    if let Some(lent) = &lent_resolv
+        && std::fs::read(&resolv).ok().as_ref() == Some(lent)
+    {
+        let _ = std::fs::remove_file(&resolv);
+    }
     // Persist whatever the session changed back into the same .db.
     if let Ok((cr, up, del)) = dbvm::vm::vm_sync_from_host(c, &tmp)
         && cr + up + del > 0

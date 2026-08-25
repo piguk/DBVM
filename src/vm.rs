@@ -1122,6 +1122,12 @@ pub fn vm_restore_file(db_path: &str, name: &str) -> Result<()> {
     if !Path::new(&snap_path).exists() {
         return Err(anyhow!("snapshot not found: {}", snap_path));
     }
+    // The -wal/-shm sidecars still describe the pre-restore database. Left in place,
+    // SQLite replays those frames onto the restored file and reports
+    // "database disk image is malformed"; discarding them is what restore means.
+    for sidecar in [format!("{}-wal", db_path), format!("{}-shm", db_path)] {
+        let _ = std::fs::remove_file(&sidecar);
+    }
     std::fs::copy(&snap_path, db_path).map_err(|e| anyhow!("restore failed: {}", e))?;
     Ok(())
 }
