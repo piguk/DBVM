@@ -1,5 +1,7 @@
 # SELF — Your executable is a SQLite database (Rust)
 
+[![CI](https://github.com/piguk/DBVM/actions/workflows/ci.yml/badge.svg)](https://github.com/piguk/DBVM/actions/workflows/ci.yml)
+
 Rust 纯实现：把 ELF 转换为 `application_id = 0x53454C46 ("SELF")` 的 SQLite 数据库，提供查询与 `self-exec` 加载器，`objects/needs` 演示 closure 去重与可选表事务。
 
 ## 构建
@@ -84,23 +86,26 @@ bash examples/bench/size.sh
 > 一个 `*.db` 既是文件系统也是内存镜像——`vm_fs + vm_mem + vm_meta + vm_snapshots` 同库，`checkpoint` 即事务，`ATTACH/VACUUM/integrity_check` 即系统操作。Alpine musl 已跑通（`bwrap/unshare/chroot` 自适应）。
 
 ```sh
-# 1. 建库 & 导入 minirootfs（3.4M tar.gz -> 7.7M db，517 entries: 97 dirs 87 files 334 symlinks，musl：/bin/sh -> /bin/busybox）
+# 1. 建库 & 导入 minirootfs（~4M tar.gz -> ~8.7M db，musl：/bin/sh -> /bin/busybox）
 cargo build --release
-curl -L -o /tmp/alpine.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
+# 解析 latest-stable（arch 取本机 CPU）、下载并校验 sha256，导出 ALPINE_VERSION / ALPINE_ARCH / ALPINE_TARBALL
+eval "$(scripts/fetch-alpine-rootfs.sh /tmp)"
 target/release/self vm-init /tmp/alpine.vm.db --force
-target/release/self vm-import-rootfs /tmp/alpine.vm.db /tmp/alpine.tar.gz
-target/release/self vm-verify /tmp/alpine.vm.db   # integrity=ok page_count=1946 files=518 bytes=7792915
+target/release/self vm-import-rootfs /tmp/alpine.vm.db "$ALPINE_TARBALL"
+target/release/self vm-verify /tmp/alpine.vm.db   # integrity=ok files=515 bytes=8652792
 
-# 2. chroot 运行（推荐，bwrap 优先）
+# 2. chroot 运行（推荐，bwrap 优先；guest 参数一律放在 `--` 之后）
 target/release/self vm-chroot /tmp/alpine.vm.db
-target/release/self vm-chroot /tmp/alpine.vm.db /bin/sh -c 'uname -a; cat /etc/alpine-release; ls /'
-target/release/self vm-chroot /tmp/alpine.vm.db /sbin/apk -- --version  # apk-tools 2.14.4
-target/release/self vm-materialize /tmp/alpine.vm.db /tmp/alpine_root   # 87 files（含 /dev/proc/sys/tmp 兜底）
+target/release/self vm-chroot /tmp/alpine.vm.db /bin/sh -- -c 'uname -a; cat /etc/alpine-release; ls /'
+target/release/self vm-chroot /tmp/alpine.vm.db /sbin/apk -- --version  # apk-tools 3.0.6-r0
+target/release/self vm-materialize /tmp/alpine.vm.db /tmp/alpine_root   # 83 files（含 /dev/proc/sys/tmp 兜底）
 bwrap --bind /tmp/alpine_root / --dev /dev --proc /proc --unshare-pid /bin/sh -c 'cat /etc/alpine-release'
 
 # 3. 单文件执行（按需 materialize 到 /tmp/self-vm-XXXXXX，自动处理 symlink 解析与 musl ld 派遣，DB 只读）
-target/release/self vm-exec /tmp/alpine.vm.db /bin/sh -- -c 'echo hi; busybox echo hi2'
-target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --help   # musl 需显式 ld-musl，与 glibc LD_LIBRARY_PATH 不同
+# 只落盘目标二进制与其依赖库，guest 的 rootfs 与 PATH 不可见——需要完整 rootfs 时用 vm-chroot
+target/release/self vm-exec /tmp/alpine.vm.db /bin/sh -- -c 'echo hi'
+target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --list | wc -l   # 304
+target/release/self vm-exec /tmp/alpine.vm.db /sbin/apk -- --version   # musl 需显式 ld-musl，与 glibc LD_LIBRARY_PATH 不同
 
 # 4. 快照与内存镜像（同库）
 target/release/self vm-checkpoint /tmp/alpine.vm.db snap1 --note "after import"
@@ -117,7 +122,7 @@ target/release/self vm-import /tmp/vm.db /bin/ls
 target/release/self vm-ls /tmp/vm.db; target/release/self vm-cat /tmp/vm.db /bin/ls > /tmp/out
 ```
 
-体积：`alpine 7.7M`，`ls 闭包`等同 `bundle 3.5M`，`mini(3 files) 280K`；`vm-exec` ~ musl interpreter 派遣开销，`vm-chroot` ~ `bwrap` 绑定开销（`hyperfine` 15 runs warmup 5）。
+体积：`alpine 4.1M`（3.24.1 aarch64，content 压缩后的 db 文件大小），`ls 闭包`等同 `bundle 3.5M`，`mini(3 files) 280K`；`vm-exec` ~ musl interpreter 派遣开销，`vm-chroot` ~ `bwrap` 绑定开销（`hyperfine` 15 runs warmup 5）。
 
 实现：`src/vm.rs`（`VMSQ 0x564D5351`，`vm_fs/vm_mem/vm_snapshots/vm_meta/vm_log`，`vm_resolve` 40 跳 symlink 解析，`vm_materialize_tree` 三段落盘，`vm_mem_*`/`vm_snapshot_file`）、`src/bin/self.rs:Vm*`（`init/add/pack/import/import-rootfs/materialize/ls/cat/stat/exec/chroot/checkpoint/snapshots/verify/extract/mem/restore`）。
 

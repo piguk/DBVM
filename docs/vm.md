@@ -7,34 +7,52 @@
 
 ## 导入 Alpine
 
+`scripts/fetch-alpine-rootfs.sh [dest-dir] [arch]` 从 `latest-stable` 解析当前 minirootfs、下载并校验 sha256，
+输出 `ALPINE_BRANCH` / `ALPINE_VERSION` / `ALPINE_ARCH` / `ALPINE_TARBALL` 四个赋值行，可直接 `eval` 或追加到 `$GITHUB_ENV`。
+arch 默认取本机 CPU（`uname -m` 映射到 Alpine 的命名，`arm64`/`aarch64` 均映射为 `aarch64`），
+guest 二进制因此与 host 同架构，可直接执行；传第二个参数可拉取其他架构。
+
 ```sh
 cargo build --release
-# 3.4M tar.gz -> 7.7M db（517 entries: 97 dirs 87 files 334 symlinks，musl 正确：/bin/sh -> /bin/busybox，ld-musl/libc.musl）
-curl -L -o /tmp/alpine.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
+# ~4M tar.gz -> ~8.7M db（musl 正确：/bin/sh -> /bin/busybox，ld-musl/libc.musl）
+eval "$(scripts/fetch-alpine-rootfs.sh /tmp)"
 ./target/release/self vm-init /tmp/alpine.vm.db --force
-./target/release/self vm-import-rootfs /tmp/alpine.vm.db /tmp/alpine.tar.gz
+./target/release/self vm-import-rootfs /tmp/alpine.vm.db "$ALPINE_TARBALL"
 ./target/release/self vm-verify /tmp/alpine.vm.db
-# integrity=ok page_size=4096 page_count=1946 freelist=0 files=518 bytes=7792915
+# integrity=ok page_size=4096 page_count=1044 freelist=0 files=515 bytes=8652792
+```
+
+<!-- alpine-verified:begin -->
+CI 每周对 `latest-stable` 跑一次导入与执行，最近验证：Alpine 3.24.1。
+<!-- alpine-verified:end -->
+
+固定某个版本时直接写 URL：
+
+```sh
+curl -L -o /tmp/alpine.tar.gz \
+  https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.1-x86_64.tar.gz
 ```
 
 ## 运行
 
 ```sh
 # chroot 模式（推荐，bwrap 优先，其次 unshare --mount --map-root-user --root，最后 chroot）
+# guest 参数一律放在 `--` 之后，否则 `-c` 会被当作 self 自己的 flag
 ./target/release/self vm-chroot /tmp/alpine.vm.db
-./target/release/self vm-chroot /tmp/alpine.vm.db /bin/sh -c 'uname -a; cat /etc/alpine-release; ls /'
-./target/release/self vm-chroot /tmp/alpine.vm.db /sbin/apk -- --version   # apk-tools 2.14.4
+./target/release/self vm-chroot /tmp/alpine.vm.db /bin/sh -- -c 'uname -a; cat /etc/alpine-release; ls /'
+./target/release/self vm-chroot /tmp/alpine.vm.db /sbin/apk -- --version   # apk-tools 3.0.6-r0
 ./target/release/self vm-chroot /tmp/alpine.vm.db /bin/busybox -- --list | wc -l  # 304
 
 # 单文件模式（按需 materialize 到 /tmp/self-vm-XXXXXX，自动处理 symlink 解析与 interpreter 派遣，DB 只读）
-./target/release/self vm-exec /tmp/alpine.vm.db /bin/sh -- -c 'echo hi; busybox echo hi2'
-./target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --help
+# 只落盘目标二进制与其依赖库；guest 的 rootfs 与 PATH 不可见，需要完整 rootfs 时用 vm-chroot
+./target/release/self vm-exec /tmp/alpine.vm.db /bin/sh -- -c 'echo hi'
+./target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --list | wc -l
 # musl: /lib/ld-musl-x86_64.so.1（与 glibc 不同，LD_LIBRARY_PATH 仅对二次库生效，主解释器需显式派遣）
 
 # 传统 vm-* 操作
 ./target/release/self vm-ls /tmp/alpine.vm.db /etc
 ./target/release/self vm-cat /tmp/alpine.vm.db /etc/alpine-release
-./target/release/self vm-materialize /tmp/alpine.vm.db /tmp/alpine_root   # 落盘 87 files，含 /dev/proc/sys/tmp 兜底
+./target/release/self vm-materialize /tmp/alpine.vm.db /tmp/alpine_root   # 落盘 83 files，含 /dev/proc/sys/tmp 兜底
 bwrap --bind /tmp/alpine_root / --dev /dev --proc /proc --unshare-pid /bin/sh -c 'cat /etc/alpine-release'
 
 # 快照与内存镜像（同库）
