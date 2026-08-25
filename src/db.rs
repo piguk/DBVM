@@ -1,10 +1,20 @@
-use rusqlite::{Connection, params};
 use crate::elf::ElfInfo;
+use rusqlite::{Connection, params};
 
-pub fn create_self_db(path: &str, info: &ElfInfo, no_sections: bool, no_notes: bool) -> anyhow::Result<()> {
-    if std::path::Path::new(path).exists() { std::fs::remove_file(path)?; }
+pub fn create_self_db(
+    path: &str,
+    info: &ElfInfo,
+    no_sections: bool,
+    no_notes: bool,
+) -> anyhow::Result<()> {
+    if std::path::Path::new(path).exists() {
+        std::fs::remove_file(path)?;
+    }
     let mut conn = Connection::open(path)?;
-    conn.execute_batch(&format!("PRAGMA application_id = {}; PRAGMA user_version = 1;", crate::elf::APP_ID))?;
+    conn.execute_batch(&format!(
+        "PRAGMA application_id = {}; PRAGMA user_version = 1;",
+        crate::elf::APP_ID
+    ))?;
     conn.execute_batch(r#"
     CREATE TABLE self_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE self_blob(content BLOB NOT NULL);
@@ -23,9 +33,12 @@ pub fn create_self_db(path: &str, info: &ElfInfo, no_sections: bool, no_notes: b
     let tx = conn.transaction()?;
     {
         let mut stmt_meta = tx.prepare_cached("INSERT INTO self_meta VALUES (?1,?2)")?;
-        let metas: Vec<(String,String)> = {
+        let metas: Vec<(String, String)> = {
             let mut v = vec![
-                ("class".to_string(), if info.is64 {"ELF64"} else {"ELF32"}.to_string()),
+                (
+                    "class".to_string(),
+                    if info.is64 { "ELF64" } else { "ELF32" }.to_string(),
+                ),
                 ("endian".to_string(), info.endian.clone()),
                 ("e_type".to_string(), info.e_type.to_string()),
                 ("e_machine".to_string(), info.e_machine.to_string()),
@@ -35,43 +48,88 @@ pub fn create_self_db(path: &str, info: &ElfInfo, no_sections: bool, no_notes: b
                 ("e_shnum".to_string(), info.e_shnum.to_string()),
                 ("e_shstrndx".to_string(), info.e_shstrndx.to_string()),
             ];
-            if let Some(interp)=&info.interp { v.push(("interp".to_string(), interp.clone())); }
+            if let Some(interp) = &info.interp {
+                v.push(("interp".to_string(), interp.clone()));
+            }
             v
         };
-        for (k,v) in metas { stmt_meta.execute(params![k,v])?; }
+        for (k, v) in metas {
+            stmt_meta.execute(params![k, v])?;
+        }
         {
-            let mut stmt = tx.prepare_cached("INSERT INTO segments VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?;
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO segments VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            )?;
             for (i, seg) in info.segments.iter().enumerate() {
                 let content: Option<&[u8]> = None;
                 let _ = seg.content.as_ref();
-                stmt.execute(params![i as i64, seg.typ, seg.offset as i64, seg.vaddr as i64, seg.filesz as i64, seg.memsz as i64, seg.r, seg.w, seg.x, seg.align as i64, content])?;
+                stmt.execute(params![
+                    i as i64,
+                    seg.typ,
+                    seg.offset as i64,
+                    seg.vaddr as i64,
+                    seg.filesz as i64,
+                    seg.memsz as i64,
+                    seg.r,
+                    seg.w,
+                    seg.x,
+                    seg.align as i64,
+                    content
+                ])?;
             }
         }
         {
-            let mut stmt = tx.prepare_cached("INSERT INTO symbols VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)")?;
+            let mut stmt =
+                tx.prepare_cached("INSERT INTO symbols VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)")?;
             for (i, sym) in info.symbols.iter().enumerate() {
-                stmt.execute(params![i as i64, sym.name, sym.version, sym.value as i64, sym.size as i64, sym.typ, sym.bind, sym.defined, sym.exported])?;
+                stmt.execute(params![
+                    i as i64,
+                    sym.name,
+                    sym.version,
+                    sym.value as i64,
+                    sym.size as i64,
+                    sym.typ,
+                    sym.bind,
+                    sym.defined,
+                    sym.exported
+                ])?;
             }
         }
         if !no_sections && !info.sections.is_empty() {
             let mut stmt = tx.prepare_cached("INSERT INTO sections VALUES (?1,?2,?3,?4,?5)")?;
-            for sec in &info.sections { stmt.execute(params![sec.name, sec.typ as i64, sec.offset as i64, sec.size as i64, sec.flags as i64])?; }
+            for sec in &info.sections {
+                stmt.execute(params![
+                    sec.name,
+                    sec.typ as i64,
+                    sec.offset as i64,
+                    sec.size as i64,
+                    sec.flags as i64
+                ])?;
+            }
         }
         if !no_notes && !info.notes.is_empty() {
             let mut stmt = tx.prepare_cached("INSERT INTO notes VALUES (?1,?2,?3)")?;
-            for note in &info.notes { stmt.execute(params![note.typ, note.name, note.desc.clone()])?; }
+            for note in &info.notes {
+                stmt.execute(params![note.typ, note.name, note.desc.clone()])?;
+            }
         }
         if !info.dynamic_entries.is_empty() {
             let mut stmt = tx.prepare_cached("INSERT INTO dynamic_entries VALUES (?1,?2)")?;
-            for d in &info.dynamic_entries { stmt.execute(params![d.tag, d.value as i64])?; }
+            for d in &info.dynamic_entries {
+                stmt.execute(params![d.tag, d.value as i64])?;
+            }
         }
         if !info.needed.is_empty() {
             let mut stmt = tx.prepare_cached("INSERT INTO needed VALUES (?1,?2)")?;
-            for (i, soname) in info.needed.iter().enumerate() { stmt.execute(params![i as i64, soname])?; }
+            for (i, soname) in info.needed.iter().enumerate() {
+                stmt.execute(params![i as i64, soname])?;
+            }
         }
         if !info.relocs.is_empty() {
             let mut stmt = tx.prepare_cached("INSERT INTO RELATIVE_RELOCS VALUES (?1,?2)")?;
-            for (vaddr, addend) in &info.relocs { stmt.execute(params![*vaddr as i64, *addend as i64])?; }
+            for (vaddr, addend) in &info.relocs {
+                stmt.execute(params![*vaddr as i64, *addend as i64])?;
+            }
         }
         {
             let mut stmt = tx.prepare_cached("INSERT INTO self_blob VALUES (?1)")?;

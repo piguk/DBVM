@@ -1,7 +1,8 @@
 [package]
 name = "selfdb"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88" # edition 2024 + let-chains
 description = "SELF: Your executable is a SQLite database — Rust port"
 license = "MIT"
 
