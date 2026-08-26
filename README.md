@@ -81,45 +81,48 @@ bash examples/bench/size.sh
 
 ## 单文件 VM（SQLite 即系统）—— Alpine 可跑
 
-> 一个 `*.db` 既是文件系统也是内存镜像——`vm_fs + vm_mem + vm_meta + vm_snapshots` 同库，`checkpoint` 即事务，`ATTACH/VACUUM/integrity_check` 即系统操作。Alpine musl 已跑通（`bwrap/unshare/chroot` 自适应）。
+> 一个 `*.db` 既是文件系统也是内存镜像——`vm_blobs+vm_fs+vm_mem+vm_meta+vm_snapshots/vm_log` 同库（`VMSQ 0x564D5351`），`checkpoint` 即事务，`ATTACH/VACUUM/integrity_check` 即系统操作。Alpine musl 已跑通；`vm-chroot` 优先 **FUSE 直读**（`--features fuse` pure-rust，无 libfuse），无 `/dev/fuse` 回落物化+bwarp，内存 `strace trace=memory` 入 `vm_mem`。
 
 ```sh
-# 1. 建库 & 导入 minirootfs（3.4M tar.gz -> 7.7M db，517 entries: 97 dirs 87 files 334 symlinks，musl：/bin/sh -> /bin/busybox）
-cargo build --release
+# 1. 建库 & 导入 minirootfs（3.4M tar.gz -> 实测 3.6M db, 519 entries: 97 dirs 88 files 334 symlinks, logical 7.4M -> blob 3.4M 45.9%）
+cargo build --release --features fuse
 curl -L -o /tmp/alpine.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
 target/release/self vm-init /tmp/alpine.vm.db --force
+target/release/self vm-import-rootfs /tmp/alpine.vm.db /tmp/alpine.tar.gz --whitelist /bin --whitelist /lib # 裁剪至 ~2M
 target/release/self vm-import-rootfs /tmp/alpine.vm.db /tmp/alpine.tar.gz
-target/release/self vm-verify /tmp/alpine.vm.db   # integrity=ok page_count=1946 files=518 bytes=7792915
+target/release/self vm-verify /tmp/alpine.vm.db  # integrity=ok page_count=920 files=519 bytes=7792927
+sqlite3 /tmp/alpine.vm.db "SELECT sum(size)/1024/1024.0 ||'M logical' FROM vm_fs WHERE kind='file'"
+./target/release/self vm-compress-info /tmp/alpine.vm.db
+./target/release/self vm-status /tmp/alpine.vm.db
 
-# 2. chroot 运行（推荐，bwrap 优先）
-target/release/self vm-chroot /tmp/alpine.vm.db
-target/release/self vm-chroot /tmp/alpine.vm.db /bin/sh -c 'uname -a; cat /etc/alpine-release; ls /'
-target/release/self vm-chroot /tmp/alpine.vm.db /sbin/apk -- --version  # apk-tools 2.14.4
-target/release/self vm-materialize /tmp/alpine.vm.db /tmp/alpine_root   # 87 files（含 /dev/proc/sys/tmp 兜底）
-bwrap --bind /tmp/alpine_root / --dev /dev --proc /proc --unshare-pid /bin/sh -c 'cat /etc/alpine-release'
+# 2. 进 VM（如何进入）
+target/release/self vm-chroot /tmp/alpine.vm.db                    # 交互式；/dev/fuse 存在则 FUSE 零落盘（df 3.6M），否则物化 88 文件后 bwrap
+target/release/self vm-chroot /tmp/alpine.vm.db /bin/sh -c 'cat /etc/alpine-release; ls /'
+mkdir -p /tmp/mnt && target/release/self vm-mount /tmp/alpine.vm.db /tmp/mnt  # 显式 FUSE
+df -h /tmp/mnt && cat /tmp/mnt/etc/alpine-release && fusermount -u /tmp/mnt
 
-# 3. 单文件执行（按需 materialize 到 /tmp/self-vm-XXXXXX，自动处理 symlink 解析与 musl ld 派遣，DB 只读）
+# 3. 单文件执行（按需 materialize 到 /tmp/self-vm-XXXXXX，自动处理 symlink 与 musl ld 派遣，DB 只读）
 target/release/self vm-exec /tmp/alpine.vm.db /bin/sh -- -c 'echo hi; busybox echo hi2'
-target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --help   # musl 需显式 ld-musl，与 glibc LD_LIBRARY_PATH 不同
+target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --help
 
-# 4. 快照与内存镜像（同库）
+# 4. 快照与内存镜像（同库：硬盘+内存均在同一 sqlite 不同表）
 target/release/self vm-checkpoint /tmp/alpine.vm.db snap1 --note "after import"
 target/release/self vm-snapshots /tmp/alpine.vm.db
-target/release/self vm-mem-insert /tmp/alpine.vm.db 0x7fff0000 4096 5 /tmp/page.bin
+target/release/self vm-mem-trace /tmp/alpine.vm.db /bin/echo -- hello  # strace 解析 mmap/mprotect 入 vm_mem
 target/release/self vm-mem-list /tmp/alpine.vm.db
-target/release/self vm-snapshot-file /tmp/alpine.vm.db snap_file1   # VACUUM INTO 或 cp -> /tmp/alpine.vm.db.snap.snap_file1
-target/release/self vm-restore-file /tmp/alpine.vm.db snap_file1
-sqlite3 /tmp/alpine.vm.db "SELECT * FROM vm_mem LIMIT 5; PRAGMA integrity_check"
+target/release/self vm-snapshot-file /tmp/alpine.vm.db snap_file1
+sqlite3 /tmp/alpine.vm.db "SELECT id,addr,size,prot,length(content) FROM vm_mem; PRAGMA integrity_check"
 
-# 5. 其他 vm-*（闭包/单文件粒度同样支持，非全量 /bin 仅作压力参考 1.2G）
-target/release/self vm-add /tmp/vm.db /bin/ls /bin/ls
-target/release/self vm-import /tmp/vm.db /bin/ls
+# 5. 其他 vm-*（闭包/单文件粒度同样支持）
+target/release/self vm-add /tmp/vm.db /bin/ls /bin/ls; target/release/self vm-import /tmp/vm.db /bin/ls
 target/release/self vm-ls /tmp/vm.db; target/release/self vm-cat /tmp/vm.db /bin/ls > /tmp/out
 ```
 
-体积：`alpine 7.7M`，`ls 闭包`等同 `bundle 3.5M`，`mini(3 files) 280K`；`vm-exec` ~ musl interpreter 派遣开销，`vm-chroot` ~ `bwrap` 绑定开销（`hyperfine` 15 runs warmup 5）。
+> 完全独立验证：`vm-mount` 后 `df` 的 `Blocks/Used` 来自 FUSE `statfs = sum(blob)/4096 (~874 blocks = 3.6M)`，非宿主 `tmpfs 13.6G`；无 FUSE 时 `vm-chroot` 回落物化仍会自动 `vm_sync_from_host` 写回（WAL, 阈值 4M, `journal_size_limit 64M`）。压缩 `zstd:3` 仅对 `>1K +64` 有收益者生效，`LRU 64` + `SELF_VM_CACHE` 物化硬链加速。见 `docs/vm.md`。
 
-实现：`src/vm.rs`（`VMSQ 0x564D5351`，`vm_fs/vm_mem/vm_snapshots/vm_meta/vm_log`，`vm_resolve` 40 跳 symlink 解析，`vm_materialize_tree` 三段落盘，`vm_mem_*`/`vm_snapshot_file`）、`src/bin/self.rs:Vm*`（`init/add/pack/import/import-rootfs/materialize/ls/cat/stat/exec/chroot/checkpoint/snapshots/verify/extract/mem/restore`）。
+体积：`alpine 7.4M logical -> 3.6M db (45.9%)`，`bundle ls 3.5M`；`vm-chroot(FUSE)` 零物化开销，回落分支 88 文件 rayon 并行。
+
+实现：`src/vm.rs`（`vm_blobs` dedup/refcnt, `zstd`, `page_size 8192`, WAL, `vm_mem_trace` via `strace`）、`src/fuse.rs`（`VmFuse`, `statfs`, `staged->vm_add_bytes`, `pure-rust fuser`）、`src/bin/self.rs:Vm*`。
 
 ## 与原文边界
 

@@ -25,17 +25,18 @@ enum Cmd {
     BundleInfo{ path: String },
     Pack{ input: String, #[arg(short,long, default_value="a.self")] output: String, #[arg(long)] no_bundle: bool, #[arg(long)] no_sections: bool, #[arg(long)] no_notes: bool },
     Run{ path: String, rest: Vec<String> },
-    VmInit{ db: String, #[arg(long)] force: bool },
+    VmInit{ db: String, #[arg(long)] force: bool, #[arg(long)] vm_only: bool },
     VmAdd{ db: String, host: String, vm_path: String },
     VmPack{ db: String, host_dir: String, #[arg(long, default_value="/")] prefix: String },
     VmImport{ db: String, elf: String, #[arg(long, default_value="/")] prefix: String },
-    VmImportRootfs{ db: String, tar: String, #[arg(long, default_value="")] strip: String },
+    VmImportRootfs{ db: String, tar: String, #[arg(long, default_value="")] strip: String, #[arg(long)] whitelist: Vec<String>, #[arg(long)] exclude: Vec<String> },
     VmMaterialize{ db: String, dest: String },
     VmLs{ db: String, #[arg(default_value="/")] path: String },
     VmCat{ db: String, path: String },
     VmStat{ db: String, path: String },
     VmExec{ db: String, vm_path: String, rest: Vec<String> },
-    VmChroot{ db: String, #[arg(default_value="/bin/sh")] cmd: String, rest: Vec<String> },
+    VmChroot{ db: String, #[arg(default_value="/bin/sh")] cmd: String, rest: Vec<String>, #[arg(long, help="keep tmp dir and persist history (default: true unless --ephemeral)")] persist: bool, #[arg(long, help="skip sync and remove tmp, disables history persistence")] ephemeral: bool },
+    VmResolve{ db: String, vm_path: String },
     VmCheckpoint{ db: String, name: String, #[arg(long, default_value="")] note: String },
     VmSnapshots{ db: String },
     VmVerify{ db: String },
@@ -48,6 +49,15 @@ enum Cmd {
     VmSync{ db: String, host_root: String },
     VmGc{ db: String },
     VmCompressInfo{ db: String },
+    VmRecompress{ db: String },
+    VmStatus{ db: String },
+    VmCacheInfo,
+    VmCachePrune{ #[arg(long, default_value="1G")] max: String },
+    VmTrainDict{ db: String, #[arg(long, default_value="16384")] max_size: usize },
+    VmDictInfo{ db: String },
+    VmDiff{ db: String, a: String, b: String },
+    VmMount{ db: String, mountpoint: String, #[arg(long)] allow_other: bool },
+    VmMemTrace{ db: String, prog: String, rest: Vec<String> },
 }
 
 fn open_db(path: &str) -> Connection {
@@ -92,11 +102,11 @@ fn main() -> anyhow::Result<()> {
             let status = std::process::Command::new(&exe).args(&args).status().unwrap_or_else(|e| { eprintln!("exec failed: {}: {}", exe, e); std::process::exit(127)});
             std::process::exit(status.code().unwrap_or(127));
         },
-        Cmd::VmInit{db, force} => { let _c=selfdb::vm::init_vm_db(&db, force)?; println!("vm init -> {} (WAL+mmap+compress)", db); },
+        Cmd::VmInit{db, force, vm_only} => { let _c=selfdb::vm::init_vm_db_with_opts(&db, force, vm_only)?; println!("vm init -> {} (WAL+mmap+compress vm_only={})", db, vm_only); },
         Cmd::VmAdd{db, host, vm_path} => { let c=Connection::open(&db)?; selfdb::vm::vm_add_file(&c, &host, &vm_path)?; println!("add {} -> {}:{}", host, db, vm_path); },
         Cmd::VmPack{db, host_dir, prefix} => { let c=Connection::open(&db)?; let n=selfdb::vm::vm_pack_host_dir(&c, &host_dir, &prefix)?; println!("pack {} -> {}:{} ({} files)", host_dir, db, prefix, n); },
         Cmd::VmImport{db, elf, prefix} => { let c=Connection::open(&db)?; let n=selfdb::vm::vm_import_closure(&c, &elf, &prefix)?; println!("import {} -> {} ({} objects)", elf, db, n); },
-        Cmd::VmImportRootfs{db, tar, strip} => { let c=selfdb::vm::vm_open(&db)?; let n=selfdb::vm::vm_import_tar(&c, &tar, &strip)?; println!("import-tar {} -> {} ({} entries)", tar, db, n); },
+        Cmd::VmImportRootfs{db, tar, strip, whitelist, exclude} => { let c=selfdb::vm::vm_open(&db)?; let wl: Option<&[String]> = if whitelist.is_empty() { None } else { Some(&whitelist) }; let ex: Option<&[String]> = if exclude.is_empty() { None } else { Some(&exclude) }; let n=selfdb::vm::vm_import_tar_filtered(&c, &tar, &strip, wl, ex)?; println!("import-tar {} -> {} ({} entries) whitelist={:?} exclude={:?}", tar, db, n, whitelist, exclude); if n>50 { let _ = selfdb::vm::vm_train_dict(&c, 16384); } },
         Cmd::VmMaterialize{db, dest} => { let c=selfdb::vm::vm_open(&db)?; let n=selfdb::vm::vm_materialize_tree(&c, std::path::Path::new(&dest))?; println!("materialize {} -> {} ({} files)", db, dest, n); },
         Cmd::VmLs{db, path} => { let c=selfdb::vm::vm_open(&db)?; for (p,k,m,sz,_) in selfdb::vm::vm_ls(&c, &path)? { println!("{:8} {:4} {:>10}  {}", k, format!("{:o}", m), sz, p);} },
         Cmd::VmCat{db, path} => { let c=selfdb::vm::vm_open(&db)?; let data=selfdb::vm::vm_cat(&c, &path)?; use std::io::Write; std::io::stdout().write_all(&data)?; },
@@ -220,28 +230,103 @@ fn main() -> anyhow::Result<()> {
             };
             std::process::exit(status.code().unwrap_or(127));
         },
-        Cmd::VmChroot{db, cmd, rest} => {
+        Cmd::VmChroot{db, cmd, rest, persist, ephemeral} => {
+            if persist && ephemeral { eprintln!("cannot use both --persist and --ephemeral"); std::process::exit(2); }
+            let effective_persist = persist || !ephemeral;
             let c=selfdb::vm::vm_open(&db)?;
+            let full_cmd = if cmd.is_empty(){ "/bin/sh".to_string()} else { cmd.clone()};
+            let has_bwrap = std::process::Command::new("bwrap").arg("--help").output().map(|o| o.status.success()).unwrap_or(false);
+            #[cfg(feature = "fuse")]
+            {
+                if std::path::Path::new("/dev/fuse").exists() {
+                    let fuse_tmp = std::env::temp_dir().join(format!("vm-fuse-{}", std::process::id()));
+                    let _ = std::fs::create_dir_all(&fuse_tmp);
+                    // try FUSE: mount db -> fuse_tmp, then bwrap bind /mnt as /
+                    // background mount keeps session alive until child exits
+                    match selfdb::fuse::fuse_impl::mount_vm_background(&db, &fuse_tmp.to_string_lossy()) {
+                        Ok(_bg) => {
+                            eprintln!("-> FUSE {} -> {} (no materialize, SELECT vm_blobs on demand, statfs blocks=sum(blob)/4096)", db, fuse_tmp.display());
+                            // give kernel a moment to establish mount
+                            std::thread::sleep(std::time::Duration::from_millis(80));
+                            let status = if has_bwrap {
+                                eprintln!("-> bwrap --bind {} / (FUSE-backed, host tmpfs not leaked)", fuse_tmp.display());
+                                let mut cmd2 = std::process::Command::new("bwrap");
+                                cmd2.arg("--bind").arg(&fuse_tmp).arg("/").arg("--dev").arg("/dev").arg("--proc").arg("/proc").arg("--unshare-pid");
+                                if effective_persist {
+                                let db_hash = selfdb::vm::fx_hash_u64(db.as_bytes());
+                                let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
+                                let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
+                                // FUSE history lives inside fuse mount but also cache for later -- persist after exit via file copy
+                                cmd2.env("HISTFILE", "/.ash_history");
+                                cmd2.env("PS1", r"vm:\w\$ ");
+                                cmd2.env("HOME", "/");
+                                // pre-seed from cache if exists
+                                if hist_cached.exists() { let _ = std::fs::copy(&hist_cached, fuse_tmp.join(".ash_history")); }
+                            }
+                                cmd2.arg(full_cmd.clone()); for a in &rest { cmd2.arg(a); }
+                                cmd2.status().unwrap_or_else(|e| { eprintln!("bwrap over FUSE failed: {}", e); std::process::exit(127)})
+                            } else if std::process::Command::new("unshare").arg("--help").output().map(|o| o.status.success()).unwrap_or(false) {
+                                let mut cmd2 = std::process::Command::new("unshare");
+                                cmd2.arg("--mount").arg("--map-root-user").arg("--root").arg(&fuse_tmp);
+                                if effective_persist { cmd2.env("HISTFILE", "/.ash_history"); cmd2.env("PS1", r"vm:\w\$ "); cmd2.env("HOME", "/"); }
+                                cmd2.arg(full_cmd.clone()); for a in &rest { cmd2.arg(a); }
+                                cmd2.status().unwrap_or_else(|e| { eprintln!("unshare over FUSE failed: {}", e); std::process::exit(127)})
+                            } else {
+                                let mut cmd2 = std::process::Command::new("chroot");
+                                if effective_persist { cmd2.env("HISTFILE", "/.ash_history"); cmd2.env("PS1", r"vm:\w\$ "); cmd2.env("HOME", "/"); }
+                                cmd2.arg(&fuse_tmp).arg(full_cmd.clone()); for a in &rest { cmd2.arg(a); }
+                                cmd2.status().unwrap_or_else(|e| { eprintln!("chroot over FUSE failed: {}", e); std::process::exit(127)})
+                            };
+                            // persist history from fuse mount to cache_dir
+                            if effective_persist {
+                                let db_hash = selfdb::vm::fx_hash_u64(db.as_bytes());
+                                let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
+                                let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
+                                let src_hist = fuse_tmp.join(".ash_history");
+                                if src_hist.exists() { let _ = std::fs::copy(&src_hist, &hist_cached); }
+                            }
+                            // bg dropped here -> AutoUnmount; writes already flushed via flush_staged -> vm_blobs
+                            std::process::exit(status.code().unwrap_or(127));
+                        },
+                        Err(e) => {
+                            eprintln!("FUSE mount failed ({}), falling back to materialize+bwrap", e);
+                        }
+                    }
+                } else {
+                    eprintln!("hint: /dev/fuse missing (no FUSE in this env) -> falling back to materialize. Build `cargo build --release --features fuse` already pure-rust (fuser default-features=false). In a host with /dev/fuse: `self vm-chroot` will mount without writing /tmp (df shows 3.6M not host tmpfs 13G).");
+                }
+            }
+            #[cfg(not(feature = "fuse"))]
+            {
+                eprintln!("hint: rebuild with --features fuse for zero-materialize: `cargo build --release --features fuse` (pure-rust, no libfuse3-dev)");
+            }
+            // fallback: materialize (88 files) then bwrap; still auto-persists via vm_sync_from_host + WAL
             let mut tmpl=b"/tmp/self-vm-XXXXXX\0".to_vec();
             let pp=unsafe{ libc::mkdtemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
             let tmp = if pp.is_null(){ std::env::temp_dir().join(format!("vm-chroot-{}", std::process::id())) } else { let s=unsafe{ std::ffi::CStr::from_ptr(pp)}; std::path::PathBuf::from(s.to_string_lossy().to_string()) };
             let n=selfdb::vm::vm_materialize_tree(&c, &tmp)?;
-            eprintln!("materialized {} files -> {}", n, tmp.display());
+            eprintln!("materialized {} files -> {} (fallback, would be 0 with FUSE)", n, tmp.display());
             for d in ["proc","sys","dev","tmp"] { let _=std::fs::create_dir_all(tmp.join(d)); }
-            let full_cmd = if cmd.is_empty(){ "/bin/sh".to_string()} else { cmd.clone()};
-            let mut args = vec![full_cmd.clone()]; args.extend(rest.clone());
-            let has_bwrap = std::process::Command::new("bwrap").arg("--help").output().map(|o| o.status.success()).unwrap_or(false);
             let has_unshare = std::process::Command::new("unshare").arg("--help").output().map(|o| o.status.success()).unwrap_or(false);
+            let db_hash = selfdb::vm::fx_hash_u64(db.as_bytes());
+            let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
+            let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
+            // if cached exists, copy to tmp for session, else start fresh
+            if hist_cached.exists() { let _ = std::fs::copy(&hist_cached, tmp.join(".ash_history")); }
+            let hist = tmp.join(".ash_history");
+            let ps1 = r"vm:\w\$ ";
             let status = if has_bwrap {
                 eprintln!("-> bwrap {}", tmp.display());
                 let mut cmd = std::process::Command::new("bwrap");
                 cmd.arg("--bind").arg(&tmp).arg("/").arg("--dev").arg("/dev").arg("--proc").arg("/proc").arg("--unshare-pid");
+                if effective_persist { cmd.env("HISTFILE", "/.ash_history"); cmd.env("PS1", ps1); cmd.env("HOME", "/"); cmd.env("SELF_VM_PERSIST", "1"); }
                 cmd.arg(full_cmd.clone()); for a in &rest { cmd.arg(a); }
                 cmd.status().unwrap_or_else(|e| { eprintln!("bwrap failed: {}", e); std::process::exit(127)})
             } else if has_unshare {
                 eprintln!("-> unshare --root {}", tmp.display());
                 let mut cmd = std::process::Command::new("unshare");
                 cmd.arg("--mount").arg("--map-root-user").arg("--root").arg(&tmp);
+                if effective_persist { cmd.env("HISTFILE", "/.ash_history"); cmd.env("PS1", ps1); cmd.env("HOME", "/"); }
                 cmd.arg(full_cmd.clone()); for a in &rest { cmd.arg(a); }
                 let s = cmd.status();
                 match s {
@@ -255,14 +340,12 @@ fn main() -> anyhow::Result<()> {
             } else {
                 eprintln!("-> chroot {}", tmp.display());
                 let mut cmd = std::process::Command::new("chroot");
+                if effective_persist { cmd.env("HISTFILE", "/.ash_history"); cmd.env("PS1", ps1); cmd.env("HOME", "/"); }
                 cmd.arg(&tmp).arg(full_cmd.clone()); for a in &rest { cmd.arg(a); }
                 cmd.status().unwrap_or_else(|e| { eprintln!("chroot failed (need root): {}", e); std::process::exit(127)})
             };
-            // auto-persist: sync host changes back to same .db (WAL)
-            {
-                // locate tmp path from earlier materialize: we need to recover it
-                // best effort: find /tmp/self-vm-* that was just used; we have `tmp` variable in scope
-                // try sync; ignore errors (e.g. no changes)
+            let do_sync = !ephemeral;
+            if do_sync {
                 let sync_res = selfdb::vm::vm_sync_from_host(&c, &tmp);
                 if let Ok((cr,up,del)) = sync_res {
                     if cr+up+del>0 {
@@ -270,8 +353,36 @@ fn main() -> anyhow::Result<()> {
                         let _ = selfdb::vm::vm_apply_pragmas(&c);
                     }
                 }
+            } else {
+                eprintln!("--ephemeral: skip sync back to DB");
+            }
+            // persist history to cache_dir/history/<hash> for next FUSE or persist session
+            if hist.exists() && effective_persist {
+                let db_hash = selfdb::vm::fx_hash_u64(db.as_bytes());
+                let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
+                let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
+                let _ = std::fs::copy(&hist, &hist_cached);
+                eprintln!("history persisted {} -> {}", hist.display(), hist_cached.display());
+            }
+            if effective_persist {
+                eprintln!("--persist: keep {} (history at {}/.ash_history also cached at {})", tmp.display(), tmp.display(), selfdb::vm::cache_dir().join("history").join(selfdb::vm::fx_hash_u64(db.as_bytes())).join(".ash_history").display());
+            }
+            if ephemeral {
+                let _ = std::fs::remove_dir_all(&tmp);
+                eprintln!("--ephemeral: removed {}", tmp.display());
             }
             std::process::exit(status.code().unwrap_or(127));
+        },
+        Cmd::VmResolve{db, vm_path} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            match selfdb::vm::vm_resolve(&c, &vm_path) {
+                Ok((real, kind, content, link, mode)) => {
+                    println!("resolve {} -> {} (kind={} mode={:o} link={:?} size={})", vm_path, real, kind, mode, link, content.as_ref().map(|v| v.len()).unwrap_or(0));
+                    if let Some(t) = link { println!("  symlink -> {}", t); }
+                    if kind=="symlink" { println!("  (symlink hops resolved via 40-step vm_resolve)"); }
+                },
+                Err(e) => { eprintln!("vm-resolve {}: {}", vm_path, e); std::process::exit(1); }
+            }
         },
         Cmd::VmCheckpoint{db, name, note} => { let c=selfdb::vm::vm_open(&db)?; selfdb::vm::vm_checkpoint(&c, &name, &note)?; println!("checkpoint {} @ {}", name, db); },
         Cmd::VmSnapshots{db} => { let c=Connection::open(&db)?; for (id,name,ts,pc,bytes,note) in selfdb::vm::vm_list_snapshots(&c)? { println!("[{}] {} ts={} pc={} bytes={} note={}", id, name, ts, pc, bytes, note);} },
@@ -287,9 +398,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::VmCompressInfo{db} => {
             let c=selfdb::vm::vm_open(&db)?;
             let total_files: i64 = c.query_row("SELECT count(*) FROM vm_fs WHERE kind='file'", [], |r| r.get(0))?;
-            let comp_files: i64 = c.query_row("SELECT count(*) FROM vm_fs WHERE compressed=1", [], |r| r.get(0))?;
+            let comp_files: i64 = c.query_row("SELECT count(*) FROM vm_blobs WHERE compressed!=0", [], |r| r.get(0)).unwrap_or(0);
             let raw_sum: Option<i64> = c.query_row("SELECT sum(size) FROM vm_fs WHERE kind='file'", [], |r| r.get(0))?;
-            let blob_sum: Option<i64> = c.query_row("SELECT sum(length(content)) FROM vm_fs WHERE kind='file'", [], |r| r.get(0))?;
+            let blob_sum: Option<i64> = c.query_row("SELECT sum(length(content)) FROM vm_blobs", [], |r| r.get(0))?;
             let page_size: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0))?;
             let page_count: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             let journal: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
@@ -299,8 +410,85 @@ fn main() -> anyhow::Result<()> {
             println!("  blob storage: {} bytes (ratio {:.1}%)", blob_sum.unwrap_or(0), 100.0* (blob_sum.unwrap_or(0) as f64)/(raw_sum.unwrap_or(1) as f64));
             println!("  db file: {} bytes (page_size={} count={} journal={} mmap={})", page_size*page_count, page_size, page_count, journal, mmap);
         },
+        Cmd::VmRecompress{db} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            let (n, before, after) = selfdb::vm::vm_recompress(&c)?;
+            let _ = selfdb::vm::vm_gc(&c);
+            println!("recompress: {} files {} -> {} bytes (saved {} bytes, {:.1}% saved); VACUUM done", n, before, after, before-after, 100.0*(before-after) as f64/(before as f64 + 1.0));
+            let total_files: i64 = c.query_row("SELECT count(*) FROM vm_fs WHERE kind='file'", [], |r| r.get(0))?;
+            let comp_files: i64 = c.query_row("SELECT count(*) FROM vm_blobs WHERE compressed!=0", [], |r| r.get(0)).unwrap_or(0);
+            println!("now: {}/{} compressed", comp_files, total_files);
+        },
+        Cmd::VmStatus{db} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            println!("{}", selfdb::vm::vm_status(&c)?);
+        },
+        Cmd::VmCacheInfo => {
+            let (dir, cnt, bytes) = selfdb::vm::vm_cache_info();
+            println!("cache dir: {}", dir.display());
+            println!("  files: {}  bytes: {} ({:.2}M)", cnt, bytes, bytes as f64/1024.0/1024.0);
+        },
+        Cmd::VmCachePrune{max} => {
+            let bytes = parse_size(&max).unwrap_or(1024*1024*1024);
+            let (n, freed) = selfdb::vm::vm_cache_prune(bytes)?;
+            println!("prune max={} ({} bytes): removed {} files freed {} bytes ({:.2}M)", max, bytes, n, freed, freed as f64/1024.0/1024.0);
+        },
+        Cmd::VmTrainDict{db, max_size} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            match selfdb::vm::vm_train_dict(&c, max_size)? {
+                Some(d) => println!("train dict {} -> {} bytes samples dict_size={}", db, d.len(), max_size),
+                None => println!("train dict {}: not enough samples or failed (max_size={})", db, max_size),
+            }
+        },
+        Cmd::VmDictInfo{db} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            match selfdb::vm::vm_get_dict(&c)? {
+                Some(d) => println!("dict {}: {} bytes (vm_dict id=1)", db, d.len()),
+                None => println!("dict {}: none", db),
+            }
+        },
+        Cmd::VmDiff{db, a, b} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            println!("{}", selfdb::vm::vm_diff(&c, &a, &b)?);
+        },
+        Cmd::VmMount{db, mountpoint, allow_other} => {
+            #[cfg(feature = "fuse")]
+            {
+                selfdb::fuse::fuse_impl::mount_vm(&db, &mountpoint, allow_other)?;
+            }
+            #[cfg(not(feature = "fuse"))]
+            {
+                eprintln!("fuse feature not enabled: rebuild with --features fuse (needs fuser default-features=false, pure-rust, no libfuse)");
+                std::process::exit(1);
+            }
+        },
+        Cmd::VmMemTrace{db, prog, rest} => {
+            #[cfg(target_os = "linux")]
+            {
+                selfdb::vm::vm_mem_trace(&db, &prog, rest)?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("vm-mem-trace only on Linux");
+                let _ = (db, prog, rest);
+                std::process::exit(1);
+            }
+        },
     }
     Ok(())
+}
+
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    if s.ends_with('g') {
+        s[..s.len()-1].parse::<u64>().ok().map(|v| v*1024*1024*1024)
+    } else if s.ends_with('m') {
+        s[..s.len()-1].parse::<u64>().ok().map(|v| v*1024*1024)
+    } else if s.ends_with('k') {
+        s[..s.len()-1].parse::<u64>().ok().map(|v| v*1024)
+    } else {
+        s.parse::<u64>().ok()
+    }
 }
 
 fn selfdb_closure(root: &str, out: &str) -> anyhow::Result<()> {
