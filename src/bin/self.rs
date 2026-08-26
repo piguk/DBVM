@@ -58,6 +58,11 @@ enum Cmd {
     VmDiff{ db: String, a: String, b: String },
     VmMount{ db: String, mountpoint: String, #[arg(long)] allow_other: bool },
     VmMemTrace{ db: String, prog: String, rest: Vec<String> },
+    VmDiskInit{ db: String, #[arg(long, default_value="20G")] size: String },
+    VmDiskImport{ db: String, raw: String, #[arg(long, default_value="")] size: String },
+    VmDiskExport{ db: String, raw: String },
+    VmDiskInfo{ db: String },
+    VmRun{ db: String, #[arg(long, default_value="512M")] mem: String, #[arg(long)] nbd: bool, #[arg(long, default_value="")] raw: String, #[arg(long)] kvm: bool },
 }
 
 fn open_db(path: &str) -> Connection {
@@ -473,6 +478,60 @@ fn main() -> anyhow::Result<()> {
                 let _ = (db, prog, rest);
                 std::process::exit(1);
             }
+        },
+        Cmd::VmDiskInit{db, size} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            let bytes = parse_size(&size).ok_or_else(|| anyhow::anyhow!("bad size {}", size))? as i64;
+            selfdb::vm::vm_disk_init(&c, bytes)?;
+            println!("vm-disk-init {} size={} ({})", db, bytes, size);
+            println!("{}", selfdb::vm::vm_disk_info(&c)?);
+        },
+        Cmd::VmDiskImport{db, raw, size} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            let existing = selfdb::vm::vm_disk_size(&c).unwrap_or(0);
+            let disk_size = if !size.is_empty() { parse_size(&size).ok_or_else(|| anyhow::anyhow!("bad size {}", size))? as i64 }
+                            else if existing>0 { existing }
+                            else { std::fs::metadata(&raw).map(|m| m.len() as i64).unwrap_or(0) };
+            let rounded = (disk_size + 4095)/4096*4096;
+            let (total, nonzero)=selfdb::vm::vm_disk_import_raw(&c, &raw, rounded)?;
+            println!("vm-disk-import {} <- {} blocks={} nonzero={} disk={} bytes", db, raw, total, nonzero, rounded);
+            println!("{}", selfdb::vm::vm_disk_info(&c)?);
+        },
+        Cmd::VmDiskExport{db, raw} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            let (blocks, nonzero)=selfdb::vm::vm_disk_export_raw(&c, &raw)?;
+            println!("vm-disk-export {} -> {} blocks={} nonzero={}", db, raw, blocks, nonzero);
+        },
+        Cmd::VmDiskInfo{db} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            println!("{}", selfdb::vm::vm_disk_info(&c)?);
+        },
+        Cmd::VmRun{db, mem, nbd, raw, kvm} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            let info=selfdb::vm::vm_disk_info(&c)?;
+            println!("{}", info);
+            let disk_size=selfdb::vm::vm_disk_size(&c).unwrap_or(0);
+            let raw_path = if raw.is_empty() {
+                let p = format!("/tmp/self-vm-disk-{}.raw", std::process::id());
+                selfdb::vm::vm_disk_export_raw(&c, &p)?;
+                println!("exported disk -> {} ({} bytes)", p, disk_size);
+                p
+            } else {
+                if std::path::Path::new(&raw).exists() && disk_size==0 {
+                    let sz = std::fs::metadata(&raw).map(|m| m.len() as i64).unwrap_or(0);
+                    selfdb::vm::vm_disk_init(&c, (sz+4095)/4096*4096)?;
+                    let (total, nonzero)=selfdb::vm::vm_disk_import_raw(&c, &raw, (sz+4095)/4096*4096)?;
+                    println!("imported {} -> vm_disk_blocks ({} blocks nonzero={})", raw, total, nonzero);
+                }
+                raw.to_string()
+            };
+            let qemu = std::env::var("QEMU_SYSTEM_X86_64").unwrap_or_else(|_| "qemu-system-x86_64".to_string());
+            let mut args: Vec<String> = vec!["-m".to_string(), mem.clone(), "-drive".to_string(), format!("file={},format=raw,if=virtio", raw_path), "-serial".to_string(), "mon:stdio".to_string(), "-nographic".to_string()];
+            if kvm && std::path::Path::new("/dev/kvm").exists() { args.push("-enable-kvm".to_string()); args.push("-cpu".to_string()); args.push("host".to_string()); }
+            if nbd { println!("hint: qemu {} {}", qemu, args.join(" ")); println!("or NBD: qemu-nbd --connect=/dev/nbd0 {} (needs nbd kernel)", raw_path); }
+            println!("boot: {} {}", qemu, args.join(" "));
+            let status = std::process::Command::new(&qemu).args(&args).status()?;
+            std::process::exit(status.code().unwrap_or(0));
         },
     }
     Ok(())

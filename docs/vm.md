@@ -90,3 +90,48 @@ sqlite3 /tmp/alpine.vm.db "SELECT id,addr,size,prot,length(content) FROM vm_mem 
 - `vm-exec` ~ musl interpreter 派遣开销，`vm-chroot(FUSE)` 零物化开销（仅首读解压），回落分支为 88 文件并行物化。
 
 实现：`src/vm.rs` (`VMSQ`, `vm_blobs/vm_fs/vm_mem/vm_dict`, `vm_resolve` 40 跳, `vm_materialize_tree`, `vm_sync_from_host`, `compress_bytes_with_conn`)、`src/fuse.rs` (`VmFuse`, `statfs`, `staged flush -> vm_add_bytes`)、`src/bin/self.rs:Vm*`。
+
+## 20G 分页块设备（完整 VM/内核路线 B）
+
+单一 `*.db` 调度硬盘按 4K 分页稀疏 `vm_disk_blocks(block_id PK, content BLOB, compressed, raw_size)`，空洞零开销；`vm_meta.disk_size` 记录逻辑大小（需为 4K 倍数），`disk_block_size=4096`。
+
+```sh
+# 1. 预分配 20G（稀疏，空库 136K）
+./target/release/self vm-init /tmp/vm.db --force --vm-only
+./target/release/self vm-disk-init /tmp/vm.db --size 20G
+./target/release/self vm-disk-info /tmp/vm.db            # blocks=5242880 stored=0 sparse_hole=20G
+./target/release/self vm-status /tmp/vm.db                # 同时显示 files/blob + disk
+
+# 2. 从 raw 镜像导入（稀疏写：零页不落库，zstd 页按需压）
+/sbin/mke2fs -d /tmp/mini_root -t ext2 -b 1024 -m 0 -O ^has_journal -F /tmp/disk.raw 32M   # 宿主造盘
+./target/release/self vm-disk-import /tmp/vm.db /tmp/disk.raw                         # 已存在 20G 时不收缩；指定 --size 可显式扩/缩
+sqlite3 /tmp/vm.db "SELECT count(*) FROM vm_disk_blocks"  # 32M 示例仅 148 块存储
+
+# 3. 以块为粒度读写（用于增量 sync/NBD）
+python3 - <<'PY2'
+import rusqlite
+# 等价 SQL：vm_disk_read/write 暴露为 API，CLI 可扩展 vm-disk-read/write
+PY2
+
+# 4. 导出 raw（稀疏 seek：20G 空洞零成本，仅回放 148 块；落盘后可用 loop/NBD 接内核）
+./target/release/self vm-disk-export /tmp/vm.db /tmp/vm.db.raw   # set_len(disk) + pwrite 已压缩块
+cmp /tmp/disk.raw /tmp/vm.db.raw && echo ok
+ls -lh /tmp/vm.db /tmp/vm.db.raw   # db 约 952K vs raw 32M 稀疏感知仅 400K 压缩存储
+
+# 5. 跑完整 kernel（需宿主 qemu-system-x86_64）
+apt install qemu-system-x86  # 宿主
+qemu-img create -f raw /tmp/empty.raw 20G
+./target/release/self vm-disk-export /tmp/vm.db /tmp/boot.raw   # 或直接用空洞 raw 接 NBD
+qemu-system-x86_64 -m 512M -drive file=/tmp/boot.raw,format=raw,if=virtio -serial mon:stdio -nographic
+# NBD 稀疏按需（避免导出 20G 实体）：
+qemu-nbd --shared=4 -x selfdisk -f raw /tmp/boot.raw -p 10809 -t &
+qemu-system-x86_64 -m 512M -drive file=nbd:localhost:10809/1,format=raw,if=virtio -serial mon:stdio -nographic
+# vm-run 便捷壳（自动 export -> qemu）：
+./target/release/self vm-run /tmp/vm.db --mem 512M --raw /tmp/boot.raw   # 或不带 --raw 则临时 /tmp/self-vm-disk-*.raw
+./target/release/self vm-run /tmp/vm.db --mem 1G --kvm                       # 宿主有 /dev/kvm 时加 --kvm
+```
+
+内存亦在同表：`vm_mem(addr,size,prot,content)` 记录 `mmap/mprotect` image，`vm-mem-trace` 自 `strace` 解析；`vm_snapshots/vm_log` 则作 checkpoint。`vm_fs + vm_mem + vm_disk_blocks` 同库即“硬盘+内存全在同一 sqlite 不同表/分页”，WAL+`journal_size_limit 64M` 保证事务安全，`vm_gc` 回收稀疏空洞。
+
+局限：QEMU 侧需宿主真实 qemu / kvm；NBD 真正零拷贝需 nbd-server 将 `vm_disk_blocks` 作为后端（当前为 `vm-disk-export + qemu-nbd` 二段，待补 `rusteNBD` 直读）。
+

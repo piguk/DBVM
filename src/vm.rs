@@ -94,6 +94,12 @@ fn ensure_dict_table(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+fn ensure_disk_blocks_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vm_disk_blocks(block_id INTEGER PRIMARY KEY, content BLOB NOT NULL, compressed INTEGER NOT NULL DEFAULT 0, raw_size INTEGER NOT NULL);"
+    )?;
+    Ok(())
+}
 
 pub fn vm_open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -112,6 +118,7 @@ pub fn vm_open(path: &str) -> Result<Connection> {
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_vm_fs_hash ON vm_fs(hash)", []);
     ensure_blob_table(&conn)?;
     ensure_dict_table(&conn)?;
+    let _ = ensure_disk_blocks_table(&conn);
     // load dict into global cache for decompress of flag 3
     let _ = vm_dict_load_global(&conn);
     // migrate page_size if still 4096 -> suggest VACUUM with 8192 on next gc if desired; we don't force rewrite here to avoid surprise slowdown
@@ -177,6 +184,12 @@ CREATE TABLE IF NOT EXISTS vm_dict(
   samples INTEGER NOT NULL,
   dict_size INTEGER NOT NULL,
   created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE TABLE IF NOT EXISTS vm_disk_blocks(
+  block_id INTEGER PRIMARY KEY,
+  content BLOB NOT NULL,
+  compressed INTEGER NOT NULL DEFAULT 0,
+  raw_size INTEGER NOT NULL
 );
 "#, app=VM_APP_ID, ver=VM_USER_VERSION)
 }
@@ -1153,10 +1166,12 @@ pub fn vm_status(conn: &Connection) -> Result<String> {
     let (cache_dir, cache_files, cache_bytes) = vm_cache_info();
     let logical = logical.unwrap_or(0);
     let ratio = if logical>0 { 100.0 * blob_storage as f64 / logical as f64 } else { 0.0 };
+    let disk_line = vm_disk_info(conn).unwrap_or_else(|_| "disk: none".to_string());
     Ok(format!(
-        "integrity={} page_size={} page_count={} freelist={} auto_vacuum={} journal={} mmap={} cache_size={}\nfiles={} (dir={} file={} symlink={}) logical={} blob_storage={} ({:.1}%) blobs={} compressed={} snaps={}\ncache: dir={} files={} bytes={}",
+        "integrity={} page_size={} page_count={} freelist={} auto_vacuum={} journal={} mmap={} cache_size={}\nfiles={} (dir={} file={} symlink={}) logical={} blob_storage={} ({:.1}%) blobs={} compressed={} snaps={}\n{}\ncache: dir={} files={} bytes={}",
         integrity, page_size, page_count, freelist, auto_vac, journal, mmap, cache_size,
         files, dirs, fcnt, syms, logical, blob_storage, ratio, blob_cnt, comp_cnt, snaps,
+        disk_line,
         cache_dir.display(), cache_files, cache_bytes
     ))
 }
@@ -1326,3 +1341,162 @@ pub fn vm_verify(conn: &Connection) -> Result<String> {
     let bytes: Option<i64> = conn.query_row("SELECT sum(size) FROM vm_fs WHERE kind='file'", [], |r| r.get(0))?;
     Ok(format!("integrity={} page_size={} page_count={} freelist={} files={} bytes={}", integrity, page_size, page_count, freelist, files, bytes.unwrap_or(0)))
 }
+
+pub const DISK_BLOCK_SIZE: i64 = 4096;
+pub fn vm_disk_init(conn: &Connection, size_bytes: i64) -> Result<()> {
+    ensure_disk_blocks_table(conn)?;
+    if size_bytes % DISK_BLOCK_SIZE != 0 { return Err(anyhow!("size must be multiple of {}", DISK_BLOCK_SIZE)); }
+    conn.execute("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)", params!["disk_size", size_bytes.to_string()])?;
+    conn.execute("UPDATE vm_meta SET value=?1 WHERE key='disk_size'", params![size_bytes.to_string()])?;
+    let bs: i64 = DISK_BLOCK_SIZE;
+    if let Ok(v) = conn.query_row("SELECT value FROM vm_meta WHERE key='disk_block_size'", [], |r| r.get::<_,String>(0)) {
+        if v != bs.to_string() { conn.execute("UPDATE vm_meta SET value=?1 WHERE key='disk_block_size'", params![bs.to_string()])?; }
+    } else {
+        conn.execute("INSERT INTO vm_meta VALUES (?1,?2)", params!["disk_block_size", bs.to_string()])?;
+    }
+    Ok(())
+}
+pub fn vm_disk_size(conn: &Connection) -> Result<i64> {
+    ensure_disk_blocks_table(conn)?;
+    let v: Option<String> = conn.query_row("SELECT value FROM vm_meta WHERE key='disk_size'", [], |r| r.get(0)).optional()?;
+    if let Some(s) = v { if let Ok(n) = s.parse::<i64>() { return Ok(n); } }
+    Ok(0)
+}
+fn is_all_zero(b: &[u8]) -> bool { b.iter().all(|&x| x==0) }
+pub fn vm_disk_read(conn: &Connection, offset: i64, len: i64) -> Result<Vec<u8>> {
+    ensure_disk_blocks_table(conn)?;
+    let disk: i64 = vm_disk_size(conn)?;
+    if offset < 0 || len < 0 || offset+len > disk { return Err(anyhow!("disk read out of range offset={} len={} disk={}", offset, len, disk)); }
+    if len == 0 { return Ok(vec![]); }
+    let bs = DISK_BLOCK_SIZE;
+    let mut out = Vec::with_capacity(len as usize);
+    let start_block = offset / bs;
+    let end_block = (offset+len-1)/bs;
+    for bid in start_block..=end_block {
+        let block_off = bid*bs;
+        let raw: Option<(Vec<u8>, i64)> = conn.query_row("SELECT content, compressed FROM vm_disk_blocks WHERE block_id=?1", params![bid], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let block_bytes: Vec<u8> = if let Some((data, comp)) = raw {
+            if comp == 2 { zstd::bulk::decompress(&data, bs as usize).map_err(|e| anyhow!("zstd decompress block {}: {}", bid, e))? }
+            else if comp == 1 { let mut d=flate2::read::GzDecoder::new(&data[..]); let mut o=Vec::new(); d.read_to_end(&mut o)?; o }
+            else { data }
+        } else { vec![0u8; bs as usize] };
+        let mut bb = block_bytes;
+        if bb.len() < bs as usize { bb.resize(bs as usize, 0); }
+        let want_off = (offset.max(block_off) - block_off) as usize;
+        let want_end = ((offset+len).min(block_off+bs) - block_off) as usize;
+        out.extend_from_slice(&bb[want_off..want_end]);
+    }
+    Ok(out)
+}
+pub fn vm_disk_write(conn: &Connection, offset: i64, data: &[u8]) -> Result<()> {
+    ensure_disk_blocks_table(conn)?;
+    let disk: i64 = vm_disk_size(conn)?;
+    let len = data.len() as i64;
+    if offset < 0 || len < 0 || offset+len > disk { return Err(anyhow!("disk write out of range offset={} len={} disk={}", offset, len, disk)); }
+    if len == 0 { return Ok(()); }
+    let bs = DISK_BLOCK_SIZE as usize;
+    let bs_i = DISK_BLOCK_SIZE;
+    let start = offset/bs_i;
+    let end = (offset+len-1)/bs_i;
+    let mut data_off = 0usize;
+    for bid in start..=end {
+        let block_off = bid*bs_i;
+        let raw_exist: Option<(Vec<u8>, i64)> = conn.query_row("SELECT content, compressed FROM vm_disk_blocks WHERE block_id=?1", params![bid], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let mut block: Vec<u8> = if let Some((d, comp)) = raw_exist {
+            if comp == 2 { zstd::bulk::decompress(&d, bs).map_err(|e| anyhow!("zstd decompress block {}: {}", bid, e))? }
+            else if comp == 1 { let mut dec=flate2::read::GzDecoder::new(&d[..]); let mut o=Vec::new(); dec.read_to_end(&mut o)?; o }
+            else { d }
+        } else { vec![0u8; bs] };
+        if block.len() < bs { block.resize(bs, 0); }
+        let lo = (offset.max(block_off)-block_off) as usize;
+        let hi = ((offset+len).min(block_off+bs_i)-block_off) as usize;
+        let n = hi-lo;
+        block[lo..hi].copy_from_slice(&data[data_off..data_off+n]);
+        data_off += n;
+        if is_all_zero(&block) {
+            conn.execute("DELETE FROM vm_disk_blocks WHERE block_id=?1", params![bid])?;
+        } else {
+            let comp_opt = compress_bytes(&block);
+            let (content, compressed, raw_size): (Vec<u8>, i64, i64) = if let Some(c) = comp_opt { (c, 2, bs as i64) } else { (block.clone(), 0, bs as i64) };
+            conn.execute("INSERT OR REPLACE INTO vm_disk_blocks(block_id, content, compressed, raw_size) VALUES (?1,?2,?3,?4)", params![bid, content, compressed, raw_size])?;
+        }
+    }
+    conn.execute("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)", params!["disk_version", "0"])?;
+    Ok(())
+}
+pub fn vm_disk_import_raw(conn: &Connection, raw_path: &str, disk_size: i64) -> Result<(i64,i64)> {
+    let existing = vm_disk_size(conn).unwrap_or(0);
+    let target = if existing>0 && existing>disk_size { existing } else { disk_size };
+    vm_disk_init(conn, target)?;
+    let mut f = std::fs::File::open(raw_path)?;
+    let mut buf = vec![0u8; DISK_BLOCK_SIZE as usize];
+    let mut bid: i64 = 0;
+    let mut nonzero: i64 = 0;
+    let mut total: i64 = 0;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 { break; }
+        if n < buf.len() { buf[n..].fill(0); }
+        let slice = &buf[..];
+        if !is_all_zero(slice) {
+            let comp_opt = compress_bytes(slice);
+            let (content, compressed, raw_size): (Vec<u8>, i64, i64) = if let Some(c)=comp_opt { (c, 2, DISK_BLOCK_SIZE) } else { (slice.to_vec(), 0, DISK_BLOCK_SIZE) };
+            conn.execute("INSERT OR REPLACE INTO vm_disk_blocks(block_id, content, compressed, raw_size) VALUES (?1,?2,?3,?4)", params![bid, content, compressed, raw_size])?;
+            nonzero += 1;
+        } else {
+            conn.execute("DELETE FROM vm_disk_blocks WHERE block_id=?1", params![bid])?;
+        }
+        total +=1;
+        bid+=1;
+        if total%1024==0 { let _=conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);"); }
+        if bid*DISK_BLOCK_SIZE >= disk_size { break; }
+    }
+    for id in bid..(disk_size/DISK_BLOCK_SIZE) {
+        conn.execute("DELETE FROM vm_disk_blocks WHERE block_id=?1", params![id])?;
+    }
+    Ok((total, nonzero))
+}
+pub fn vm_disk_export_raw(conn: &Connection, raw_path: &str) -> Result<(i64,i64)> {
+    ensure_disk_blocks_table(conn)?;
+    let disk = vm_disk_size(conn)?;
+    let mut f = std::fs::File::create(raw_path)?;
+    f.set_len(disk as u64)?;
+    let bs = DISK_BLOCK_SIZE as usize;
+    let blocks = disk/DISK_BLOCK_SIZE;
+    if blocks > 10_000_000 {
+        return Err(anyhow!("refusing to export huge disk {} blocks: use NBD or limit size", blocks));
+    }
+    // sparse: iterate only stored blocks, so 20G (5.2M blocks) with <1% stored is fine
+    let mut nonzero=0i64;
+    use std::io::{Seek, SeekFrom};
+    let mut stmt = conn.prepare("SELECT block_id, content, compressed FROM vm_disk_blocks ORDER BY block_id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?)))?;
+    for row in rows {
+        let (bid, data, comp) = row?;
+        let bytes: Vec<u8> = if comp==2 { zstd::bulk::decompress(&data, bs).map_err(|e| anyhow!("zstd decompress export {}: {}", bid, e))? } else if comp==1 { let mut d=flate2::read::GzDecoder::new(&data[..]); let mut o=Vec::new(); d.read_to_end(&mut o)?; o } else { data };
+        let mut b = bytes; if b.len()<bs { b.resize(bs, 0); }
+        if is_all_zero(&b) { continue; }
+        f.seek(SeekFrom::Start((bid*DISK_BLOCK_SIZE) as u64))?;
+        f.write_all(&b)?;
+        nonzero+=1;
+    }
+    Ok((blocks, nonzero))
+}
+pub fn vm_disk_export_raw_sparse(conn: &Connection, raw_path: &str) -> Result<(i64,i64)> { vm_disk_export_raw(conn, raw_path) }
+pub fn vm_disk_info(conn: &Connection) -> Result<String> {
+    ensure_disk_blocks_table(conn)?;
+    let disk = vm_disk_size(conn)?;
+    let blocks = disk/DISK_BLOCK_SIZE;
+    let stored: i64 = conn.query_row("SELECT count(*) FROM vm_disk_blocks", [], |r| r.get(0))?;
+    let raw_storage: Option<i64> = conn.query_row("SELECT sum(length(content)) FROM vm_disk_blocks", [], |r| r.get(0))?;
+    let raw_storage = raw_storage.unwrap_or(0);
+    let logical = stored*DISK_BLOCK_SIZE;
+    Ok(format!("disk size={} bytes ({:.2}G) blocks={} stored_blocks={} logical_stored={} sparse_hole={} bytes compressed_storage={} bytes ratio={:.1}% page_size={} page_count={}",
+        disk, disk as f64/1024.0/1024.0/1024.0, blocks, stored, logical, disk-logical, raw_storage, if disk>0 {100.0*raw_storage as f64/disk as f64} else {0.0},
+        conn.query_row("PRAGMA page_size", [], |r| r.get::<_,i64>(0)).unwrap_or(0),
+        conn.query_row("PRAGMA page_count", [], |r| r.get::<_,i64>(0)).unwrap_or(0)))
+}
+pub fn vm_disk_nbd_serve(db_path: &str, host: &str, port: u16) -> Result<()> {
+    anyhow::bail!("NBD serve via sqlite is experimental: export raw then use qemu-nbd --shared=4 -x selfdisk {} or rusteNBD. disk_size={} bytes. Steps: vm-disk-export {} /tmp/disk.raw && qemu-nbd -f raw -x selfdisk /tmp/disk.raw -p {} -t & qemu-system-x86_64 -m 512M -drive file=nbd:{}:{}/1,format=raw,if=virtio -serial mon:stdio -nographic", host, vm_disk_size(&vm_open(db_path)?)?, db_path, port, host, port)
+}
+
