@@ -126,7 +126,7 @@ qemu-system-x86_64 -m 512M -drive file=/tmp/boot.raw,format=raw,if=virtio -seria
 # NBD 稀疏按需（避免导出 20G 实体）：
 qemu-nbd --shared=4 -x selfdisk -f raw /tmp/boot.raw -p 10809 -t &
 qemu-system-x86_64 -m 512M -drive file=nbd:localhost:10809/1,format=raw,if=virtio -serial mon:stdio -nographic
-# vm-run 便捷壳（自动 export -> qemu）：
+# vm-run 便捷壳（自动 export -> qemu）；若 raw 仅是 ext2（如 /tmp/test_disk.raw 无 MBR/GRUB）会报 Boot failed: could not read the boot disk，需加 --kernel 直启：
 ./target/release/self vm-run /tmp/vm.db --mem 512M --raw /tmp/boot.raw   # 或不带 --raw 则临时 /tmp/self-vm-disk-*.raw
 ./target/release/self vm-run /tmp/vm.db --mem 1G --kvm                       # 宿主有 /dev/kvm 时加 --kvm
 QEMU=/usr/bin/qemu-system-i386 ./target/release/self vm-run /tmp/vm.db          # 覆盖探测
@@ -134,6 +134,20 @@ QEMU_SYSTEM_X86_64=/usr/bin/qemu-system-x86_64 ./target/release/self vm-run /tmp
 ```
 
 内存亦在同表：`vm_mem(addr,size,prot,content)` 记录 `mmap/mprotect` image，`vm-mem-trace` 自 `strace` 解析；`vm_snapshots/vm_log` 则作 checkpoint。`vm_fs + vm_mem + vm_disk_blocks` 同库即“硬盘+内存全在同一 sqlite 不同表/分页”，WAL+`journal_size_limit 64M` 保证事务安全，`vm_gc` 回收稀疏空洞。
+
+排障：
+
+- **Boot failed: could not read the boot disk / Booting from Hard Disk... iPXE No bootable device**：`vm_disk_blocks` 或 `raw` 仅含 ext2 数据分区，无 MBR/GRUB/SeaBIOS 可引导。QEMU 仅接 `-drive` 会走 SeaBIOS->iPXE 网络引导并失败。解决：
+  ```sh
+  # 直启内核（无需 bootloader，适合测试 /tmp/test_disk.raw 这类 mke2fs -d 生成的盘）
+  ./target/release/self vm-run /tmp/vm.db --kernel /boot/vmlinuz-6.12.74+deb13+1-amd64 \
+      --initrd /boot/initrd.img-6.12.74+deb13+1-amd64 --append "console=ttyS0 root=/dev/vda rw panic=1"
+  # 或让 vm-run 自动探测宿主内核（无 --kernel 但检测到无 MBR 时自动用 /boot/vmlinuz）
+  ./target/release/self vm-run /tmp/vm.db
+  # 生产可引导盘需先安装 bootloader：
+  losetup /dev/loop0 /tmp/boot.raw && echo 'type=83,bootable' | sfdisk /dev/loop0 && mkfs.ext4 /dev/loop0p1 && mount ... && grub-install --boot-directory=/mnt/boot /dev/loop0 && umount ...
+  ```
+  `vm-run` 已在无 MBR 时打印 `note: disk has no MBR/bootloader ... Use: vm-run --kernel ...`。
 
 局限：QEMU 侧需宿主真实 qemu / kvm；NBD 真正零拷贝需 nbd-server 将 `vm_disk_blocks` 作为后端（当前为 `vm-disk-export + qemu-nbd` 二段，待补 `rusteNBD` 直读）。
 

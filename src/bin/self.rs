@@ -62,7 +62,7 @@ enum Cmd {
     VmDiskImport{ db: String, raw: String, #[arg(long, default_value="")] size: String },
     VmDiskExport{ db: String, raw: String },
     VmDiskInfo{ db: String },
-    VmRun{ db: String, #[arg(long, default_value="512M")] mem: String, #[arg(long)] nbd: bool, #[arg(long, default_value="")] raw: String, #[arg(long)] kvm: bool },
+    VmRun{ db: String, #[arg(long, default_value="512M")] mem: String, #[arg(long)] nbd: bool, #[arg(long, default_value="")] raw: String, #[arg(long)] kvm: bool, #[arg(long, default_value="")] kernel: String, #[arg(long, default_value="")] initrd: String, #[arg(long, default_value="")] append: String },
 }
 
 fn open_db(path: &str) -> Connection {
@@ -506,7 +506,7 @@ fn main() -> anyhow::Result<()> {
             let c=selfdb::vm::vm_open(&db)?;
             println!("{}", selfdb::vm::vm_disk_info(&c)?);
         },
-        Cmd::VmRun{db, mem, nbd, raw, kvm} => {
+        Cmd::VmRun{db, mem, nbd, raw, kvm, kernel, initrd, append} => {
             let c=selfdb::vm::vm_open(&db)?;
             let info=selfdb::vm::vm_disk_info(&c)?;
             println!("{}", info);
@@ -536,9 +536,78 @@ fn main() -> anyhow::Result<()> {
                     }
                     "qemu-system-x86_64".to_string()
                 });
+            // direct kernel boot path (no bootloader needed) via -kernel/-initrd/-append
+            // If kernel empty but disk has no bootable MBR (e.g. /tmp/test_disk.raw ext2 only), auto-suggest direct boot.
+            // Also treat direct vm DB disk (no --raw) as .raw-like for probing: check the exported raw_path.
+            let mut boot_args: Vec<String> = Vec::new();
+            let effective_kernel = if !kernel.is_empty() { Some(kernel.clone()) } else {
+                let is_raw_like = raw_path.ends_with(".raw") || raw.is_empty();
+                if is_raw_like {
+                    // probe disk for MBR bootable signature; if missing, use host kernel + busybox trick
+                    let has_mbr = std::fs::File::open(&raw_path).ok().and_then(|mut f| {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let mut b = [0u8; 512];
+                        if f.read_exact(&mut b).is_ok() { Some(b[510]==0x55 && b[511]==0xAA) } else { None }
+                    }).unwrap_or(false);
+                    if !has_mbr {
+                        // use host kernel + initrd for demo when disk is just an ext2 fs (like /tmp/test_disk.raw)
+                        // robust host kernel probe: try /vmlinuz symlink, /boot/vmlinuz*, explicit fallback
+                        let mut host_k: Option<String> = None;
+                        for cand in ["/vmlinuz".to_string(), "/boot/vmlinuz".to_string(), format!("/boot/vmlinuz-{}", std::env::var("HOST_KERNEL").unwrap_or_default()), "/boot/vmlinuz-6.12.74+deb13+1-amd64".to_string()] {
+                            if !cand.is_empty() && std::path::Path::new(&cand).exists() { host_k = Some(cand); break; }
+                            // also handle /vmlinuz -> boot/vmlinuz-* relative link: canonicalize
+                            if cand == "/vmlinuz" {
+                                if let Ok(link) = std::fs::read_link(&cand) {
+                                    let abs = if link.is_absolute() { link } else { std::path::Path::new("/").join(link) };
+                                    if abs.exists() { host_k = Some(abs.to_string_lossy().to_string()); break; }
+                                    // also try resolving via canonicalize
+                                    if let Ok(canon) = std::fs::canonicalize(&cand) { if canon.exists() { host_k = Some(canon.to_string_lossy().to_string()); break; } }
+                                }
+                            }
+                        }
+                        if host_k.is_none() {
+                            if let Ok(rd) = std::fs::read_dir("/boot") {
+                                for e in rd.flatten() {
+                                    let n = e.file_name().to_string_lossy().to_string();
+                                    if n.starts_with("vmlinuz-") { host_k = Some(e.path().to_string_lossy().to_string()); break; }
+                                }
+                            }
+                        }
+                        let host_k = host_k.unwrap_or_else(|| "/boot/vmlinuz-6.12.74+deb13+1-amd64".to_string());
+                        if std::path::Path::new(&host_k).exists() { Some(host_k) } else { None }
+                    } else { None }
+                } else { None }
+            };
+            if let Some(k) = &effective_kernel {
+                // -kernel boot needs --raw to be the rootfs disk; we pass it as virtio drive + root=/dev/vda
+                let initrd_arg = if !initrd.is_empty() { Some(initrd.clone()) } else {
+                    // try to guess initrd for host kernel
+                    let guess = k.replace("vmlinuz", "initrd.img");
+                    if std::path::Path::new(&guess).exists() { Some(guess) } else {
+                        ["/boot/initrd.img-6.12.74+deb13+1-amd64", "/boot/initrd.img"].into_iter().find(|p| std::path::Path::new(p).exists()).map(|s| s.to_string())
+                    }
+                };
+                boot_args.push("-kernel".to_string()); boot_args.push(k.clone());
+                if let Some(ir) = initrd_arg { boot_args.push("-initrd".to_string()); boot_args.push(ir); }
+                let app = if !append.is_empty() { append.clone() } else { "console=ttyS0 root=/dev/vda rw panic=1".to_string() };
+                boot_args.push("-append".to_string()); boot_args.push(app);
+                println!("direct-kernel boot: kernel={} initrd={} append={:?}", k, initrd, if append.is_empty() { "console=ttyS0 root=/dev/vda rw panic=1" } else { &append });
+            }
             let mut args: Vec<String> = vec!["-m".to_string(), mem.clone(), "-drive".to_string(), format!("file={},format=raw,if=virtio", raw_path), "-serial".to_string(), "mon:stdio".to_string(), "-nographic".to_string()];
+            args.extend(boot_args);
             if kvm && std::path::Path::new("/dev/kvm").exists() { args.push("-enable-kvm".to_string()); args.push("-cpu".to_string()); args.push("host".to_string()); }
             if nbd { println!("hint: qemu {} {}", qemu, args.join(" ")); println!("or NBD: qemu-nbd --connect=/dev/nbd0 {} (needs nbd kernel)", raw_path); }
+            // warn if MBR missing and no kernel provided
+            if effective_kernel.is_none() && !raw_path.is_empty() {
+                let has_mbr = std::fs::File::open(&raw_path).ok().and_then(|mut f| {
+                    use std::io::{Read, Seek};
+                    let mut b = [0u8; 512];
+                    if f.seek(std::io::SeekFrom::Start(510)).is_ok() && f.read_exact(&mut b[0..2]).is_ok() { Some(b[0]==0x55 && b[1]==0xAA) } else { None }
+                }).unwrap_or(false);
+                if !has_mbr {
+                    eprintln!("note: disk {} has no MBR/bootloader (ext2 only); boot will fall back to iPXE/SeaBIOS and fail with 'Boot failed: could not read the boot disk'. Use: vm-run --kernel /boot/vmlinuz --initrd /boot/initrd.img --append 'console=ttyS0 root=/dev/vda rw' OR build a bootable image with grub.", raw_path);
+                }
+            }
             println!("boot: {} {}  (apt: qemu-system-x86 provides {})", qemu, args.join(" "), qemu);
             let status = std::process::Command::new(&qemu).args(&args).status().map_err(|e| anyhow::anyhow!("exec {} failed: {} (apt install qemu-system-x86)", qemu, e))?;
             std::process::exit(status.code().unwrap_or(0));
