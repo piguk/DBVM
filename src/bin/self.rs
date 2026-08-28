@@ -580,8 +580,10 @@ fn main() -> anyhow::Result<()> {
             };
             if let Some(k) = &effective_kernel {
                 // -kernel boot needs --raw to be the rootfs disk; we pass it as virtio drive + root=/dev/vda
-                let initrd_arg = if !initrd.is_empty() { Some(initrd.clone()) } else {
-                    // try to guess initrd for host kernel
+                let initrd_arg = if !initrd.is_empty() {
+                    if initrd=="none" || initrd=="no" || initrd=="0" { None } else { Some(initrd.clone()) }
+                } else {
+                    // try to guess initrd for host kernel (skip if user wants none)
                     let guess = k.replace("vmlinuz", "initrd.img");
                     if std::path::Path::new(&guess).exists() { Some(guess) } else {
                         ["/boot/initrd.img-6.12.74+deb13+1-amd64", "/boot/initrd.img"].into_iter().find(|p| std::path::Path::new(p).exists()).map(|s| s.to_string())
