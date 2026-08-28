@@ -525,12 +525,22 @@ fn main() -> anyhow::Result<()> {
                 }
                 raw.to_string()
             };
-            let qemu = std::env::var("QEMU_SYSTEM_X86_64").unwrap_or_else(|_| "qemu-system-x86_64".to_string());
+            let qemu = std::env::var("QEMU_SYSTEM_X86_64")
+                .or_else(|_| std::env::var("QEMU"))
+                .unwrap_or_else(|_| {
+                    for c in ["qemu-system-x86_64", "qemu-system-x86", "qemu-system-i386"] {
+                        if std::path::Path::new(&format!("/usr/bin/{}", c)).exists() { return c.to_string(); }
+                        if let Ok(out) = std::process::Command::new("which").arg(c).output() {
+                            if out.status.success() { return c.to_string(); }
+                        }
+                    }
+                    "qemu-system-x86_64".to_string()
+                });
             let mut args: Vec<String> = vec!["-m".to_string(), mem.clone(), "-drive".to_string(), format!("file={},format=raw,if=virtio", raw_path), "-serial".to_string(), "mon:stdio".to_string(), "-nographic".to_string()];
             if kvm && std::path::Path::new("/dev/kvm").exists() { args.push("-enable-kvm".to_string()); args.push("-cpu".to_string()); args.push("host".to_string()); }
             if nbd { println!("hint: qemu {} {}", qemu, args.join(" ")); println!("or NBD: qemu-nbd --connect=/dev/nbd0 {} (needs nbd kernel)", raw_path); }
-            println!("boot: {} {}", qemu, args.join(" "));
-            let status = std::process::Command::new(&qemu).args(&args).status()?;
+            println!("boot: {} {}  (apt: qemu-system-x86 provides {})", qemu, args.join(" "), qemu);
+            let status = std::process::Command::new(&qemu).args(&args).status().map_err(|e| anyhow::anyhow!("exec {} failed: {} (apt install qemu-system-x86)", qemu, e))?;
             std::process::exit(status.code().unwrap_or(0));
         },
     }

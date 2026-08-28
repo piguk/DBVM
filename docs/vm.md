@@ -119,16 +119,18 @@ cmp /tmp/disk.raw /tmp/vm.db.raw && echo ok
 ls -lh /tmp/vm.db /tmp/vm.db.raw   # db 约 952K vs raw 32M 稀疏感知仅 400K 压缩存储
 
 # 5. 跑完整 kernel（需宿主 qemu-system-x86_64）
-apt install qemu-system-x86  # 宿主
+apt install qemu-system-x86  # 宿主（提供 qemu-system-x86_64 / qemu-system-i386 二者皆可，本项目自动探测）
 qemu-img create -f raw /tmp/empty.raw 20G
 ./target/release/self vm-disk-export /tmp/vm.db /tmp/boot.raw   # 或直接用空洞 raw 接 NBD
-qemu-system-x86_64 -m 512M -drive file=/tmp/boot.raw,format=raw,if=virtio -serial mon:stdio -nographic
+qemu-system-x86_64 -m 512M -drive file=/tmp/boot.raw,format=raw,if=virtio -serial mon:stdio -nographic  # 若宿主仅有 qemu-system-x86，二进制为 /usr/bin/qemu-system-i386，vm-run 会自动探测并可用 QEMU=/usr/bin/qemu-system-i386 覆盖
 # NBD 稀疏按需（避免导出 20G 实体）：
 qemu-nbd --shared=4 -x selfdisk -f raw /tmp/boot.raw -p 10809 -t &
 qemu-system-x86_64 -m 512M -drive file=nbd:localhost:10809/1,format=raw,if=virtio -serial mon:stdio -nographic
 # vm-run 便捷壳（自动 export -> qemu）：
 ./target/release/self vm-run /tmp/vm.db --mem 512M --raw /tmp/boot.raw   # 或不带 --raw 则临时 /tmp/self-vm-disk-*.raw
 ./target/release/self vm-run /tmp/vm.db --mem 1G --kvm                       # 宿主有 /dev/kvm 时加 --kvm
+QEMU=/usr/bin/qemu-system-i386 ./target/release/self vm-run /tmp/vm.db          # 覆盖探测
+QEMU_SYSTEM_X86_64=/usr/bin/qemu-system-x86_64 ./target/release/self vm-run /tmp/vm.db  # 显式指定
 ```
 
 内存亦在同表：`vm_mem(addr,size,prot,content)` 记录 `mmap/mprotect` image，`vm-mem-trace` 自 `strace` 解析；`vm_snapshots/vm_log` 则作 checkpoint。`vm_fs + vm_mem + vm_disk_blocks` 同库即“硬盘+内存全在同一 sqlite 不同表/分页”，WAL+`journal_size_limit 64M` 保证事务安全，`vm_gc` 回收稀疏空洞。
