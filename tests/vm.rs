@@ -112,3 +112,10 @@ fn materialize_tree_matches_db() {
     assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), vec![9u8; 5000]);
     assert_eq!(std::fs::read_link(dest.join("bin/t2")).unwrap(), PathBuf::from("tool"));
 }
+
+#[test]
+fn blob_key_is_full_sha256() {
+    let k = vm::fx_hash_u64(b"abc");
+    assert_eq!(k.len(), 64, "content key must be sha256 hex");
+    assert_eq!(k, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}

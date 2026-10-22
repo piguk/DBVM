@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::{Connection, params, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::io::{Read, Write};
-use std::sync::{OnceLock, Mutex};
+use std::sync::{Arc, OnceLock, Mutex};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
@@ -46,8 +46,8 @@ fn try_hardlink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 // LRU for decompressed blobs: hash -> raw bytes
-pub fn decompress_cache() -> &'static Mutex<LruCache<String, Vec<u8>>> {
-    static CACHE: OnceLock<Mutex<LruCache<String, Vec<u8>>>> = OnceLock::new();
+pub fn decompress_cache() -> &'static Mutex<LruCache<String, Arc<Vec<u8>>>> {
+    static CACHE: OnceLock<Mutex<LruCache<String, Arc<Vec<u8>>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())))
 }
 
@@ -269,7 +269,14 @@ pub fn fx_hash(data: &[u8]) -> u64 {
     data.hash(&mut h);
     h.finish()
 }
-pub fn fx_hash_u64(data: &[u8]) -> String { format!("{:x}", fx_hash(data)) }
+/// Content identity for blobs: SHA-256 hex (collision-safe dedup key).
+pub fn fx_hash_u64(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(data);
+    d.iter().map(|b| format!("{:02x}", b)).collect()
+}
+/// Short non-crypto key for a DB path (history/cache dir naming only).
+pub fn path_key(p: &str) -> String { format!("{:x}", fx_hash(p.as_bytes())) }
 
 pub fn vm_get_dict(conn: &Connection) -> Result<Option<Vec<u8>>> {
     let dict: Option<Vec<u8>> = conn.query_row("SELECT dict FROM vm_dict WHERE id=1", [], |r| r.get(0)).optional()?.flatten().map(|v| v);
@@ -451,16 +458,11 @@ pub fn decompress_bytes_raw(data: &[u8], compressed: i64) -> Result<Vec<u8>> {
     }
     Ok(data.to_vec())
 }
-pub fn decompress_bytes_cached(hash: &str, data: &[u8], compressed: i64) -> Vec<u8> {
-    {
-        let mut c = decompress_cache().lock().unwrap();
-        if let Some(v) = c.get(hash) { return v.clone(); }
-    }
-    let raw = decompress_bytes_raw(data, compressed).unwrap_or_else(|_| data.to_vec());
-    {
-        let mut c = decompress_cache().lock().unwrap();
-        c.put(hash.to_string(), raw.clone());
-    }
+/// Decompressed bytes keyed by content hash; LRU hit = refcount bump, no copy.
+pub fn decompress_bytes_cached(hash: &str, data: &[u8], compressed: i64) -> Arc<Vec<u8>> {
+    if let Some(v) = decompress_cache().lock().unwrap().get(hash) { return v.clone(); }
+    let raw = Arc::new(decompress_bytes_raw(data, compressed).unwrap_or_else(|_| data.to_vec()));
+    decompress_cache().lock().unwrap().put(hash.to_string(), raw.clone());
     raw
 }
 
@@ -550,7 +552,7 @@ pub fn vm_add_file(conn: &Connection, host_path: &str, vm_path: &str) -> Result<
     conn.execute("INSERT INTO vm_log(op, path, detail) VALUES ('add', ?1, ?2)", params![vm_p, host_path])?;
     Ok(())
 }
-pub fn fx_hash_u64_static(data: &[u8]) -> String { format!("{:x}", fx_hash(data)) }
+pub fn fx_hash_u64_static(data: &[u8]) -> String { fx_hash_u64(data) }
 pub fn vm_import_closure(conn: &Connection, host_elf: &str, vm_prefix: &str) -> Result<usize> {
     let host_real = std::fs::canonicalize(host_elf).unwrap_or(PathBuf::from(host_elf));
     use rustc_hash::FxHashMap;
@@ -622,14 +624,14 @@ pub fn vm_stat(conn: &Connection, vm_path: &str) -> Result<(String,String,i64,i6
     if kind == "symlink" {
         let target = link.clone().unwrap_or_default();
         if let Ok((_rp, _rk, rc, _rl, _rm)) = vm_resolve(conn, &p) {
-            if let Some(d)=rc { return Ok((path,kind,mode,d.len() as i64,mtime, format!("-> {} {:x}", target, fx_hash(&d)))); }
+            if let Some(d)=rc { return Ok((path,kind,mode,d.len() as i64,mtime, format!("-> {} {}", target, fx_hash_u64(&d)))); }
         }
         return Ok((path,kind,mode,size,mtime, format!("-> {}", target)));
     }
     if kind == "dir" { return Ok((path,kind,mode,0,mtime,String::new())); }
     // for file, hash is stored; if content present (legacy) use it else use blob
     let hash = hash_opt.unwrap_or_else(|| {
-        if let Some(c)=content { format!("{:x}", fx_hash(&c)) } else { String::new() }
+        if let Some(c)=content { fx_hash_u64(&c) } else { String::new() }
     });
     Ok((path,kind,mode,size,mtime,hash))
 }
@@ -641,24 +643,23 @@ pub fn vm_resolve(conn: &Connection, vm_path: &str) -> Result<(String, String, O
         let row: Option<(String, Option<Vec<u8>>, Option<String>, i64, Option<String>, Option<i64>)> = conn.query_row("SELECT kind, content, link_target, mode, hash, compressed FROM vm_fs WHERE path=?1", params![cur], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).optional()?;
         let (kind, content_opt, link, mode, hash_opt, compressed) = match row { Some(x)=>x, None=> return Err(anyhow!("not found in VM: {}", cur)) };
         if kind != "symlink" {
-            let content_opt_cloned = content_opt.clone();
-            let content = match (content_opt, hash_opt) {
-                (Some(b), _) if b.len()>0 => {
-                    let cflag = compressed.unwrap_or(0);
-                    let h = fx_hash_u64_static(&decompress_bytes_raw(&b, cflag).unwrap_or(b.clone()));
-                    Some(decompress_bytes_cached(&h, &b, cflag))
+            let cflag = compressed.unwrap_or(0);
+            let content: Option<Vec<u8>> = match (hash_opt, content_opt) {
+                // content-addressed: key cache by stored hash, decompress only on miss
+                (Some(h), inline) => {
+                    let blob: Option<(Vec<u8>, i64)> = conn.query_row("SELECT content, compressed FROM vm_blobs WHERE hash=?1", params![h], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+                    match (blob, inline) {
+                        (Some((b,c)), _) => Some(decompress_bytes_cached(&h, &b, c).to_vec()),
+                        (None, Some(b)) => Some(decompress_bytes_cached(&h, &b, cflag).to_vec()),
+                        (None, None) => None,
+                    }
                 },
-                (Some(_), Some(h)) | (None, Some(h)) => {
-                    let blob: Option<(Vec<u8>, i64)> = conn.query_row("SELECT content, compressed FROM vm_blobs WHERE hash=?1", params![h.clone()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-                    if let Some((b,c)) = blob {
-                        Some(decompress_bytes_cached(&h, &b, c))
-                    } else if let Some(b) = content_opt_cloned {
-                        let cflag = compressed.unwrap_or(0);
-                        Some(decompress_bytes_cached(&h, &b, cflag))
-                    } else { None }
+                // legacy rows: inline content, no hash column -> key by decompressed hash
+                (None, Some(b)) if !b.is_empty() => {
+                    let raw = decompress_bytes_raw(&b, cflag).unwrap_or_else(|_| b.clone());
+                    Some(raw)
                 },
-                (None, None) => None,
-                _ => content_opt_cloned,
+                _ => None,
             };
             return Ok((cur, kind, content, link, mode));
         }
@@ -688,7 +689,7 @@ pub fn vm_materialize(conn: &Connection, vm_path: &str, host_tmp: &Path) -> Resu
         }
         if !cache_p.exists() {
             if let Some(par)=cache_p.parent(){ let _ = std::fs::create_dir_all(par); }
-            let _ = std::fs::write(&cache_p, &data);
+            let _ = std::fs::write(&cache_p, data.as_slice());
         }
         std::fs::write(host_tmp, &data)?;
         #[cfg(unix)] { let _ = std::fs::set_permissions(host_tmp, std::fs::Permissions::from_mode(mode as u32)); }
@@ -832,10 +833,10 @@ pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
             try_hardlink_or_copy(&cache_p, &host).is_ok()
         } else { false };
         if !done {
-            let _ = std::fs::write(&host, &data);
+            let _ = std::fs::write(&host, data.as_slice());
             if !cache_p.exists() {
                 if let Some(par)=cache_p.parent(){ let _ = std::fs::create_dir_all(par); }
-                let _ = std::fs::write(&cache_p, &data);
+                let _ = std::fs::write(&cache_p, data.as_slice());
             }
         }
         #[cfg(unix)] { let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(t.mode as u32)); }

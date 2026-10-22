@@ -254,7 +254,7 @@ fn main() -> anyhow::Result<()> {
                                 let mut cmd2 = std::process::Command::new("bwrap");
                                 cmd2.arg("--bind").arg(&fuse_tmp).arg("/").arg("--dev").arg("/dev").arg("--proc").arg("/proc").arg("--unshare-pid");
                                 if effective_persist {
-                                let db_hash = selfdb::vm::fx_hash_u64(db.as_bytes());
+                                let db_hash = selfdb::vm::path_key(&db);
                                 let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
                                 let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
                                 // FUSE history lives inside fuse mount but also cache for later -- persist after exit via file copy
@@ -280,7 +280,7 @@ fn main() -> anyhow::Result<()> {
                             };
                             // persist history from fuse mount to cache_dir
                             if effective_persist {
-                                let db_hash = selfdb::vm::fx_hash_u64(db.as_bytes());
+                                let db_hash = selfdb::vm::path_key(&db);
                                 let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
                                 let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
                                 let src_hist = fuse_tmp.join(".ash_history");
@@ -307,7 +307,7 @@ fn main() -> anyhow::Result<()> {
             eprintln!("materialized {} files -> {} (fallback, would be 0 with FUSE)", n, tmp.display());
             for d in ["proc","sys","dev","tmp"] { let _=std::fs::create_dir_all(tmp.join(d)); }
             let has_unshare = std::process::Command::new("unshare").arg("--help").output().map(|o| o.status.success()).unwrap_or(false);
-            let db_hash = selfdb::vm::fx_hash_u64(db.as_bytes());
+            let db_hash = selfdb::vm::path_key(&db);
             let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
             let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
             // if cached exists, copy to tmp for session, else start fresh
@@ -357,14 +357,14 @@ fn main() -> anyhow::Result<()> {
             }
             // persist history to cache_dir/history/<hash> for next FUSE or persist session
             if hist.exists() && effective_persist {
-                let db_hash = selfdb::vm::fx_hash_u64(db.as_bytes());
+                let db_hash = selfdb::vm::path_key(&db);
                 let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
                 let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
                 let _ = std::fs::copy(&hist, &hist_cached);
                 eprintln!("history persisted {} -> {}", hist.display(), hist_cached.display());
             }
             if effective_persist {
-                eprintln!("--persist: keep {} (history at {}/.ash_history also cached at {})", tmp.display(), tmp.display(), selfdb::vm::cache_dir().join("history").join(selfdb::vm::fx_hash_u64(db.as_bytes())).join(".ash_history").display());
+                eprintln!("--persist: keep {} (history at {}/.ash_history also cached at {})", tmp.display(), tmp.display(), selfdb::vm::cache_dir().join("history").join(selfdb::vm::path_key(&db)).join(".ash_history").display());
             }
             if ephemeral {
                 let _ = std::fs::remove_dir_all(&tmp);
