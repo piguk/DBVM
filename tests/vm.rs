@@ -134,3 +134,19 @@ fn dict_trains_from_many_small_blobs() {
     let got = vm::vm_cat(&c, "/data/7.json").unwrap();
     assert!(String::from_utf8(got).unwrap().contains("item-7"));
 }
+
+#[test]
+fn materialize_streams_large_and_refreshes_changed() {
+    let (_g, db) = tmpdb("mat-big");
+    let c = open(&db);
+    let big: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(1103515245) >> 16) as u8).collect();
+    vm::vm_add_bytes(&c, "/big.bin", &big, 0o644, 100).unwrap();
+    let dest = _g.path().join("out");
+    vm::vm_materialize_tree(&c, &dest).unwrap();
+    assert_eq!(std::fs::read(dest.join("big.bin")).unwrap(), big);
+    // same size, different content and new mtime -> must be rewritten
+    let new: Vec<u8> = big.iter().map(|b| b.wrapping_add(1)).collect();
+    vm::vm_add_bytes(&c, "/big.bin", &new, 0o644, 5000).unwrap();
+    vm::vm_materialize_tree(&c, &dest).unwrap();
+    assert_eq!(std::fs::read(dest.join("big.bin")).unwrap(), new);
+}

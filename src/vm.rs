@@ -746,6 +746,32 @@ pub fn vm_import_tar_filtered(conn: &Connection, tar_path: &str, strip_prefix: &
     conn.execute("INSERT INTO vm_log(op, detail) VALUES ('import_tar', ?1)", params![tar_path])?;
     Ok(n)
 }
+thread_local! {
+    // one read connection per rayon worker; rusqlite::Connection is not Sync
+    static WORKER_CONN: std::cell::RefCell<Option<Connection>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Load one file's decompressed bytes inside a worker. Falls back to legacy inline content.
+fn load_task_bytes<T: TaskLike>(db_path: Option<&str>, t: &T) -> Option<Vec<u8>> {
+    let path = db_path?;
+    WORKER_CONN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() { *slot = Connection::open(path).ok(); }
+        let c = slot.as_ref()?;
+        if let Some(h) = t.hash_ref() {
+            let row: Option<(Vec<u8>, i64)> = c.query_row("SELECT content, compressed FROM vm_blobs WHERE hash=?1", params![h], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok()?;
+            if let Some((b, comp)) = row { return Some(decompress_bytes_cached(h, &b, comp).to_vec()); }
+        }
+        let inline: Option<(Option<Vec<u8>>, Option<i64>)> = c.query_row("SELECT content, compressed FROM vm_fs WHERE path=?1", params![t.path_ref()], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok()?;
+        match inline {
+            Some((Some(b), comp)) => Some(decompress_bytes_raw(&b, comp.unwrap_or(0)).unwrap_or(b)),
+            _ => None,
+        }
+    })
+}
+
+trait TaskLike { fn hash_ref(&self) -> Option<&str>; fn path_ref(&self) -> &str; }
+
 pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
     use rayon::prelude::*;
     std::fs::create_dir_all(dest)?;
@@ -764,30 +790,18 @@ pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
         if let Some(par)=host.parent(){ std::fs::create_dir_all(par)?; }
         #[cfg(unix)] { let _ = std::os::unix::fs::symlink(&target, &host); }
     }
-    // collect file tasks to parallelize: include mtime for incremental fastpath
-    struct Task { path: String, mode: i64, hash: String, blob: Vec<u8>, compressed: i64, size: i64, mtime: i64 }
-    let mut tasks: Vec<Task> = Vec::new();
-    {
-        let mut st = conn.prepare("SELECT path, mode, hash, size, mtime FROM vm_fs WHERE kind='file'")?;
-        for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?, r.get::<_,Option<String>>(2)?, r.get::<_,i64>(3)?, r.get::<_,i64>(4)?)))? {
-            let (p,mode,hash,size,mtime)=r?;
-            if let Some(h)=hash {
-                let blob_row: Option<(Vec<u8>, i64)> = conn.query_row("SELECT content, compressed FROM vm_blobs WHERE hash=?1", params![h.clone()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-                if let Some((c, comp)) = blob_row {
-                    tasks.push(Task{ path: p, mode, hash: h, blob: c, compressed: comp, size, mtime });
-                    continue;
-                }
-                let inline: Option<(Option<Vec<u8>>, Option<i64>)> = conn.query_row("SELECT content, compressed FROM vm_fs WHERE path=?1", params![p.clone()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-                if let Some((Some(content), comp)) = inline { tasks.push(Task{ path: p, mode, hash: h, blob: content, compressed: comp.unwrap_or(0), size, mtime }); }
-            } else {
-                let inline: Option<(Option<Vec<u8>>, Option<i64>)> = conn.query_row("SELECT content, compressed FROM vm_fs WHERE path=?1", params![p.clone()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-                if let Some((Some(c), comp)) = inline {
-                    let h = fx_hash_u64(&c);
-                    tasks.push(Task{ path: p, mode, hash: h, blob: c, compressed: comp.unwrap_or(0), size, mtime });
-                }
-            }
-        }
+    // Metadata only: blobs are loaded per file inside the worker, so memory stays O(one file).
+    struct Task { path: String, mode: i64, hash: Option<String>, size: i64, mtime: i64 }
+    impl TaskLike for Task {
+        fn hash_ref(&self) -> Option<&str> { self.hash.as_deref() }
+        fn path_ref(&self) -> &str { &self.path }
     }
+    let tasks: Vec<Task> = {
+        let mut st = conn.prepare("SELECT path, mode, hash, size, mtime FROM vm_fs WHERE kind='file'")?;
+        let rows = st.query_map([], |r| Ok(Task{ path: r.get(0)?, mode: r.get(1)?, hash: r.get(2)?, size: r.get(3)?, mtime: r.get(4)? }))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let db_path = conn.path().map(|p| p.to_string());
     let dest_buf = dest.to_path_buf();
     let written = std::sync::atomic::AtomicUsize::new(0);
     tasks.par_iter().for_each(|t| {
@@ -795,44 +809,34 @@ pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
         let mut need = true;
         if let Ok(md) = std::fs::metadata(&host) {
             if md.len() as i64 == t.size {
-                if let Ok(mt) = md.modified() {
-                    if let Ok(dur) = mt.duration_since(std::time::UNIX_EPOCH) {
-                        let host_secs = dur.as_secs() as i64;
-                        // allow 1s tolerance; truncate vs stored mtime
-                        if (host_secs - t.mtime).abs() <= 1 {
-                            need = false;
-                        }
-                    }
-                } else {
-                    need = false;
+                match md.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()) {
+                    // 1s tolerance for fs timestamp granularity
+                    Some(d) if (d.as_secs() as i64 - t.mtime).abs() <= 1 => need = false,
+                    _ => {}
                 }
             }
         }
-        if !need {
-            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        let data = decompress_bytes_cached(&t.hash, &t.blob, t.compressed);
+        if !need { written.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; }
+        let Some(data) = load_task_bytes(db_path.as_deref(), t) else { return; };
         if let Some(par)=host.parent(){ let _ = std::fs::create_dir_all(par); }
-        let cache_p = cache_path_for_hash(&t.hash);
-        let done = if cache_p.exists() {
-            try_hardlink_or_copy(&cache_p, &host).is_ok()
-        } else { false };
+        let key = t.hash.clone().unwrap_or_else(|| fx_hash_u64(&data));
+        let cache_p = cache_path_for_hash(&key);
+        let done = cache_p.exists() && try_hardlink_or_copy(&cache_p, &host).is_ok();
         if !done {
-            let _ = std::fs::write(&host, data.as_slice());
+            let _ = std::fs::write(&host, &data);
             if !cache_p.exists() {
                 if let Some(par)=cache_p.parent(){ let _ = std::fs::create_dir_all(par); }
-                let _ = std::fs::write(&cache_p, data.as_slice());
+                let _ = std::fs::write(&cache_p, &data);
             }
         }
-        #[cfg(unix)] { let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(t.mode as u32)); }
-        // preserve mtime for next incremental run (best-effort, no hard failure)
         #[cfg(unix)]
         {
+            let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(t.mode as u32));
             let ts = libc::timespec { tv_sec: t.mtime as libc::time_t, tv_nsec: 0 };
             let times = [ts, ts];
-            let cpath = std::ffi::CString::new(host.to_string_lossy().as_bytes()).unwrap_or_else(|_| std::ffi::CString::new("/tmp").unwrap());
-            unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0); }
+            if let Ok(cpath) = std::ffi::CString::new(host.to_string_lossy().as_bytes()) {
+                unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0); }
+            }
         }
         written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
