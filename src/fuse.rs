@@ -16,7 +16,8 @@ pub mod fuse_impl {
     const BLOCK_SIZE: u32 = 4096;
 
     pub struct VmFuse {
-        db_path: String,
+        /// One connection per mount; fuser dispatches Filesystem callbacks on a single thread.
+        conn: rusqlite::Connection,
         ino_to_path: HashMap<u64, String>,
         path_to_ino: HashMap<String, u64>,
         ino_to_kind: HashMap<u64, String>,
@@ -27,8 +28,9 @@ pub mod fuse_impl {
 
     impl VmFuse {
         pub fn new(db_path: String) -> Result<Self> {
+            let conn = vm_open(&db_path)?;
             let mut fs = Self {
-                db_path: db_path.clone(),
+                conn,
                 ino_to_path: HashMap::new(),
                 path_to_ino: HashMap::new(),
                 ino_to_kind: HashMap::new(),
@@ -68,7 +70,7 @@ pub mod fuse_impl {
             self.ino_to_kind.insert(1, "dir".to_string());
             self.ino_to_attr.insert(1, root_attr);
 
-            let conn = vm_open(&self.db_path)?;
+            let conn = &self.conn;
             let mut stmt = conn.prepare("SELECT path, kind, mode, size, mtime, uid, gid, link_target, hash, compressed FROM vm_fs ORDER BY length(path), path")?;
             let rows = stmt.query_map([], |r| Ok((
                 r.get::<_,String>(0)?,
@@ -145,7 +147,7 @@ pub mod fuse_impl {
         }
 
         fn fetch_file_content(&self, path: &str) -> Result<Vec<u8>> {
-            let conn = vm_open(&self.db_path)?;
+            let conn = &self.conn;
             // use vm_cat logic but inline to avoid borrowing issues
             // resolve symlink? if path is symlink, vm_cat will resolve; for regular file we just fetch blob
             // we should use vm_resolve then content
@@ -165,7 +167,7 @@ pub mod fuse_impl {
                 let mode = attr.perm as i64 | if attr.kind == FileType::Directory { 0o40000 } else { 0o100000 };
                 // use current time
                 let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                let conn = vm_open(&self.db_path)?;
+                let conn = &self.conn;
                 // vm_add_bytes handles dedup and blob insertion
                 vm_add_bytes(&conn, &path, &buf, mode as i64, mtime)?;
                 // update attr size/blocks/mtime
@@ -239,10 +241,7 @@ pub mod fuse_impl {
                 Some(p) => p.clone(),
                 None => { reply.error(libc::ENOENT); return; }
             };
-            let conn = match vm_open(&self.db_path) {
-                Ok(c) => c,
-                Err(_) => { reply.error(libc::EIO); return; }
-            };
+            let conn = &self.conn;
             let target: Result<String, _> = conn.query_row("SELECT link_target FROM vm_fs WHERE path=?1", params![path], |r| r.get(0));
             match target {
                 Ok(t) => reply.data(t.as_bytes()),
@@ -388,13 +387,13 @@ pub mod fuse_impl {
         }
         fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
             // df reports stored blob bytes (compressed), not host tmpfs
-            let (blocks, files) = match vm_open(&self.db_path) {
-                Ok(c) => {
+            let (blocks, files) = match Some(&self.conn) {
+                Some(c) => {
                     let blob_bytes: i64 = c.query_row("SELECT COALESCE(sum(length(content)),0) FROM vm_blobs", [], |r| r.get(0)).unwrap_or(0);
                     let files: i64 = c.query_row("SELECT count(*) FROM vm_fs", [], |r| r.get(0)).unwrap_or(0);
                     ((blob_bytes as u64).div_ceil(BLOCK_SIZE as u64), files as u64)
                 }
-                Err(_) => (0, 0),
+                None => (0, 0),
             };
             let bsize = BLOCK_SIZE;
             reply.statfs(blocks, 0, 0, files, 0, bsize, 255, bsize);
@@ -406,10 +405,7 @@ pub mod fuse_impl {
             };
             let perm = mode & 0o7777;
             let now = now_secs();
-            let conn = match vm_open(&self.db_path) {
-                Ok(c) => c,
-                Err(_) => { reply.error(libc::EIO); return; }
-            };
+            let conn = &self.conn;
             if let Err(_) = vm_add_bytes(&conn, &new_path, &[], perm as i64, now) {
                 reply.error(libc::EIO);
                 return;
@@ -448,10 +444,7 @@ pub mod fuse_impl {
             };
             let perm = mode & 0o7777;
             let now = now_secs();
-            let conn = match vm_open(&self.db_path) {
-                Ok(c) => c,
-                Err(_) => { reply.error(libc::EIO); return; }
-            };
+            let conn = &self.conn;
             if let Err(_) = vm_add_dir(&conn, &new_path, perm as i64, now) {
                 reply.error(libc::EIO);
                 return;
@@ -490,7 +483,7 @@ pub mod fuse_impl {
             let ino = match self.path_to_ino.get(&norm).copied() { Some(i)=> i, None=> {reply.error(libc::ENOENT); return;} };
             let kind = self.ino_to_kind.get(&ino).cloned().unwrap_or_default();
             if kind == "dir" { reply.error(libc::EISDIR); return; }
-            let conn = match vm_open(&self.db_path) { Ok(c)=>c, Err(_)=>{reply.error(libc::EIO); return;} };
+            let conn = &self.conn;
             // handle blob refcnt like vm_sync does
             let hash: Option<String> = conn.query_row("SELECT hash FROM vm_fs WHERE path=?1", params![norm.clone()], |r| r.get(0)).ok().flatten();
             let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1", params![norm.clone()]);
@@ -518,7 +511,7 @@ pub mod fuse_impl {
                     if pp_norm == norm { reply.error(libc::ENOTEMPTY); return; }
                 }
             }
-            let conn = match vm_open(&self.db_path) { Ok(c)=>c, Err(_)=>{reply.error(libc::EIO); return;} };
+            let conn = &self.conn;
             let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1", params![norm.clone()]);
             self.path_to_ino.remove(&norm);
             self.ino_to_path.remove(&ino);
@@ -532,7 +525,7 @@ pub mod fuse_impl {
                 Err(_) => { reply.error(libc::EEXIST); return; }
             };
             let tgt = target.to_string_lossy().to_string();
-            let conn = match vm_open(&self.db_path) { Ok(c)=>c, Err(_)=>{reply.error(libc::EIO); return;} };
+            let conn = &self.conn;
             if let Err(_) = vm_add_symlink(&conn, &new_path, &tgt) {
                 reply.error(libc::EIO); return;
             }
@@ -576,7 +569,7 @@ pub mod fuse_impl {
                     // simple unlink if file
                     let kind = self.ino_to_kind.get(&ino).cloned().unwrap_or_default();
                     if kind == "dir" { reply.error(libc::EEXIST); return; }
-                    let conn = vm_open(&self.db_path).unwrap();
+                    let conn = &self.conn;
                     let h: Option<String> = conn.query_row("SELECT hash FROM vm_fs WHERE path=?1", params![new_path.clone()], |r| r.get(0)).ok().flatten();
                     let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1", params![new_path.clone()]);
                     if let Some(hash)=h { let _=conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![hash]); let _=conn.execute("DELETE FROM vm_blobs WHERE hash=?1 AND refcnt<=0", params![hash]);}
@@ -587,7 +580,7 @@ pub mod fuse_impl {
                     self.staged.remove(&old_ino);
                 }
             }
-            let conn = match vm_open(&self.db_path) { Ok(c)=>c, Err(_)=>{reply.error(libc::EIO); return;} };
+            let conn = &self.conn;
             // update vm_fs for old_path and descendants
             let old_prefix = if old_path=="/" { "/".to_string() } else { format!("{}/", old_path) };
             let new_prefix = if new_path=="/" { "/".to_string() } else { format!("{}/", new_path) };
@@ -612,7 +605,7 @@ pub mod fuse_impl {
         fn setattr(&mut self, _req: &Request, ino: u64, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, atime: Option<fuser::TimeOrNow>, mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
             if !self.ino_to_attr.contains_key(&ino) { reply.error(libc::ENOENT); return; }
             let path = self.ino_to_path.get(&ino).cloned().unwrap_or_default();
-            let conn = vm_open(&self.db_path).ok();
+            let conn = Some(&self.conn);
             if let Some(m) = mode {
                 if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.perm = (m & 0o7777) as u16; }
                 if let Some(ref c) = conn { let _ = c.execute("UPDATE vm_fs SET mode=?1 WHERE path=?2", params![m as i64, path.clone()]); }
@@ -684,7 +677,7 @@ pub mod fuse_impl {
                 return;
             }
             let now = now_secs();
-            let conn = match vm_open(&self.db_path) { Ok(c)=>c, Err(_)=>{reply.error(libc::EIO); return;} };
+            let conn = &self.conn;
             if let Err(_) = vm_add_bytes(&conn, &new_path, &[], perm as i64, now) {
                 reply.error(libc::EIO); return;
             }
@@ -710,32 +703,27 @@ pub mod fuse_impl {
         }
     }
 
+    fn mount_opts(allow_other: bool) -> Vec<MountOption> {
+        // fuser 0.14 encodes AllowRoot as `allow_other` too, and AutoUnmount then forces it.
+        // Default = no allow_* option (owner-only, no user_allow_other needed).
+        // Explicit --allow-other requires `user_allow_other` in /etc/fuse.conf.
+        let mut opts = vec![MountOption::FSName("vmfs".to_string()), MountOption::CUSTOM("default_permissions".to_string())];
+        if allow_other { opts.push(MountOption::AllowOther); }
+        opts
+    }
+
     pub fn mount_vm(db_path: &str, mountpoint: &str, allow_other: bool) -> Result<()> {
-        if !Path::new(mountpoint).exists() {
-            anyhow::bail!("mountpoint does not exist: {}", mountpoint);
-        }
         if !Path::new(mountpoint).is_dir() {
             anyhow::bail!("mountpoint is not a directory: {}", mountpoint);
         }
         let fs = VmFuse::new(db_path.to_string())?;
-        let mut opts = vec![MountOption::FSName("vmfs".to_string()), MountOption::AutoUnmount];
-        if allow_other {
-            opts.push(MountOption::AllowOther);
-        } else {
-            opts.push(MountOption::AllowRoot);
-        }
-        // default_permissions lets kernel enforce perm checks
-        opts.push(MountOption::CUSTOM("default_permissions".to_string()));
-        // ro/rw? make writable so FUSE writes go to DB
         println!("mount {} -> {} (blocks compressed, bsize=4096)", db_path, mountpoint);
-        println!("  hint: inside mount, `df -h .` should show ~3.6M, not host tmpfs 13G");
-        fuser::mount2(fs, mountpoint, &opts)?;
+        fuser::mount2(fs, mountpoint, &mount_opts(allow_other))?;
         Ok(())
     }
 
     pub fn mount_vm_background(db_path: &str, mountpoint: &str) -> Result<fuser::BackgroundSession> {
         let fs = VmFuse::new(db_path.to_string())?;
-        let opts = vec![MountOption::FSName("vmfs".to_string()), MountOption::AutoUnmount, MountOption::AllowOther, MountOption::CUSTOM("default_permissions".to_string())];
-        Ok(fuser::spawn_mount2(fs, mountpoint, &opts)?)
+        Ok(fuser::spawn_mount2(fs, mountpoint, &mount_opts(false))?)
     }
 }
