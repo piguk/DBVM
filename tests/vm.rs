@@ -119,3 +119,18 @@ fn blob_key_is_full_sha256() {
     assert_eq!(k.len(), 64, "content key must be sha256 hex");
     assert_eq!(k, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 }
+
+#[test]
+fn dict_trains_from_many_small_blobs() {
+    let (_g, db) = tmpdb("dict");
+    let c = open(&db);
+    for i in 0..60u32 {
+        let body = format!("{{\"id\":{},\"name\":\"item-{}\",\"tags\":[\"alpha\",\"beta\",\"gamma\"],\"pad\":\"{}\"}}", i, i, "x".repeat(300 + i as usize));
+        vm::vm_add_bytes(&c, &format!("/data/{}.json", i), body.as_bytes(), 0o644, 1).unwrap();
+    }
+    let d = vm::vm_train_dict(&c, 16384).unwrap();
+    assert!(d.is_some(), "expected a dictionary from 60 similar small blobs");
+    // reads still byte-exact after training
+    let got = vm::vm_cat(&c, "/data/7.json").unwrap();
+    assert!(String::from_utf8(got).unwrap().contains("item-7"));
+}

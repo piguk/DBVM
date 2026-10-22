@@ -181,14 +181,23 @@ fn run_via_memfd(db: Connection, guest: Vec<String>) -> ! {
     let (_env_cstrs, env_ptrs)=build_env(bundle_dir.as_ref());
     let fdpath=format!("/proc/self/fd/{}", fd);
     let fdpath_c=CString::new(fdpath.clone()).unwrap();
-    unsafe{
-        libc::execve(fdpath_c.as_ptr(), argv_ptrs.as_ptr() as *const *const libc::c_char, env_ptrs.as_ptr() as *const *const libc::c_char);
-        eprintln!("execve {}: {}", fdpath, std::io::Error::last_os_error());
-        const AT_EMPTY_PATH: libc::c_int = 0x1000;
-        libc::syscall(libc::SYS_execveat as libc::c_long, fd as libc::c_long, CString::new("").unwrap().as_ptr(), argv_ptrs.as_ptr() as libc::c_long, env_ptrs.as_ptr() as libc::c_long, AT_EMPTY_PATH as libc::c_long);
-        libc::close(fd);
+    // Fork so the parent survives to remove the bundle dir after the guest exits.
+    // Terminal signals reach the whole foreground group, so the guest gets them directly.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 { eprintln!("fork: {}", std::io::Error::last_os_error()); std::process::exit(2); }
+    if pid == 0 {
+        unsafe {
+            libc::execve(fdpath_c.as_ptr(), argv_ptrs.as_ptr() as *const *const libc::c_char, env_ptrs.as_ptr() as *const *const libc::c_char);
+            eprintln!("execve {}: {}", fdpath, std::io::Error::last_os_error());
+            libc::_exit(127);
+        }
     }
-    std::process::exit(127);
+    unsafe { libc::close(fd); }
+    let mut status: libc::c_int = 0;
+    unsafe { while libc::waitpid(pid, &mut status, 0) < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {} }
+    if let Some(d) = bundle_dir { let _ = std::fs::remove_dir_all(&d); }
+    let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
+    std::process::exit(code);
 }
 fn main() -> anyhow::Result<()> {
     let args: Vec<String>=std::env::args().collect();

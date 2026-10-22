@@ -292,39 +292,25 @@ pub fn vm_train_dict(conn: &Connection, max_dict_size: usize) -> Result<Option<V
     // collect raw samples: files with raw_size between 256 and 16384, up to 120 samples
     let mut samples: Vec<Vec<u8>> = Vec::new();
     let mut total_raw: usize = 0;
-    // fetch blobs raw by decompressing stored content
-    let rows: Vec<(Vec<u8>, i64)> = {
-        let mut st = conn.prepare("SELECT content, compressed FROM vm_blobs WHERE raw_size BETWEEN 256 AND 16384 ORDER BY RANDOM() LIMIT 150")?;
-        let mut out = Vec::new();
-        for r in st.query_map([], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?)))? {
-            if let Ok(x)=r { out.push(x); }
+    // Sample without a full-table sort: start at a pseudo-random rowid (seconds-based; only
+    // affects which samples are chosen, not correctness), read forward, wrap once.
+    let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(rowid),0) FROM vm_blobs", [], |r| r.get(0))?;
+    let start: i64 = if max_id > 0 { (now_secs().wrapping_mul(2654435761) as i64).rem_euclid(max_id) + 1 } else { 1 };
+    let mut rows: Vec<(Vec<u8>, i64)> = Vec::new();
+    {
+        let mut st = conn.prepare("SELECT content, compressed FROM vm_blobs WHERE rowid >= ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT 150")?;
+        for r in st.query_map(params![start], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?)))? { rows.push(r?); }
+        if rows.len() < 150 {
+            let mut st = conn.prepare("SELECT content, compressed FROM vm_blobs WHERE rowid < ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT ?2")?;
+            for r in st.query_map(params![start, 150 - rows.len() as i64], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?)))? { rows.push(r?); }
         }
-        out
-    };
+    }
     for (data, comp) in rows.into_iter() {
         let raw = decompress_bytes_raw(&data, comp).unwrap_or(data);
         if raw.len() >= 256 && raw.len() < 16384 {
             total_raw += raw.len();
             samples.push(raw);
             if samples.len() >= 120 || total_raw > 500_000 { break; }
-        }
-    }
-    // fallback: if not enough samples, collect from vm_fs inline (should be rare after blobs)
-    if samples.len() < 10 {
-        let rows2: Vec<(Vec<u8>, i64)> = {
-            let mut st = conn.prepare("SELECT content, compressed FROM vm_fs WHERE kind='file' AND content IS NOT NULL AND size BETWEEN 256 AND 16384 LIMIT 120")?;
-            let mut out=Vec::new();
-            for r in st.query_map([], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,Option<i64>>(1)?)))? {
-                if let Ok((d,c))=r { out.push((d, c.unwrap_or(0))); }
-            }
-            out
-        };
-        for (data, comp) in rows2 {
-            let raw = decompress_bytes_raw(&data, comp).unwrap_or(data);
-            if raw.len() >=256 && raw.len()<16384 {
-                samples.push(raw);
-                if samples.len()>=120 { break; }
-            }
         }
     }
     if samples.len() < 10 {
