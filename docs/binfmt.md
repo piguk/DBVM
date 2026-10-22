@@ -1,24 +1,7 @@
-# binfmt_misc
+# binfmt_misc 注册（未验证）
 
-SELF 文件头为 SQLite 头（`SQLite format 3\x00`，偏移 0）且 `application_id` 在偏移 68 处为 `SELF`（`0x53454C46`）。
+SELF 文件：偏移 0 为 SQLite 头 `SQLite format 3\0`，偏移 68..71 为 `application_id = 0x53454C46` (`SELF`)。
 
-`self.conf` 为 `systemd-binfmt` 注册示例，指向 `self-exec` 解释器（`target/release/self-exec`）。
-`self-exec` 本身必须是 ELF，否则会递归触发 `ELOOP`。
+binfmt 的 magic 必须是连续字节串，且 mask 与 magic 等长。"偏移 0 的 16 字节 + 偏移 68 的 4 字节"需要 52 字节间隔，直接用 `:offset:magic:mask` 表达不了；需要 `magic` 带 52 字节通配（mask 为 `\x00`）。此格式未在本机验证，注册前请先用 `/proc/sys/fs/binfmt_misc` 试验。
 
-注册后可直接 `chmod +x hello.self && ./hello.self`。
-
-## self.conf
-
-```ini
-# systemd-binfmt registration for SELF (SQLite at 0, application_id SELF at 68)
-# Place as /usr/lib/binfmt.d/self.conf then: systemctl restart systemd-binfmt
-:SELF:M:0:SQLite format 3\x00:!:SELF:/usr/local/bin/self-exec:OC
-# For NixOS (from article):
-# boot.binfmt.registrations.self = {
-#   recognitionType = "magic";
-#   offset = 0;
-#   magicOrExtension = "SQLite format 3\x00" + <skip 52 bytes> + "SELF";
-#   mask = "\xff..\x00..\xff";  # match bytes 0-15 and 68-71
-#   interpreter = "${self-exec}/bin/self-exec";
-# };
-```
+`self-exec` 必须是普通 ELF，否则会递归触发 `ELOOP`。

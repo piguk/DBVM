@@ -2,3 +2,7 @@
 /tmp
 *.self
 *.db
+*.so
+*.so.*
+/.workflow/
+*.snap.*

@@ -243,20 +243,6 @@ pub fn meta_for_path_cached(path: &Path, cache: &mut FxHashMap<PathBuf, ElfMeta>
     m
 }
 
-pub fn needed_for_path(path: &str) -> Vec<String> { meta_for_path(path).needed }
-pub fn soname_for_path(path: &str) -> Option<String> { meta_for_path(path).soname }
-pub fn runpath_for_path(path: &str) -> (Option<String>, Option<String>) {
-    let m = meta_for_path(path);
-    (m.runpath, m.rpath)
-}
-
-pub fn needed_for_path_cached(path: &Path, cache: &mut FxHashMap<PathBuf, ElfMeta>) -> Vec<String> {
-    meta_for_path_cached(path, cache).needed
-}
 pub fn soname_for_path_cached(path: &Path, cache: &mut FxHashMap<PathBuf, ElfMeta>) -> Option<String> {
     meta_for_path_cached(path, cache).soname
-}
-pub fn runpath_for_path_cached(path: &Path, cache: &mut FxHashMap<PathBuf, ElfMeta>) -> (Option<String>, Option<String>) {
-    let m = meta_for_path_cached(path, cache);
-    (m.runpath, m.rpath)
 }

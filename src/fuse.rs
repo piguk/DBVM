@@ -6,12 +6,11 @@ pub mod fuse_impl {
     use rusqlite::params;
     use std::collections::HashMap;
     use std::ffi::OsStr;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use std::os::raw::c_int;
-    use std::sync::{Arc, Mutex};
 
-    use crate::vm::{vm_open, vm_add_bytes, vm_add_dir, vm_add_symlink, normalize_vm_path, now_secs, decompress_bytes_raw, decompress_bytes_cached, fx_hash_u64};
+    use crate::vm::{vm_open, vm_add_bytes, vm_add_dir, vm_add_symlink, normalize_vm_path, now_secs};
 
     const TTL: Duration = Duration::from_secs(1);
     const BLOCK_SIZE: u32 = 4096;
@@ -388,30 +387,17 @@ pub mod fuse_impl {
             reply.ok();
         }
         fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-            // compute sum(size) logical, blob storage, db file size
-            let conn = vm_open(&self.db_path);
-            let (logical, blob_bytes, files, db_blocks) = if let Ok(c) = conn {
-                let logical: i64 = c.query_row("SELECT COALESCE(sum(size),0) FROM vm_fs WHERE kind='file'", [], |r| r.get(0)).unwrap_or(0);
-                let blob_bytes: i64 = c.query_row("SELECT COALESCE(sum(length(content)),0) FROM vm_blobs", [], |r| r.get(0)).unwrap_or(0);
-                let files: i64 = c.query_row("SELECT count(*) FROM vm_fs", [], |r| r.get(0)).unwrap_or(0);
-                let page_size: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(4096);
-                let page_count: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(0);
-                let db_bytes = page_size * page_count;
-                // use compressed size as truth for df
-                let used = if blob_bytes > 0 { blob_bytes } else { logical };
-                let blocks = if used > 0 { (used as u64 + BLOCK_SIZE as u64 -1)/BLOCK_SIZE as u64 } else { 0 };
-                // ensure at least 1 block for root
-                (logical, blob_bytes, files, blocks)
-            } else {
-                (0,0,0,0)
+            // df reports stored blob bytes (compressed), not host tmpfs
+            let (blocks, files) = match vm_open(&self.db_path) {
+                Ok(c) => {
+                    let blob_bytes: i64 = c.query_row("SELECT COALESCE(sum(length(content)),0) FROM vm_blobs", [], |r| r.get(0)).unwrap_or(0);
+                    let files: i64 = c.query_row("SELECT count(*) FROM vm_fs", [], |r| r.get(0)).unwrap_or(0);
+                    ((blob_bytes as u64).div_ceil(BLOCK_SIZE as u64), files as u64)
+                }
+                Err(_) => (0, 0),
             };
             let bsize = BLOCK_SIZE;
-            let blocks = db_blocks;
-            let bfree = 0;
-            let bavail = 0;
-            let files_u = files as u64;
-            let ffree = 0;
-            reply.statfs(blocks, bfree, bavail, files_u, ffree, bsize, 255, bsize);
+            reply.statfs(blocks, 0, 0, files, 0, bsize, 255, bsize);
         }
         fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
             let new_path = match self.ensure_not_exists(parent, name) {
@@ -750,12 +736,6 @@ pub mod fuse_impl {
     pub fn mount_vm_background(db_path: &str, mountpoint: &str) -> Result<fuser::BackgroundSession> {
         let fs = VmFuse::new(db_path.to_string())?;
         let opts = vec![MountOption::FSName("vmfs".to_string()), MountOption::AutoUnmount, MountOption::AllowOther, MountOption::CUSTOM("default_permissions".to_string())];
-        let bg = fuser::spawn_mount2(fs, mountpoint, &opts)?;
-        Ok(bg)
+        Ok(fuser::spawn_mount2(fs, mountpoint, &opts)?)
     }
-}
-#[cfg(not(feature="fuse"))]
-pub mod fuse_impl {
-    use anyhow::Result;
-    pub fn mount_vm(_db: &str, _mp: &str, _allow: bool) -> Result<()> { anyhow::bail!("rebuild with --features fuse") }
 }

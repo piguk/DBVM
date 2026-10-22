@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
-use crate::elf::{ElfMeta, meta_for_path, meta_for_path_cached};
+use crate::elf::{ElfMeta, meta_for_path_cached};
 
 fn expand_runpath(raw: &str, bdir: &Path) -> Vec<PathBuf> {
     let bdir_str = bdir.to_string_lossy();
@@ -19,34 +19,6 @@ fn expand_runpath(raw: &str, bdir: &Path) -> Vec<PathBuf> {
         }
     }
     out
-}
-
-pub fn search_dirs_for(obj_path: &Path, extra_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    let canon = std::fs::canonicalize(obj_path).unwrap_or_else(|_| obj_path.to_path_buf());
-    let bdir_canon = canon.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-    let m = meta_for_path(&canon.to_string_lossy());
-    let runpath = m.runpath;
-    let rpath = m.rpath;
-    let mut dirs = Vec::with_capacity(20);
-    let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    let has_runpath = runpath.is_some();
-    if has_runpath {
-        for d in ld.split(':').filter(|s| !s.is_empty()) { dirs.push(PathBuf::from(d)); }
-        if let Some(rp) = runpath { dirs.extend(expand_runpath(&rp, &bdir_canon)); }
-    } else {
-        if let Some(rp) = rpath { dirs.extend(expand_runpath(&rp, &bdir_canon)); }
-        for d in ld.split(':').filter(|s| !s.is_empty()) { dirs.push(PathBuf::from(d)); }
-    }
-    for d in extra_dirs { if !dirs.contains(d) { dirs.push(d.clone()); } }
-    if !dirs.contains(&bdir_canon) { dirs.push(bdir_canon); }
-    for s in ["/lib/x86_64-linux-gnu","/lib","/usr/lib/x86_64-linux-gnu","/usr/lib","/usr/lib64"] {
-        let p = PathBuf::from(s);
-        if !dirs.contains(&p) { dirs.push(p); }
-    }
-    let mut seen = FxHashSet::default();
-    let mut uniq = Vec::with_capacity(dirs.len());
-    for d in dirs { if seen.insert(d.clone()) { uniq.push(d);} }
-    uniq
 }
 
 pub fn search_dirs_for_cached(
@@ -90,14 +62,6 @@ pub fn search_dirs_for_cached(
     uniq
 }
 
-pub fn resolve_soname(soname: &str, search: &[PathBuf]) -> Option<PathBuf> {
-    for d in search {
-        let cand = d.join(soname);
-        if std::fs::metadata(&cand).map(|m| m.is_file()).unwrap_or(false) { return Some(cand); }
-    }
-    None
-}
-
 pub fn search_dirs_hash(search: &[PathBuf]) -> u64 {
 
     use std::hash::{Hash, Hasher};
@@ -117,23 +81,6 @@ pub fn resolve_soname_cached(
     soname.hash(&mut hasher);
     search_hash.hash(&mut hasher);
     let key = hasher.finish();
-    if let Some(v) = cache.get(&key) { return v.clone(); }
-    let mut found = None;
-    for d in search {
-        let cand = d.join(soname);
-        if std::fs::metadata(&cand).map(|m| m.is_file()).unwrap_or(false) { found = Some(cand); break; }
-    }
-    cache.insert(key, found.clone());
-    found
-}
-
-pub fn resolve_soname_cached_strkey(
-    soname: &str,
-    search: &[PathBuf],
-    cache: &mut FxHashMap<String, Option<PathBuf>>,
-    search_key: &str,
-) -> Option<PathBuf> {
-    let key = format!("{}|{}", soname, search_key);
     if let Some(v) = cache.get(&key) { return v.clone(); }
     let mut found = None;
     for d in search {

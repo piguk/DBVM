@@ -3,7 +3,6 @@ use anyhow::{anyhow, Result};
 use rusqlite::{Connection, params, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::io::{Read, Write};
-use std::collections::HashMap;
 use std::sync::{OnceLock, Mutex};
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -11,32 +10,24 @@ use std::num::NonZeroUsize;
 pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 pub const VM_USER_VERSION: u32 = 1;
 
+/// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("SELF_VM_CACHE") {
-        let pb = PathBuf::from(p);
-        let _ = std::fs::create_dir_all(&pb);
-        if pb.is_dir() { return pb; }
-    }
-    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
-        let pb = PathBuf::from(x).join("self-vm");
-        let _ = std::fs::create_dir_all(&pb);
-        if pb.is_dir() { return pb; }
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        let pb = PathBuf::from(h).join(".cache/self-vm");
-        if std::fs::create_dir_all(&pb).is_ok() && pb.is_dir() {
-            let probe = pb.join(".probe");
-            if std::fs::write(&probe, b"1").is_ok() { let _ = std::fs::remove_file(&probe); return pb; }
-        }
-    }
-    if let Ok(r) = std::env::var("XDG_RUNTIME_DIR") {
-        let pb = PathBuf::from(r).join("self-vm-cache");
-        let _ = std::fs::create_dir_all(&pb);
-        if pb.is_dir() { return pb; }
-    }
-    let pb = PathBuf::from("/tmp/self-vm-cache");
-    let _ = std::fs::create_dir_all(&pb);
-    pb
+    let dir = std::env::var_os("SELF_VM_CACHE").map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(|x| PathBuf::from(x).join("self-vm")))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/self-vm")))
+        .unwrap_or_else(|| std::env::temp_dir().join("self-vm-cache"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+/// Create unique temp dir `$TMPDIR/<prefix>XXXXXX` via mkdtemp(3).
+pub fn make_tmp_dir(prefix: &str) -> Result<PathBuf> {
+    let tmpl = std::env::temp_dir().join(format!("{}XXXXXX", prefix));
+    let mut buf = tmpl.to_string_lossy().as_bytes().to_vec();
+    buf.push(0);
+    let p = unsafe { libc::mkdtemp(buf.as_mut_ptr() as *mut libc::c_char) };
+    if p.is_null() { return Err(anyhow!("mkdtemp {}: {}", tmpl.display(), std::io::Error::last_os_error())); }
+    buf.pop();
+    Ok(PathBuf::from(String::from_utf8_lossy(&buf).to_string()))
 }
 pub fn cache_path_for_hash(hash: &str) -> PathBuf {
     let dir = cache_dir();
@@ -472,8 +463,6 @@ pub fn decompress_bytes_cached(hash: &str, data: &[u8], compressed: i64) -> Vec<
     }
     raw
 }
-pub fn is_gzipped(data: &[u8]) -> bool { data.len()>=2 && data[0]==0x1f && data[1]==0x8b }
-pub fn is_zstd(data: &[u8]) -> bool { data.len()>=4 && data[0]==0x28 && data[1]==0xb5 && data[2]==0x2f && data[3]==0xfd }
 
 pub fn vm_add_bytes(conn: &Connection, vm_path: &str, data: &[u8], mode: i64, mtime: i64) -> Result<()> {
     let vm_p = normalize_vm_path(vm_path);
@@ -723,9 +712,6 @@ pub fn vm_pack_host_dir(conn: &Connection, host_dir: &str, vm_prefix: &str) -> R
     }
     conn.execute_batch("COMMIT;")?;
     Ok(n)
-}
-pub fn vm_import_tar(conn: &Connection, tar_path: &str, strip_prefix: &str) -> Result<usize> {
-    vm_import_tar_filtered(conn, tar_path, strip_prefix, None, None)
 }
 pub fn vm_import_tar_filtered(conn: &Connection, tar_path: &str, strip_prefix: &str, whitelist: Option<&[String]>, exclude: Option<&[String]>) -> Result<usize> {
     use std::io::Read;
@@ -1224,7 +1210,7 @@ pub fn vm_mem_trace(db_path: &str, prog: &str, rest: Vec<String>) -> Result<()> 
     #[cfg(target_os = "linux")]
     {
         let db_path_owned = db_path.to_string();
-        let trace_path = format!("/tmp/self-vm-trace-{}", std::process::id());
+        let trace_path = std::env::temp_dir().join(format!("self-vm-trace-{}", std::process::id())).to_string_lossy().to_string();
         let strace_ok = Command::new("strace").arg("--help").output().is_ok();
         if strace_ok {
             let mut cmd = Command::new("strace");
@@ -1363,67 +1349,6 @@ pub fn vm_disk_size(conn: &Connection) -> Result<i64> {
     Ok(0)
 }
 fn is_all_zero(b: &[u8]) -> bool { b.iter().all(|&x| x==0) }
-pub fn vm_disk_read(conn: &Connection, offset: i64, len: i64) -> Result<Vec<u8>> {
-    ensure_disk_blocks_table(conn)?;
-    let disk: i64 = vm_disk_size(conn)?;
-    if offset < 0 || len < 0 || offset+len > disk { return Err(anyhow!("disk read out of range offset={} len={} disk={}", offset, len, disk)); }
-    if len == 0 { return Ok(vec![]); }
-    let bs = DISK_BLOCK_SIZE;
-    let mut out = Vec::with_capacity(len as usize);
-    let start_block = offset / bs;
-    let end_block = (offset+len-1)/bs;
-    for bid in start_block..=end_block {
-        let block_off = bid*bs;
-        let raw: Option<(Vec<u8>, i64)> = conn.query_row("SELECT content, compressed FROM vm_disk_blocks WHERE block_id=?1", params![bid], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let block_bytes: Vec<u8> = if let Some((data, comp)) = raw {
-            if comp == 2 { zstd::bulk::decompress(&data, bs as usize).map_err(|e| anyhow!("zstd decompress block {}: {}", bid, e))? }
-            else if comp == 1 { let mut d=flate2::read::GzDecoder::new(&data[..]); let mut o=Vec::new(); d.read_to_end(&mut o)?; o }
-            else { data }
-        } else { vec![0u8; bs as usize] };
-        let mut bb = block_bytes;
-        if bb.len() < bs as usize { bb.resize(bs as usize, 0); }
-        let want_off = (offset.max(block_off) - block_off) as usize;
-        let want_end = ((offset+len).min(block_off+bs) - block_off) as usize;
-        out.extend_from_slice(&bb[want_off..want_end]);
-    }
-    Ok(out)
-}
-pub fn vm_disk_write(conn: &Connection, offset: i64, data: &[u8]) -> Result<()> {
-    ensure_disk_blocks_table(conn)?;
-    let disk: i64 = vm_disk_size(conn)?;
-    let len = data.len() as i64;
-    if offset < 0 || len < 0 || offset+len > disk { return Err(anyhow!("disk write out of range offset={} len={} disk={}", offset, len, disk)); }
-    if len == 0 { return Ok(()); }
-    let bs = DISK_BLOCK_SIZE as usize;
-    let bs_i = DISK_BLOCK_SIZE;
-    let start = offset/bs_i;
-    let end = (offset+len-1)/bs_i;
-    let mut data_off = 0usize;
-    for bid in start..=end {
-        let block_off = bid*bs_i;
-        let raw_exist: Option<(Vec<u8>, i64)> = conn.query_row("SELECT content, compressed FROM vm_disk_blocks WHERE block_id=?1", params![bid], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let mut block: Vec<u8> = if let Some((d, comp)) = raw_exist {
-            if comp == 2 { zstd::bulk::decompress(&d, bs).map_err(|e| anyhow!("zstd decompress block {}: {}", bid, e))? }
-            else if comp == 1 { let mut dec=flate2::read::GzDecoder::new(&d[..]); let mut o=Vec::new(); dec.read_to_end(&mut o)?; o }
-            else { d }
-        } else { vec![0u8; bs] };
-        if block.len() < bs { block.resize(bs, 0); }
-        let lo = (offset.max(block_off)-block_off) as usize;
-        let hi = ((offset+len).min(block_off+bs_i)-block_off) as usize;
-        let n = hi-lo;
-        block[lo..hi].copy_from_slice(&data[data_off..data_off+n]);
-        data_off += n;
-        if is_all_zero(&block) {
-            conn.execute("DELETE FROM vm_disk_blocks WHERE block_id=?1", params![bid])?;
-        } else {
-            let comp_opt = compress_bytes(&block);
-            let (content, compressed, raw_size): (Vec<u8>, i64, i64) = if let Some(c) = comp_opt { (c, 2, bs as i64) } else { (block.clone(), 0, bs as i64) };
-            conn.execute("INSERT OR REPLACE INTO vm_disk_blocks(block_id, content, compressed, raw_size) VALUES (?1,?2,?3,?4)", params![bid, content, compressed, raw_size])?;
-        }
-    }
-    conn.execute("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)", params!["disk_version", "0"])?;
-    Ok(())
-}
 pub fn vm_disk_import_raw(conn: &Connection, raw_path: &str, disk_size: i64) -> Result<(i64,i64)> {
     let existing = vm_disk_size(conn).unwrap_or(0);
     let target = if existing>0 && existing>disk_size { existing } else { disk_size };
@@ -1482,7 +1407,6 @@ pub fn vm_disk_export_raw(conn: &Connection, raw_path: &str) -> Result<(i64,i64)
     }
     Ok((blocks, nonzero))
 }
-pub fn vm_disk_export_raw_sparse(conn: &Connection, raw_path: &str) -> Result<(i64,i64)> { vm_disk_export_raw(conn, raw_path) }
 pub fn vm_disk_info(conn: &Connection) -> Result<String> {
     ensure_disk_blocks_table(conn)?;
     let disk = vm_disk_size(conn)?;
@@ -1495,8 +1419,5 @@ pub fn vm_disk_info(conn: &Connection) -> Result<String> {
         disk, disk as f64/1024.0/1024.0/1024.0, blocks, stored, logical, disk-logical, raw_storage, if disk>0 {100.0*raw_storage as f64/disk as f64} else {0.0},
         conn.query_row("PRAGMA page_size", [], |r| r.get::<_,i64>(0)).unwrap_or(0),
         conn.query_row("PRAGMA page_count", [], |r| r.get::<_,i64>(0)).unwrap_or(0)))
-}
-pub fn vm_disk_nbd_serve(db_path: &str, host: &str, port: u16) -> Result<()> {
-    anyhow::bail!("NBD serve via sqlite is experimental: export raw then use qemu-nbd --shared=4 -x selfdisk {} or rusteNBD. disk_size={} bytes. Steps: vm-disk-export {} /tmp/disk.raw && qemu-nbd -f raw -x selfdisk /tmp/disk.raw -p {} -t & qemu-system-x86_64 -m 512M -drive file=nbd:{}:{}/1,format=raw,if=virtio -serial mon:stdio -nographic", host, vm_disk_size(&vm_open(db_path)?)?, db_path, port, host, port)
 }
 

@@ -88,10 +88,7 @@ fn extract_bundle(db: &Connection) -> Option<PathBuf> {
     let mut dir_created: Option<PathBuf>=None;
     let mut get_dir = || -> PathBuf {
         if let Some(ref d)=dir_created { return d.clone(); }
-        let mut tmpl=b"/tmp/self-bundle-XXXXXX\0".to_vec();
-        let p=unsafe{ libc::mkdtemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
-        let d=if p.is_null(){ PathBuf::from("/tmp/self-bundle-fallback") } else { let c=unsafe{ CStr::from_ptr(p)}; PathBuf::from(c.to_string_lossy().to_string()) };
-        let _=std::fs::create_dir_all(&d);
+        let d = selfdb::vm::make_tmp_dir("self-bundle-").unwrap_or_else(|e| { eprintln!("self-exec: {e}"); std::process::exit(126) });
         dir_created=Some(d.clone()); d
     };
     let mut written=0usize;

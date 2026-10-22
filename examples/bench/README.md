@@ -23,5 +23,4 @@ SELF stripped  172032 bytes
 `--bundle` 自包含时自身体积为主可执行文件 + 闭包 `.so` 的 `content` 之和（含原文图中的 `ld.so`）；单一 `ls` 闭包约 6 objects（`ld.so/libselinux/libcap/libc/libpcre2`），瘦身策略为宿主字节一致的系统库落盘跳过（`/tmp/self-bundle-XXXXXX` 仅含私有库如 `libgreet.so.1` 时约 15 KiB），空闭包目录会被回收不污染 `LD_LIBRARY_PATH`。
 
 `scan` / `userland` 已会在聚合库上输出与原文一致的 headline 查询（distinct soname、top sonames、unresolved needs）。
-动态与多对象场景的时延未在本 demo 中定量复现。
-`vm` (新增)：`self vm-init/vm-import/vm-exec` 为单文件 VM，`vm-exec` 按需 materialize 到 `mkdtemp`，`--version` 约 6.6 ms（见 README 单文件 VM 一节）。
+单文件 VM 基准见 `docs/vm.md`。

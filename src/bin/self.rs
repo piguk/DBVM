@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::ffi::CStr;
 use rusqlite::Connection;
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +23,7 @@ enum Cmd {
     Bundle{ path: String, #[arg(long, default_value="")] filter: String },
     BundleInfo{ path: String },
     Pack{ input: String, #[arg(short,long, default_value="a.self")] output: String, #[arg(long)] no_bundle: bool, #[arg(long)] no_sections: bool, #[arg(long)] no_notes: bool },
-    Run{ path: String, rest: Vec<String> },
+    Run{ path: String, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String> },
     VmInit{ db: String, #[arg(long)] force: bool, #[arg(long)] vm_only: bool },
     VmAdd{ db: String, host: String, vm_path: String },
     VmPack{ db: String, host_dir: String, #[arg(long, default_value="/")] prefix: String },
@@ -34,8 +33,8 @@ enum Cmd {
     VmLs{ db: String, #[arg(default_value="/")] path: String },
     VmCat{ db: String, path: String },
     VmStat{ db: String, path: String },
-    VmExec{ db: String, vm_path: String, rest: Vec<String> },
-    VmChroot{ db: String, #[arg(default_value="/bin/sh")] cmd: String, rest: Vec<String>, #[arg(long, help="keep tmp dir and persist history (default: true unless --ephemeral)")] persist: bool, #[arg(long, help="skip sync and remove tmp, disables history persistence")] ephemeral: bool },
+    VmExec{ db: String, vm_path: String, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String> },
+    VmChroot{ db: String, #[arg(default_value="/bin/sh")] cmd: String, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String>, #[arg(long, help="keep tmp dir and persist history (default: true unless --ephemeral)")] persist: bool, #[arg(long, help="skip sync and remove tmp, disables history persistence")] ephemeral: bool },
     VmResolve{ db: String, vm_path: String },
     VmCheckpoint{ db: String, name: String, #[arg(long, default_value="")] note: String },
     VmSnapshots{ db: String },
@@ -57,12 +56,12 @@ enum Cmd {
     VmDictInfo{ db: String },
     VmDiff{ db: String, a: String, b: String },
     VmMount{ db: String, mountpoint: String, #[arg(long)] allow_other: bool },
-    VmMemTrace{ db: String, prog: String, rest: Vec<String> },
+    VmMemTrace{ db: String, prog: String, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String> },
     VmDiskInit{ db: String, #[arg(long, default_value="20G")] size: String },
     VmDiskImport{ db: String, raw: String, #[arg(long, default_value="")] size: String },
     VmDiskExport{ db: String, raw: String },
     VmDiskInfo{ db: String },
-    VmRun{ db: String, #[arg(long, default_value="512M")] mem: String, #[arg(long)] nbd: bool, #[arg(long, default_value="")] raw: String, #[arg(long)] kvm: bool, #[arg(long, default_value="")] kernel: String, #[arg(long, default_value="")] initrd: String, #[arg(long, default_value="")] append: String },
+    VmRun{ db: String, #[arg(long, default_value="512M")] mem: String, #[arg(long, default_value="")] raw: String, #[arg(long)] kvm: bool, #[arg(long, default_value="")] kernel: String, #[arg(long, default_value="")] initrd: String, #[arg(long, default_value="")] append: String },
 }
 
 fn open_db(path: &str) -> Connection {
@@ -118,10 +117,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::VmStat{db, path} => { let c=selfdb::vm::vm_open(&db)?; let (p,k,m,sz,mtime,hash)=selfdb::vm::vm_stat(&c, &path)?; println!("path={} kind={} mode={:o} size={} mtime={} hash={}", p,k,m,sz,mtime,hash); },
         Cmd::VmExec{db, vm_path, rest} => {
             let c=selfdb::vm::vm_open(&db)?;
-            // mkdtemp under /tmp/self-vm-XXXXXX
-            let mut tmpl=b"/tmp/self-vm-XXXXXX\0".to_vec();
-            let p=unsafe{ libc::mkdtemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
-            let tmp = if p.is_null(){ std::env::temp_dir().join(format!("vm-exec-{}", std::process::id())) } else { let s=unsafe{ std::ffi::CStr::from_ptr(p)}; std::path::PathBuf::from(s.to_string_lossy().to_string()) };
+            let tmp = selfdb::vm::make_tmp_dir("self-vm-")?;
             let host_bin = tmp.join(vm_path.trim_start_matches('/'));
             if let Some(parent)=host_bin.parent(){ std::fs::create_dir_all(parent)?; }
             // resolve symlink via vm_resolve and materialize (symlinks become regular file with target content)
@@ -187,7 +183,7 @@ fn main() -> anyhow::Result<()> {
                     let _ = selfdb::vm::vm_materialize(&c, &lp, &host);
                 }
             }
-            let mut env_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            let env_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
             let vm_ld = format!("{}:{}", tmp.join("usr/lib/x86_64-linux-gnu").to_string_lossy(), tmp.join("lib/x86_64-linux-gnu").to_string_lossy());
             let merged_ld = if env_ld.is_empty(){ format!("{}:{}", tmp.to_string_lossy(), vm_ld) } else { format!("{}:{}:{}", tmp.to_string_lossy(), vm_ld, env_ld) };
             let mut args = Vec::new(); args.extend(rest.clone());
@@ -306,9 +302,7 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("hint: rebuild with --features fuse for zero-materialize: `cargo build --release --features fuse` (pure-rust, no libfuse3-dev)");
             }
             // fallback: materialize (88 files) then bwrap; still auto-persists via vm_sync_from_host + WAL
-            let mut tmpl=b"/tmp/self-vm-XXXXXX\0".to_vec();
-            let pp=unsafe{ libc::mkdtemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
-            let tmp = if pp.is_null(){ std::env::temp_dir().join(format!("vm-chroot-{}", std::process::id())) } else { let s=unsafe{ std::ffi::CStr::from_ptr(pp)}; std::path::PathBuf::from(s.to_string_lossy().to_string()) };
+            let tmp = selfdb::vm::make_tmp_dir("self-vm-")?;
             let n=selfdb::vm::vm_materialize_tree(&c, &tmp)?;
             eprintln!("materialized {} files -> {} (fallback, would be 0 with FUSE)", n, tmp.display());
             for d in ["proc","sys","dev","tmp"] { let _=std::fs::create_dir_all(tmp.join(d)); }
@@ -456,17 +450,10 @@ fn main() -> anyhow::Result<()> {
             let c=selfdb::vm::vm_open(&db)?;
             println!("{}", selfdb::vm::vm_diff(&c, &a, &b)?);
         },
-        Cmd::VmMount{db, mountpoint, allow_other} => {
-            #[cfg(feature = "fuse")]
-            {
-                selfdb::fuse::fuse_impl::mount_vm(&db, &mountpoint, allow_other)?;
-            }
-            #[cfg(not(feature = "fuse"))]
-            {
-                eprintln!("fuse feature not enabled: rebuild with --features fuse (needs fuser default-features=false, pure-rust, no libfuse)");
-                std::process::exit(1);
-            }
-        },
+        #[cfg(feature = "fuse")]
+        Cmd::VmMount{db, mountpoint, allow_other} => { selfdb::fuse::fuse_impl::mount_vm(&db, &mountpoint, allow_other)?; },
+        #[cfg(not(feature = "fuse"))]
+        Cmd::VmMount{..} => anyhow::bail!("rebuild with --features fuse"),
         Cmd::VmMemTrace{db, prog, rest} => {
             #[cfg(target_os = "linux")]
             {
@@ -506,110 +493,35 @@ fn main() -> anyhow::Result<()> {
             let c=selfdb::vm::vm_open(&db)?;
             println!("{}", selfdb::vm::vm_disk_info(&c)?);
         },
-        Cmd::VmRun{db, mem, nbd, raw, kvm, kernel, initrd, append} => {
+        Cmd::VmRun{db, mem, raw, kvm, kernel, initrd, append} => {
             let c=selfdb::vm::vm_open(&db)?;
             let info=selfdb::vm::vm_disk_info(&c)?;
             println!("{}", info);
             let disk_size=selfdb::vm::vm_disk_size(&c).unwrap_or(0);
             let raw_path = if raw.is_empty() {
-                let p = format!("/tmp/self-vm-disk-{}.raw", std::process::id());
+                let p = std::env::temp_dir().join(format!("self-vm-disk-{}.raw", std::process::id())).to_string_lossy().to_string();
                 selfdb::vm::vm_disk_export_raw(&c, &p)?;
                 println!("exported disk -> {} ({} bytes)", p, disk_size);
                 p
             } else {
-                if std::path::Path::new(&raw).exists() && disk_size==0 {
-                    let sz = std::fs::metadata(&raw).map(|m| m.len() as i64).unwrap_or(0);
-                    selfdb::vm::vm_disk_init(&c, (sz+4095)/4096*4096)?;
-                    let (total, nonzero)=selfdb::vm::vm_disk_import_raw(&c, &raw, (sz+4095)/4096*4096)?;
-                    println!("imported {} -> vm_disk_blocks ({} blocks nonzero={})", raw, total, nonzero);
-                }
                 raw.to_string()
             };
-            let qemu = std::env::var("QEMU_SYSTEM_X86_64")
-                .or_else(|_| std::env::var("QEMU"))
-                .unwrap_or_else(|_| {
-                    for c in ["qemu-system-x86_64", "qemu-system-x86", "qemu-system-i386"] {
-                        if std::path::Path::new(&format!("/usr/bin/{}", c)).exists() { return c.to_string(); }
-                        if let Ok(out) = std::process::Command::new("which").arg(c).output() {
-                            if out.status.success() { return c.to_string(); }
-                        }
-                    }
-                    "qemu-system-x86_64".to_string()
-                });
+            let qemu = std::env::var("QEMU").unwrap_or_else(|_| "qemu-system-x86_64".to_string());
             // direct kernel boot path (no bootloader needed) via -kernel/-initrd/-append
             // If kernel empty but disk has no bootable MBR (e.g. /tmp/test_disk.raw ext2 only), auto-suggest direct boot.
             // Also treat direct vm DB disk (no --raw) as .raw-like for probing: check the exported raw_path.
+            // direct kernel boot: -kernel/-initrd/-append (rootfs = virtio disk, root=/dev/vda)
             let mut boot_args: Vec<String> = Vec::new();
-            let effective_kernel = if !kernel.is_empty() { Some(kernel.clone()) } else {
-                let is_raw_like = raw_path.ends_with(".raw") || raw.is_empty();
-                if is_raw_like {
-                    // probe disk for MBR bootable signature; if missing, use host kernel + busybox trick
-                    let has_mbr = std::fs::File::open(&raw_path).ok().and_then(|mut f| {
-                        use std::io::{Read, Seek, SeekFrom};
-                        let mut b = [0u8; 512];
-                        if f.read_exact(&mut b).is_ok() { Some(b[510]==0x55 && b[511]==0xAA) } else { None }
-                    }).unwrap_or(false);
-                    if !has_mbr {
-                        // use host kernel + initrd for demo when disk is just an ext2 fs (like /tmp/test_disk.raw)
-                        // robust host kernel probe: try /vmlinuz symlink, /boot/vmlinuz*, explicit fallback
-                        let mut host_k: Option<String> = None;
-                        for cand in ["/vmlinuz".to_string(), "/boot/vmlinuz".to_string(), format!("/boot/vmlinuz-{}", std::env::var("HOST_KERNEL").unwrap_or_default()), "/boot/vmlinuz-6.12.74+deb13+1-amd64".to_string()] {
-                            if !cand.is_empty() && std::path::Path::new(&cand).exists() { host_k = Some(cand); break; }
-                            // also handle /vmlinuz -> boot/vmlinuz-* relative link: canonicalize
-                            if cand == "/vmlinuz" {
-                                if let Ok(link) = std::fs::read_link(&cand) {
-                                    let abs = if link.is_absolute() { link } else { std::path::Path::new("/").join(link) };
-                                    if abs.exists() { host_k = Some(abs.to_string_lossy().to_string()); break; }
-                                    // also try resolving via canonicalize
-                                    if let Ok(canon) = std::fs::canonicalize(&cand) { if canon.exists() { host_k = Some(canon.to_string_lossy().to_string()); break; } }
-                                }
-                            }
-                        }
-                        if host_k.is_none() {
-                            if let Ok(rd) = std::fs::read_dir("/boot") {
-                                for e in rd.flatten() {
-                                    let n = e.file_name().to_string_lossy().to_string();
-                                    if n.starts_with("vmlinuz-") { host_k = Some(e.path().to_string_lossy().to_string()); break; }
-                                }
-                            }
-                        }
-                        let host_k = host_k.unwrap_or_else(|| "/boot/vmlinuz-6.12.74+deb13+1-amd64".to_string());
-                        if std::path::Path::new(&host_k).exists() { Some(host_k) } else { None }
-                    } else { None }
-                } else { None }
-            };
-            if let Some(k) = &effective_kernel {
-                // -kernel boot needs --raw to be the rootfs disk; we pass it as virtio drive + root=/dev/vda
-                let initrd_arg = if !initrd.is_empty() {
-                    if initrd=="none" || initrd=="no" || initrd=="0" { None } else { Some(initrd.clone()) }
-                } else {
-                    // try to guess initrd for host kernel (skip if user wants none)
-                    let guess = k.replace("vmlinuz", "initrd.img");
-                    if std::path::Path::new(&guess).exists() { Some(guess) } else {
-                        ["/boot/initrd.img-6.12.74+deb13+1-amd64", "/boot/initrd.img"].into_iter().find(|p| std::path::Path::new(p).exists()).map(|s| s.to_string())
-                    }
-                };
-                boot_args.push("-kernel".to_string()); boot_args.push(k.clone());
-                if let Some(ir) = initrd_arg { boot_args.push("-initrd".to_string()); boot_args.push(ir); }
-                let app = if !append.is_empty() { append.clone() } else { "console=ttyS0 root=/dev/vda rw panic=1".to_string() };
-                boot_args.push("-append".to_string()); boot_args.push(app);
-                println!("direct-kernel boot: kernel={} initrd={} append={:?}", k, initrd, if append.is_empty() { "console=ttyS0 root=/dev/vda rw panic=1" } else { &append });
+            if !kernel.is_empty() {
+                boot_args.push("-kernel".into()); boot_args.push(kernel.clone());
+                let no_initrd = matches!(initrd.as_str(), "" | "none" | "no" | "0");
+                if !no_initrd { boot_args.push("-initrd".into()); boot_args.push(initrd.clone()); }
+                let app = if append.is_empty() { "console=ttyS0 root=/dev/vda rw panic=1".to_string() } else { append.clone() };
+                boot_args.push("-append".into()); boot_args.push(app);
             }
             let mut args: Vec<String> = vec!["-m".to_string(), mem.clone(), "-drive".to_string(), format!("file={},format=raw,if=virtio", raw_path), "-serial".to_string(), "mon:stdio".to_string(), "-nographic".to_string()];
             args.extend(boot_args);
             if kvm && std::path::Path::new("/dev/kvm").exists() { args.push("-enable-kvm".to_string()); args.push("-cpu".to_string()); args.push("host".to_string()); }
-            if nbd { println!("hint: qemu {} {}", qemu, args.join(" ")); println!("or NBD: qemu-nbd --connect=/dev/nbd0 {} (needs nbd kernel)", raw_path); }
-            // warn if MBR missing and no kernel provided
-            if effective_kernel.is_none() && !raw_path.is_empty() {
-                let has_mbr = std::fs::File::open(&raw_path).ok().and_then(|mut f| {
-                    use std::io::{Read, Seek};
-                    let mut b = [0u8; 512];
-                    if f.seek(std::io::SeekFrom::Start(510)).is_ok() && f.read_exact(&mut b[0..2]).is_ok() { Some(b[0]==0x55 && b[1]==0xAA) } else { None }
-                }).unwrap_or(false);
-                if !has_mbr {
-                    eprintln!("note: disk {} has no MBR/bootloader (ext2 only); boot will fall back to iPXE/SeaBIOS and fail with 'Boot failed: could not read the boot disk'. Use: vm-run --kernel /boot/vmlinuz --initrd /boot/initrd.img --append 'console=ttyS0 root=/dev/vda rw' OR build a bootable image with grub.", raw_path);
-                }
-            }
             println!("boot: {} {}  (apt: qemu-system-x86 provides {})", qemu, args.join(" "), qemu);
             let status = std::process::Command::new(&qemu).args(&args).status().map_err(|e| anyhow::anyhow!("exec {} failed: {} (apt install qemu-system-x86)", qemu, e))?;
             std::process::exit(status.code().unwrap_or(0));
