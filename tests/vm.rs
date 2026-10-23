@@ -542,3 +542,64 @@ fn recompress_runs_on_current_schema() {
     assert_eq!(vm::vm_cat(&c, "/r").unwrap(), data);
     assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
 }
+
+/// Snapshot of everything that defines a packed VM: per-file metadata + chunk keys, and the
+/// blob set with stored encodings. Two packs of the same tree must produce equal snapshots.
+fn pack_snapshot(c: &rusqlite::Connection) -> (Vec<(String, i64, i64, Vec<u8>, Vec<Vec<u8>>)>, Vec<(Vec<u8>, i64, i64, i64)>) {
+    let mut files = Vec::new();
+    let mut st = c.prepare("SELECT path, mode, size, hash FROM vm_fs WHERE kind='file' ORDER BY path").unwrap();
+    for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?))).unwrap() {
+        let (p, m, sz, h) = r.unwrap();
+        let mut ks = c.prepare("SELECT hash FROM vm_file_chunks WHERE path=?1 ORDER BY idx").unwrap();
+        let keys: Vec<Vec<u8>> = ks.query_map([&p], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect();
+        files.push((p, m, sz, h, keys));
+    }
+    let mut blobs = Vec::new();
+    let mut st = c.prepare("SELECT hash, compressed, raw_size, dict_id FROM vm_blobs ORDER BY hash").unwrap();
+    for r in st.query_map([], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?))).unwrap() {
+        blobs.push(r.unwrap());
+    }
+    (files, blobs)
+}
+
+#[test]
+fn parallel_pack_matches_serial_pack() {
+    use vm::CHUNK_SIZE;
+    let (_g, _db) = tmpdb("pack-eq");
+    let src = _g.path().join("src");
+    std::fs::create_dir_all(src.join("sub/deep")).unwrap();
+    // mix: empty, tiny, dict-eligible text, multi-chunk, binary-ish, nested
+    std::fs::write(src.join("empty"), b"").unwrap();
+    std::fs::write(src.join("tiny"), b"t").unwrap();
+    for i in 0..40 { std::fs::write(src.join(format!("sub/rec{}", i)), format!("{{\"schema\":\"v1\",\"id\":{},\"owner\":\"alpha\",\"note\":\"generated record {} for owner alpha in the batch\"}}", i, i)).unwrap(); }
+    let big: Vec<u8> = (0..(2*CHUNK_SIZE+777)).map(|k| ((k*31)%251) as u8).collect();
+    std::fs::write(src.join("sub/deep/big"), &big).unwrap();
+    let mut x = 0x2545F4914F6CDD1Du64;
+    let rnd: Vec<u8> = (0..70000).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 24) as u8 }).collect();
+    std::fs::write(src.join("sub/rnd"), &rnd).unwrap();
+
+    let make = |name: &str, parallel: bool| -> rusqlite::Connection {
+        let db = _g.path().join(format!("{}.db", name));
+        let c = vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap();
+        // dictionary trained on the same kind of data first, so dict_id paths are exercised
+        for i in 0..60u32 { vm::vm_add_bytes(&c, &format!("/train/{}", i), format!("{{\"schema\":\"v1\",\"id\":{},\"owner\":\"alpha\",\"note\":\"generated record {} for owner alpha in the batch\"}}", i, i).as_bytes(), 0o644, 1).unwrap(); }
+        vm::vm_train_dict(&c, 16384).unwrap();
+        let n = if parallel { vm::vm_pack_host_dir_parallel(&c, src.to_str().unwrap(), "/data").unwrap() }
+                else { vm::vm_pack_host_dir(&c, src.to_str().unwrap(), "/data").unwrap() };
+        assert_eq!(n, 44, "{} packed file count", name);
+        c
+    };
+    let serial = make("serial", false);
+    let parallel = make("parallel", true);
+    assert_eq!(pack_snapshot(&serial), pack_snapshot(&parallel), "parallel pack must equal serial pack");
+    // directory rows too (the snapshot covers files only)
+    let dirs = |c: &rusqlite::Connection| -> Vec<String> {
+        c.prepare("SELECT path FROM vm_fs WHERE kind='dir' ORDER BY path").unwrap().query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+    };
+    assert_eq!(dirs(&serial), dirs(&parallel), "directory rows must match");
+    // content round-trips exactly
+    assert_eq!(vm::vm_cat(&parallel, "/data/sub/deep/big").unwrap(), big);
+    assert_eq!(vm::vm_cat(&parallel, "/data/sub/rnd").unwrap(), rnd);
+    assert_eq!(vm::vm_cat(&parallel, "/data/empty").unwrap(), b"");
+    assert!(vm::vm_verify(&parallel, true).unwrap().contains("deep=ok"));
+}

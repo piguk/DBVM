@@ -636,10 +636,28 @@ pub fn compress_bytes(data: &[u8]) -> Option<Vec<u8>> {
 /// Choose the smallest encoding. Returns (stored bytes, flag, dict_id); dict_id is non-zero
 /// only for flag 3. None means store raw.
 pub fn compress_bytes_with_conn(conn: &Connection, data: &[u8]) -> Option<(Vec<u8>, i64, i64)> {
+    let dict = latest_dict(conn);
+    compress_with_dict(data, dict.as_ref())
+}
+
+/// The dictionary new writes use: the latest one, loaded once. None if untrained.
+pub fn latest_dict(conn: &Connection) -> Option<(i64, Arc<Vec<u8>>)> {
+    let id = vm_latest_dict_id(conn).ok().flatten()?;
+    let d = dict_by_id(conn, id).ok()?;
+    Some((id, d))
+}
+
+/// Pure encoding decision (no DB access, safe to run on worker threads). Returns
+/// (stored bytes, flag, dict_id); None means store raw. The serial and parallel write paths
+/// both call this, so they cannot diverge.
+pub fn compress_with_dict(data: &[u8], dict: Option<&(i64, Arc<Vec<u8>>)>) -> Option<(Vec<u8>, i64, i64)> {
+    let dict = dict.filter(|(_, d)| d.len() >= 512);
     if data.len() < 512 {
         // tiny files only benefit from a dictionary
-        if let Some((c, id)) = try_dict(conn, data, 3) {
-            if c.len() + 32 < data.len() { return Some((c, 3, id)); }
+        if let Some((id, d)) = dict {
+            if let Ok(c) = zstd::bulk::Compressor::with_dictionary(3, d).and_then(|mut e| e.compress(data)) {
+                if c.len() + 32 < data.len() { return Some((c, 3, *id)); }
+            }
         }
         if data.len() < 1024 { return None; }
     }
@@ -647,10 +665,12 @@ pub fn compress_bytes_with_conn(conn: &Connection, data: &[u8]) -> Option<(Vec<u
     let mut best: Option<(Vec<u8>, i64, i64)> = None;
     let mut best_len = usize::MAX;
     if data.len() < 16384 {
-        if let Some((c, id)) = try_dict(conn, data, level) {
-            if c.len() + 32 < data.len() && c.len() < best_len {
-                best_len = c.len();
-                best = Some((c, 3, id));
+        if let Some((id, d)) = dict {
+            if let Ok(c) = zstd::bulk::Compressor::with_dictionary(level, d).and_then(|mut e| e.compress(data)) {
+                if c.len() + 32 < data.len() && c.len() < best_len {
+                    best_len = c.len();
+                    best = Some((c, 3, *id));
+                }
             }
         }
     }
@@ -671,14 +691,6 @@ pub fn compress_bytes_with_conn(conn: &Connection, data: &[u8]) -> Option<(Vec<u
     best
 }
 
-/// Compress with the latest dictionary, if one exists. Returns the dictionary id used.
-fn try_dict(conn: &Connection, data: &[u8], level: i32) -> Option<(Vec<u8>, i64)> {
-    let id = vm_latest_dict_id(conn).ok().flatten()?;
-    let dict = dict_by_id(conn, id).ok()?;
-    if dict.len() < 512 { return None; }
-    let c = zstd::bulk::Compressor::with_dictionary(level, &dict).ok()?.compress(data).ok()?;
-    Some((c, id))
-}
 /// Decompressed size from the zstd frame header. Never truncates: a missing or implausible
 /// header is an error, and the output buffer is sized to exactly the declared content size.
 fn zstd_frame_size(data: &[u8]) -> Result<usize> {
@@ -734,10 +746,14 @@ fn blob_ensure(conn: &Connection, key: &BlobKey, data: &[u8]) -> Result<i64> {
     if let Some(flag) = conn.prepare_cached("SELECT compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![key.as_slice()], |r| r.get::<_,i64>(0)).optional()? {
         return Ok(flag);
     }
-    let (body, flag, dict_id) = match compress_bytes_with_conn(conn, data) {
-        Some(t) => t,
-        None => (data.to_vec(), 0, 0),
-    };
+    let enc = compress_bytes_with_conn(conn, data).unwrap_or_else(|| (data.to_vec(), 0, 0));
+    blob_insert_encoded(conn, key, data, enc)
+}
+
+/// Insert a blob row from an already-computed encoding (serial writer only). Called by
+/// `blob_ensure` and by the parallel pack, which computes encodings on worker threads.
+fn blob_insert_encoded(conn: &Connection, key: &BlobKey, data: &[u8], enc: (Vec<u8>, i64, i64)) -> Result<i64> {
+    let (body, flag, dict_id) = enc;
     conn.prepare_cached("INSERT INTO vm_blobs(hash, content, compressed, raw_size, refcnt, dict_id) VALUES (?1,?2,?3,?4,0,?5)")?.execute(
         params![key.as_slice(), body, flag, data.len() as i64, dict_id])?;
     let cache_p = cache_path_for_hash(&key_hex(key));
@@ -1107,16 +1123,87 @@ pub fn vm_pack_host_dir(conn: &Connection, host_dir: &str, vm_prefix: &str) -> R
     for entry in walkdir::WalkDir::new(host_dir).follow_links(false).min_depth(0) {
         let e = entry?;
         if e.depth()==0 { continue; }
+        // count regular files only (the CLI reports "N files"); dirs are created implicitly
+        let is_file = e.file_type().is_file();
         let hp = e.path().to_string_lossy().to_string();
         let rel = e.path().strip_prefix(host_dir).unwrap_or(e.path()).to_string_lossy().to_string();
         let vm_p = if vm_prefix == "/" { format!("/{}", rel.trim_start_matches('/')) } else { format!("{}/{}", vm_prefix.trim_end_matches('/'), rel.trim_start_matches('/')) };
         vm_add_file(conn, &hp, &normalize_vm_path(&vm_p))?;
-        n+=1;
+        if is_file { n+=1; }
         if n % 2000 == 0 { conn.execute_batch("COMMIT; BEGIN IMMEDIATE;")?; }
     }
     conn.execute_batch("COMMIT;")?;
     Ok(n)
 }
+/// Parallel directory import. Compression (CPU) runs on rayon workers in bounded batches;
+/// SQLite writes stay serial in walk order inside short transactions. The dictionary is read
+/// once per run, so every file is encoded exactly as the serial path would encode it.
+/// Output matches `vm_pack_host_dir` (verified by a test); only wall time differs.
+pub fn vm_pack_host_dir_parallel(conn: &Connection, host_dir: &str, vm_prefix: &str) -> Result<usize> {
+    use rayon::prelude::*;
+    const BATCH: usize = 256;
+    // 1) plan: (host path, normalized vm path) in walk order, regular files only
+    let mut plan: Vec<(PathBuf, String)> = Vec::new();
+    for entry in walkdir::WalkDir::new(host_dir).follow_links(false).min_depth(1) {
+        let e = entry?;
+        if !e.file_type().is_file() { continue; }
+        let rel = e.path().strip_prefix(host_dir).unwrap_or(e.path()).to_string_lossy().to_string();
+        let vm_p = if vm_prefix == "/" { format!("/{}", rel.trim_start_matches('/')) }
+                   else { format!("{}/{}", vm_prefix.trim_end_matches('/'), rel.trim_start_matches('/')) };
+        plan.push((e.path().to_path_buf(), normalize_vm_path(&vm_p)));
+    }
+    // 2) one dictionary snapshot for the whole run
+    let dict = latest_dict(conn);
+    let mut n = 0usize;
+    for chunk in plan.chunks(BATCH) {
+        // parallel: read + encode each file's chunks (pure CPU, no DB)
+        let encoded: Vec<Result<(PathBuf, String, u32, i64, Vec<(BlobKey, usize, (Vec<u8>, i64, i64))>, Vec<u8>)>> = chunk
+            .par_iter()
+            .map(|(host, vm_p)| {
+                let md = std::fs::metadata(host)?;
+                #[cfg(unix)] let mode = { use std::os::unix::fs::PermissionsExt; md.permissions().mode() };
+                #[cfg(not(unix))] let mode = 0o644u32;
+                let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or_else(now_secs);
+                let data = std::fs::read(host)?;
+                let file_key = blob_key(&data);
+                let pieces: Vec<(BlobKey, usize, (Vec<u8>, i64, i64))> = data.chunks(CHUNK_SIZE).map(|piece| {
+                    let k = blob_key(piece);
+                    let enc = compress_with_dict(piece, dict.as_ref()).unwrap_or_else(|| (piece.to_vec(), 0, 0));
+                    (k, piece.len(), enc)
+                }).collect();
+                let _ = file_key;
+                Ok((host.clone(), vm_p.clone(), mode, mtime, pieces, data))
+            })
+            .collect();
+        // serial writes, walk order
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        for item in encoded {
+            let (host, vm_p, mode, mtime, pieces, data) = item.map_err(|e: anyhow::Error| anyhow!("{}", e))?;
+            ensure_parent_dirs(conn, &vm_p)?;
+            conn.prepare_cached("DELETE FROM vm_file_chunks WHERE path=?1")?.execute(params![vm_p])?;
+            for (i, (key, plen, enc)) in pieces.into_iter().enumerate() {
+                let piece_start = i * CHUNK_SIZE;
+                let piece = &data[piece_start..piece_start + plen];
+                if conn.prepare_cached("SELECT 1 FROM vm_blobs WHERE hash=?1")?.query_row(params![key.as_slice()], |_| Ok(())).optional()?.is_none() {
+                    blob_insert_encoded(conn, &key, piece, enc)?;
+                }
+                conn.prepare_cached("INSERT INTO vm_file_chunks(path, idx, hash) VALUES (?1,?2,?3)")?
+                    .execute(params![vm_p, i as i64, key.as_slice()])?;
+            }
+            let file_hash = blob_key(&data);
+            conn.prepare_cached(
+                "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,NULL,0,NULL)
+                 ON CONFLICT(path) DO UPDATE SET kind='file', mode=excluded.mode, mtime=excluded.mtime, size=excluded.size,
+                    hash=excluded.hash, content=NULL, compressed=0, link_target=NULL")?
+                .execute(params![vm_p, mode as i64, mtime, data.len() as i64, file_hash.as_slice()])?;
+            let _ = host;
+            n += 1;
+        }
+        conn.execute_batch("COMMIT;")?;
+    }
+    Ok(n)
+}
+
 pub fn vm_import_tar_filtered(conn: &Connection, tar_path: &str, strip_prefix: &str, whitelist: Option<&[String]>, exclude: Option<&[String]>) -> Result<usize> {
     use std::io::Read;
     let file = std::fs::File::open(tar_path).map_err(|e| anyhow!("open tar {}: {}", tar_path, e))?;
