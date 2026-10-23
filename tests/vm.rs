@@ -346,3 +346,123 @@ fn rechunk_splits_legacy_single_chunk_files_idempotently() {
     let (done2, skipped2, failed2) = vm::vm_rechunk(&c).unwrap();
     assert_eq!((done2, skipped2, failed2), (0, 1, 0));
 }
+
+#[test]
+fn sync_reports_real_counts_for_dir_type_change() {
+    // file -> dir type change: must count exactly one update, not two.
+    let (_g, db) = tmpdb("sync-count");
+    let host = _g.path().join("root");
+    std::fs::create_dir_all(host.join("etc")).unwrap();
+    std::fs::write(host.join("etc/x"), b"file").unwrap();
+    let c = open(&db);
+    vm::vm_sync_from_host(&c, &host).unwrap();
+    std::fs::remove_file(host.join("etc/x")).unwrap();
+    std::fs::create_dir_all(host.join("etc/x")).unwrap();
+    let (created, updated, deleted) = vm::vm_sync_from_host(&c, &host).unwrap();
+    assert_eq!((created, updated, deleted), (0, 1, 0));
+}
+
+#[test]
+fn sync_counts_file_to_symlink_once() {
+    let (_g, db) = tmpdb("sync-count2");
+    let host = _g.path().join("root");
+    std::fs::create_dir_all(host.join("etc")).unwrap();
+    std::fs::write(host.join("etc/x"), b"file body").unwrap();
+    let c = open(&db);
+    vm::vm_sync_from_host(&c, &host).unwrap();
+    std::fs::remove_file(host.join("etc/x")).unwrap();
+    std::os::unix::fs::symlink("/etc/y", host.join("etc/x")).unwrap();
+    let (created, updated, deleted) = vm::vm_sync_from_host(&c, &host).unwrap();
+    assert_eq!((created, updated, deleted), (0, 1, 0), "one type change = one update");
+}
+
+#[test]
+fn sync_counts_symlink_to_file_once() {
+    let (_g, db) = tmpdb("sync-count3");
+    let host = _g.path().join("root");
+    std::fs::create_dir_all(host.join("etc")).unwrap();
+    std::os::unix::fs::symlink("/etc/y", host.join("etc/x")).unwrap();
+    let c = open(&db);
+    vm::vm_sync_from_host(&c, &host).unwrap();
+    std::fs::remove_file(host.join("etc/x")).unwrap();
+    std::fs::write(host.join("etc/x"), b"now a file").unwrap();
+    let (created, updated, deleted) = vm::vm_sync_from_host(&c, &host).unwrap();
+    assert_eq!((created, updated, deleted), (0, 1, 0), "one type change = one update");
+}
+
+#[test]
+fn stream_write_matches_whole_write() {
+    use vm::CHUNK_SIZE;
+    let (_g, db) = tmpdb("stream-eq");
+    let c = open(&db);
+    for (i, n) in [0usize, 1, CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1, 5 * CHUNK_SIZE + 3].into_iter().enumerate() {
+        let data: Vec<u8> = (0..n).map(|k| ((k * 13 + i) % 251) as u8).collect();
+        vm::vm_add_bytes(&c, &format!("/w{}", i), &data, 0o644, 1).unwrap();
+        // a reader that returns short reads (1..=7 bytes) to exercise the fill loop
+        struct Dribble<'a>(&'a [u8], usize);
+        impl<'a> std::io::Read for Dribble<'a> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let k = out.len().min(self.0.len()).min(1 + self.1 % 7);
+                self.1 += 1;
+                out[..k].copy_from_slice(&self.0[..k]);
+                self.0 = &self.0[k..];
+                Ok(k)
+            }
+        }
+        let got = vm::fs_put_file_stream(&c, &format!("/s{}", i), 0o644, 1, &mut Dribble(&data, 0)).unwrap();
+        assert_eq!(got as usize, n);
+        assert_eq!(vm::vm_cat(&c, &format!("/s{}", i)).unwrap(), data, "size {}", n);
+        let a: (i64, Vec<u8>) = c.query_row("SELECT size, hash FROM vm_fs WHERE path=?1", rusqlite::params![format!("/w{}", i)], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let b: (i64, Vec<u8>) = c.query_row("SELECT size, hash FROM vm_fs WHERE path=?1", rusqlite::params![format!("/s{}", i)], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(a, b, "whole-file hash and size identical, size {}", n);
+    }
+    assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
+}
+
+#[test]
+fn failed_stream_keeps_previous_version() {
+    use vm::CHUNK_SIZE;
+    let (_g, db) = tmpdb("stream-fail");
+    let c = open(&db);
+    let old = vec![3u8; 2 * CHUNK_SIZE + 9];
+    vm::vm_add_bytes(&c, "/f", &old, 0o644, 1).unwrap();
+    // reader that fails after one chunk
+    struct Bad { left: usize }
+    impl std::io::Read for Bad {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.left == 0 { return Err(std::io::Error::new(std::io::ErrorKind::Other, "disk gone")); }
+            let k = out.len().min(self.left);
+            for b in &mut out[..k] { *b = 4; }
+            self.left -= k;
+            Ok(k)
+        }
+    }
+    let r = vm::fs_put_file_stream(&c, "/f", 0o644, 2, &mut Bad { left: CHUNK_SIZE + 5 });
+    assert!(r.is_err());
+    assert_eq!(vm::vm_cat(&c, "/f").unwrap(), old, "previous content must survive a failed write");
+    assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
+}
+
+#[test]
+fn sync_is_incremental_and_reports_exact_counts() {
+    let (_g, db) = tmpdb("sync-inc");
+    let host = _g.path().join("root");
+    std::fs::create_dir_all(host.join("d/sub")).unwrap();
+    std::fs::write(host.join("d/a"), b"aaa").unwrap();
+    std::fs::write(host.join("d/sub/b"), b"bbbb").unwrap();
+    std::os::unix::fs::symlink("a", host.join("d/l")).unwrap();
+    let c = open(&db);
+    let r1 = vm::vm_sync_report(&c, &host).unwrap();
+    assert_eq!((r1.created, r1.updated, r1.unchanged, r1.deleted, r1.failed), (5, 0, 0, 0, 0));
+    // nothing changed: every entry is unchanged, nothing rewritten
+    let r2 = vm::vm_sync_report(&c, &host).unwrap();
+    assert_eq!((r2.created, r2.updated, r2.unchanged, r2.deleted, r2.failed), (0, 0, 5, 0, 0));
+    // one edit, one delete
+    std::fs::write(host.join("d/a"), b"aaa-changed-longer").unwrap();
+    std::fs::remove_file(host.join("d/sub/b")).unwrap();
+    let r3 = vm::vm_sync_report(&c, &host).unwrap();
+    assert_eq!((r3.created, r3.updated, r3.unchanged, r3.deleted, r3.failed), (0, 1, 3, 1, 0));
+    assert_eq!(vm::vm_cat(&c, "/d/a").unwrap(), b"aaa-changed-longer");
+    assert!(vm::vm_cat(&c, "/d/sub/b").is_err());
+    assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
+}

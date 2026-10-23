@@ -720,6 +720,52 @@ fn chunks_replace(conn: &Connection, vm_p: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Streaming file write: reads `src` in CHUNK_SIZE pieces, storing each as a chunk while
+/// hashing the whole file. Never holds more than one chunk in memory. Runs inside a
+/// SAVEPOINT so a read or write error leaves the previous version of the file intact.
+/// Returns the file size written.
+pub fn fs_put_file_stream<R: Read>(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, src: &mut R) -> Result<u64> {
+    use sha2::{Digest, Sha256};
+    conn.execute_batch("SAVEPOINT put_stream;")?;
+    let res: Result<u64> = (|| {
+        conn.prepare_cached("DELETE FROM vm_file_chunks WHERE path=?1")?.execute(params![vm_p])?;
+        let mut whole = Sha256::new();
+        let mut total: u64 = 0;
+        let mut idx: i64 = 0;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            // fill one full chunk (short reads are normal for files)
+            let mut filled = 0usize;
+            while filled < CHUNK_SIZE {
+                let n = src.read(&mut buf[filled..])?;
+                if n == 0 { break; }
+                filled += n;
+            }
+            if filled == 0 { break; }
+            let piece = &buf[..filled];
+            whole.update(piece);
+            let key = blob_key(piece);
+            blob_ensure(conn, &key, piece)?;
+            conn.prepare_cached("INSERT INTO vm_file_chunks(path, idx, hash) VALUES (?1,?2,?3)")?
+                .execute(params![vm_p, idx, key.as_slice()])?;
+            idx += 1;
+            total += filled as u64;
+            if filled < CHUNK_SIZE { break; }
+        }
+        let file_hash: [u8; 32] = whole.finalize().into();
+        conn.prepare_cached(
+            "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,NULL,0,NULL)
+             ON CONFLICT(path) DO UPDATE SET kind='file', mode=excluded.mode, mtime=excluded.mtime, size=excluded.size,
+                hash=excluded.hash, content=NULL, compressed=0, link_target=NULL")?
+            .execute(params![vm_p, mode, mtime, total as i64, file_hash.as_slice()])?;
+        Ok(total)
+    })();
+    match res {
+        Ok(n) => { conn.execute_batch("RELEASE put_stream;")?; Ok(n) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK TO put_stream; RELEASE put_stream;"); Err(e) }
+    }
+}
+
 /// Upsert a regular-file row. vm_fs.hash is the whole-file sha256 (sync/stat only).
 fn fs_put_file(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, data: &[u8]) -> Result<()> {
     chunks_replace(conn, vm_p, data)?;
@@ -1168,122 +1214,127 @@ pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
     for d in ["dev","proc","sys","tmp"] { let _ = std::fs::create_dir_all(dest.join(d)); }
     Ok(written.load(std::sync::atomic::Ordering::Relaxed))
 }
+/// Summary of one sync pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SyncReport { pub created: usize, pub updated: usize, pub unchanged: usize, pub deleted: usize, pub failed: usize }
+
+fn is_reserved_vm_path(p: &str) -> bool {
+    p == "/" || p == "/dev" || p.starts_with("/dev/") || p == "/proc" || p.starts_with("/proc/") || p == "/sys" || p.starts_with("/sys/")
+}
+
+/// Mirror a host directory tree into the VM. Streaming: file contents are read one chunk at a
+/// time, never the whole tree. Metadata for the DB is read as small fields only.
+///
+/// A regular file is rewritten only when its size, mtime, or type changed (1-second mtime
+/// granularity: a same-size edit within the same second is not detected; use vm-verify and
+/// a fresh sync after such edits). A failure on one entry is counted in `failed` and does not
+/// stop the rest of the sync.
 pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,usize,usize)> {
+    let r = vm_sync_report(conn, host_root)?;
+    Ok((r.created, r.updated, r.deleted))
+}
+
+pub fn vm_sync_report(conn: &Connection, host_root: &Path) -> Result<SyncReport> {
     use std::collections::{HashMap, HashSet};
-    let mut host_files: HashMap<String, (String, Vec<u8>, i64)> = HashMap::new();
-    let mut host_all_paths: HashSet<String> = HashSet::new();
+    #[cfg(unix)] use std::os::unix::fs::PermissionsExt;
+
+    // 1) DB side: metadata only (no content, no hash).
+    struct Row { kind: String, mode: i64, mtime: i64, size: i64, link: Option<String> }
+    let mut db: HashMap<String, Row> = HashMap::new();
+    {
+        let mut st = conn.prepare("SELECT path, kind, mode, mtime, size, link_target FROM vm_fs")?;
+        for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, Row { kind: r.get(1)?, mode: r.get(2)?, mtime: r.get(3)?, size: r.get(4)?, link: r.get(5)? })))? {
+            let (p, row) = r?;
+            db.insert(p, row);
+        }
+    }
+
+    // 2) Host side: walk, keep only metadata. Entries are processed as we go.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rep = SyncReport::default();
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let now = now_secs();
     for entry in walkdir::WalkDir::new(host_root).follow_links(false).min_depth(1) {
-        let e = match entry { Ok(v)=>v, Err(_)=> continue };
+        let e = match entry { Ok(v) => v, Err(_) => { rep.failed += 1; continue; } };
         let rel = e.path().strip_prefix(host_root).unwrap_or(e.path()).to_string_lossy().to_string();
         let vm_p = normalize_vm_path(&format!("/{}", rel.trim_start_matches('/')));
-        if vm_p == "/" { continue; }
-        if vm_p == "/dev" || vm_p.starts_with("/dev/") || vm_p == "/proc" || vm_p.starts_with("/proc/") || vm_p == "/sys" || vm_p.starts_with("/sys/") { continue; }
-        let md = match std::fs::symlink_metadata(e.path()) { Ok(m)=>m, Err(_)=> continue };
-        host_all_paths.insert(vm_p.clone());
-        #[cfg(unix)] let mode = { use std::os::unix::fs::PermissionsExt; md.permissions().mode() as i64 };
-        #[cfg(not(unix))] let mode = 420;
-        if md.file_type().is_symlink() {
-            if let Ok(t)=std::fs::read_link(e.path()) {
-                host_files.insert(vm_p, ("symlink".to_string(), t.to_string_lossy().as_bytes().to_vec(), mode));
-            }
-        } else if md.is_dir() {
-            host_files.insert(vm_p, ("dir".to_string(), Vec::new(), mode));
-        } else if md.is_file() {
-            if let Ok(data)=std::fs::read(e.path()) {
-                host_files.insert(vm_p, ("file".to_string(), data, mode));
-            }
-        }
-    }
-    let mut db_map: HashMap<String, (String, Option<String>, Option<String>, i64, i64)> = HashMap::new();
-    {
-        // hash+size for quick compare without fetching blob
-        let mut st = conn.prepare("SELECT path, kind, NULLIF(lower(hex(hash)),''), link_target, mode, size FROM vm_fs")?;
-        for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<String>>(2)?, r.get::<_,Option<String>>(3)?, r.get::<_,i64>(4)?, r.get::<_,i64>(5)?)))? {
-            let (p,kind,hash,link,mode,size)=r?;
-            db_map.insert(p, (kind, hash, link, mode, size));
-        }
-    }
-    let mut created=0usize; let mut updated=0usize; let mut deleted=0usize;
-    conn.execute_batch("BEGIN IMMEDIATE;")?;
-    for (vm_p, (kind, data, mode)) in host_files.iter() {
-        if vm_p == "/" { continue; }
-        match db_map.get(vm_p) {
-            None => {
-                if kind == "symlink" {
-                    let target = String::from_utf8_lossy(data).to_string();
-                    let _ = fs_put_node(conn, vm_p, "symlink", *mode, now_secs(), Some(&target));
-                    created+=1;
-                } else if kind == "dir" {
-                    let _ = fs_put_node(conn, vm_p, "dir", *mode, now_secs(), None);
-                    created+=1;
-                } else {
-                    // use vm_add_bytes dedup path without extra blob fetch
-                    let _ = vm_add_bytes(conn, vm_p, data, *mode, now_secs());
-                    created+=1;
+        if is_reserved_vm_path(&vm_p) { continue; }
+        let md = match std::fs::symlink_metadata(e.path()) { Ok(m) => m, Err(_) => { rep.failed += 1; continue; } };
+        #[cfg(unix)] let mode = md.permissions().mode() as i64;
+        #[cfg(not(unix))] let mode = 420i64;
+        let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(now);
+        seen.insert(vm_p.clone());
+        let ft = md.file_type();
+        let host_kind = if ft.is_symlink() { "symlink" } else if md.is_dir() { "dir" } else if md.is_file() { "file" } else { continue };
+        let prev = db.get(&vm_p);
+        let res: Result<Option<bool>> = (|| {
+            // Some(true)=updated, Some(false)=created, None=unchanged
+            match (prev, host_kind) {
+                (None, "dir") => { fs_put_node(conn, &vm_p, "dir", mode, now, None)?; Ok(Some(false)) }
+                (None, "symlink") => {
+                    let t = std::fs::read_link(e.path())?;
+                    fs_put_node(conn, &vm_p, "symlink", mode, now, Some(&t.to_string_lossy()))?;
+                    Ok(Some(false))
                 }
-            },
-            Some((db_kind, db_hash, db_link, db_mode, db_size)) => {
-                if db_kind != kind {
-                    if kind == "symlink" {
-                        let target = String::from_utf8_lossy(data).to_string();
-                        let _ = fs_put_node(conn, vm_p, "symlink", *mode, now_secs(), Some(&target));
-                    } else if kind == "dir" {
-                        let _ = fs_put_node(conn, vm_p, "dir", *mode, now_secs(), None);
-                    } else {
-                        let hash = fx_hash_u64(data);
-                        let need = db_hash.as_deref()!=Some(&hash) || db_mode!=mode || db_size!=&(data.len() as i64);
-                        if need {
-                                let _ = fs_put_file(conn, vm_p, *mode, now_secs(), data);
-                            updated+=1;
-                        }
-                    }
-                    if db_kind != kind { updated+=1; }
-                } else if kind == "file" {
-                    let hash = fx_hash_u64(data);
-                    let need = db_hash.as_deref()!=Some(&hash) || db_mode!=mode || db_size!=&(data.len() as i64);
-                    if need {
-                        // avoid double decompress: just update via vm_add_bytes
-                        let _ = vm_add_bytes(conn, vm_p, data, *mode, now_secs());
-                        updated+=1;
-                    }
-                } else if kind == "symlink" {
-                    let target = String::from_utf8_lossy(data).to_string();
-                    let db_target = db_link.as_deref().unwrap_or("");
-                    if db_target != target || db_mode != mode {
-                        let _ = conn.prepare_cached("UPDATE vm_fs SET mode=?2, link_target=?3, mtime=?4 WHERE path=?1")?.execute( params![vm_p, *mode, target, now_secs()]);
-                        updated+=1;
-                    }
-                } else if kind == "dir" {
-                    if db_mode != mode {
-                        let _ = conn.prepare_cached("UPDATE vm_fs SET mode=?2, mtime=?3 WHERE path=?1")?.execute( params![vm_p, *mode, now_secs()]);
-                        updated+=1;
+                (None, _) => {
+                    let mut f = std::fs::File::open(e.path())?;
+                    fs_put_file_stream(conn, &vm_p, mode, mtime, &mut f)?;
+                    Ok(Some(false))
+                }
+                (Some(p), "dir") if p.kind == "dir" => {
+                    if p.mode == mode { Ok(None) } else {
+                        conn.prepare_cached("UPDATE vm_fs SET mode=?2, mtime=?3 WHERE path=?1")?.execute(params![vm_p, mode, now])?;
+                        Ok(Some(true))
                     }
                 }
+                (Some(p), "symlink") if p.kind == "symlink" => {
+                    let t = std::fs::read_link(e.path())?.to_string_lossy().to_string();
+                    if p.link.as_deref() == Some(t.as_str()) && p.mode == mode { Ok(None) } else {
+                        conn.prepare_cached("UPDATE vm_fs SET mode=?2, link_target=?3, mtime=?4 WHERE path=?1")?.execute(params![vm_p, mode, t, now])?;
+                        Ok(Some(true))
+                    }
+                }
+                (Some(p), "file") if p.kind == "file" => {
+                    if p.size == md.len() as i64 && p.mtime == mtime && p.mode == mode { Ok(None) } else {
+                        let mut f = std::fs::File::open(e.path())?;
+                        fs_put_file_stream(conn, &vm_p, mode, mtime, &mut f)?;
+                        Ok(Some(true))
+                    }
+                }
+                // type changed (or unknown): replace the entry
+                (Some(_), _) => {
+                    match host_kind {
+                        "dir" => fs_put_node(conn, &vm_p, "dir", mode, now, None)?,
+                        "symlink" => { let t = std::fs::read_link(e.path())?; fs_put_node(conn, &vm_p, "symlink", mode, now, Some(&t.to_string_lossy()))? }
+                        _ => { let mut f = std::fs::File::open(e.path())?; fs_put_file_stream(conn, &vm_p, mode, mtime, &mut f)?; }
+                    }
+                    Ok(Some(true))
+                }
             }
+        })();
+        match res {
+            Ok(Some(false)) => rep.created += 1,
+            Ok(Some(true)) => rep.updated += 1,
+            Ok(None) => rep.unchanged += 1,
+            Err(err) => { eprintln!("sync {}: {}", vm_p, err); rep.failed += 1; }
         }
     }
-    let mut to_delete: Vec<String> = Vec::new();
-    for (db_path, _) in db_map.iter() {
-        if db_path == "/" { continue; }
-        if db_path == "/dev" || db_path.starts_with("/dev/") || db_path == "/proc" || db_path.starts_with("/proc/") || db_path == "/sys" || db_path.starts_with("/sys/") { continue; }
-        if !host_all_paths.contains(db_path) {
-            to_delete.push(db_path.clone());
-        }
-    }
-    for p in to_delete {
-        // DELETE fires vm_fs_hash_del, which releases the blob reference.
-        // prefix match via substr (LIKE treats _ and % as wildcards)
-        let _ = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1 OR substr(path,1,?2)=?3")?.execute( params![p.clone(), p.len() as i64 + 1, format!("{}/", p)]);
-        deleted+=1;
+
+    // 3) Deletions: DB paths absent from the host (prefix match is exact; DELETE fires triggers).
+    let mut gone: Vec<&String> = db.keys().filter(|p| !is_reserved_vm_path(p) && !seen.contains(*p)).collect();
+    gone.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    for p in gone {
+        let n = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1")?.execute(params![p])?;
+        if n > 0 { rep.deleted += 1; }
     }
     conn.execute_batch("COMMIT;")?;
-    let _ = conn.prepare_cached("INSERT INTO vm_log(op, detail) VALUES ('sync', ?1)")?.execute( params![format!("host:{} created:{} updated:{} deleted:{}", host_root.display(), created, updated, deleted)]);
-    // checkpoint throttled: only if wal size > 4M
+    conn.prepare_cached("INSERT INTO vm_log(op, detail) VALUES ('sync', ?1)")?
+        .execute(params![format!("host:{} created:{} updated:{} unchanged:{} deleted:{} failed:{}", host_root.display(), rep.created, rep.updated, rep.unchanged, rep.deleted, rep.failed)])?;
     let wal_size: i64 = conn.path().and_then(|pp| std::fs::metadata(format!("{}-wal", pp)).ok()).map(|m| m.len() as i64).unwrap_or(0);
-    if wal_size > 4*1024*1024 {
+    if wal_size > 4 * 1024 * 1024 {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
     }
-    Ok((created, updated, deleted))
+    Ok(rep)
 }
 /// Re-split legacy single-chunk files larger than CHUNK_SIZE into CHUNK_SIZE chunks.
 /// Each file is rewritten in its own transaction and verified by re-reading the new chunk
