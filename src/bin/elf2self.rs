@@ -70,7 +70,7 @@ fn bundle_closure(input: &str, output: &str, info: &selfdb::elf::ElfInfo) -> Res
         }
     }
     conn.execute_batch(r#"
-    CREATE TABLE bundle_objects(id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, soname TEXT, kind TEXT NOT NULL, is_root INTEGER NOT NULL, size INTEGER NOT NULL, content BLOB NOT NULL);
+    CREATE TABLE bundle_objects(id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, soname TEXT, kind TEXT NOT NULL, is_root INTEGER NOT NULL, size INTEGER NOT NULL, content BLOB NOT NULL, hash TEXT);
     CREATE TABLE bundle_needs(object_id INTEGER NOT NULL REFERENCES bundle_objects(id), ord INTEGER NOT NULL, soname TEXT NOT NULL, resolved_path TEXT REFERENCES bundle_objects(path));
     CREATE INDEX IF NOT EXISTS idx_bundle_needs_soname ON bundle_needs(soname);
     "#)?;
@@ -79,7 +79,13 @@ fn bundle_closure(input: &str, output: &str, info: &selfdb::elf::ElfInfo) -> Res
         let is_root = if idx==0 {1} else {0};
         let data = std::fs::read(rp)?;
         let id = (idx+1) as i64;
-        conn.execute("INSERT INTO bundle_objects VALUES (?1,?2,?3,?4,?5,?6,?7)", params![id, rp.to_string_lossy().to_string(), soname, kind, is_root, data.len() as i64, data])?;
+        // hash = sha256 of content: lets the launcher check its cache without reading the bytes
+        let hash: String = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&data).iter().map(|b| format!("{:02x}", b)).collect()
+        };
+        conn.execute("INSERT INTO bundle_objects(id, path, soname, kind, is_root, size, content, hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, rp.to_string_lossy().to_string(), soname, kind, is_root, data.len() as i64, data, hash])?;
         path_to_id.insert(rp.clone(), id);
     }
     let mut needs = 0;

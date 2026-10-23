@@ -1,7 +1,6 @@
 use rusqlite::{Connection, OpenFlags};
 use rusqlite::types::ValueRef;
 use std::ffi::{CString, CStr};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 const MFD_CLOEXEC: u32 = 0x0001;
@@ -70,47 +69,79 @@ fn dump_to_fd(db: &Connection, fd: i32) -> anyhow::Result<()> {
     unsafe { libc::munmap(ptr, size); }
     Ok(())
 }
+/// Materialize the bundle's private libraries for one run.
+///
+/// Library bytes live in a shared, content-addressed cache (`cache_dir()/bundle/<sha256>`), so
+/// a repeat launch writes nothing. The per-run directory holds only links to those cache files
+/// plus soname aliases, and is the only thing removed afterwards.
 fn extract_bundle(db: &Connection) -> Option<PathBuf> {
-    let mut st = match db.prepare("SELECT soname, path, content FROM bundle_objects WHERE kind='lib' AND path NOT LIKE '/usr/lib%' AND path NOT LIKE '/lib/%'") { Ok(s)=>s, Err(_)=>return None };
-    let rows: Vec<(Option<String>, String, Vec<u8>)> = {
-        let mut out=Vec::new();
-        let mut q=st.query([]).unwrap();
-        while let Some(r)=q.next().unwrap() {
-            let sn: Option<String>=r.get(0).unwrap_or(None);
-            let p: String=r.get(1).unwrap_or_else(|_| "lib.so".to_string());
-            let b: Option<Vec<u8>>=r.get(2).unwrap_or(None);
-            if let Some(blob)=b { if !blob.is_empty() { out.push((sn,p,blob)); } }
-            else { out.push((sn,p,Vec::new())); }
-        }
-        out
+    use sha2::{Digest, Sha256};
+    let cache = selfdb::vm::cache_dir().join("bundle");
+    let _ = std::fs::create_dir_all(&cache);
+    // Bundles from elf2self >= this change carry a sha256 per object: list metadata first, so a
+    // cache hit reads no library bytes at all. Older bundles lack the column and read content.
+    let has_hash: bool = db.query_row("SELECT count(*) FROM pragma_table_info('bundle_objects') WHERE name='hash'", [], |r| r.get::<_,i64>(0)).unwrap_or(0) > 0;
+    let sql = if has_hash {
+        "SELECT soname, path, hash FROM bundle_objects WHERE kind='lib' AND path NOT LIKE '/usr/lib%' AND path NOT LIKE '/lib/%'"
+    } else {
+        "SELECT soname, path, NULL FROM bundle_objects WHERE kind='lib' AND path NOT LIKE '/usr/lib%' AND path NOT LIKE '/lib/%'"
     };
-    if rows.is_empty(){ return None; }
-    let mut dir_created: Option<PathBuf>=None;
-    let mut get_dir = || -> PathBuf {
-        if let Some(ref d)=dir_created { return d.clone(); }
-        let d = selfdb::vm::make_tmp_dir("self-bundle-").unwrap_or_else(|e| { eprintln!("self-exec: {e}"); std::process::exit(126) });
-        dir_created=Some(d.clone()); d
+    let list: Vec<(Option<String>, String, Option<String>)> = {
+        let mut st = match db.prepare(sql) { Ok(s)=>s, Err(_)=>return None };
+        let rows = st.query_map([], |r| Ok((r.get::<_,Option<String>>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<String>>(2)?)));
+        match rows { Ok(it) => it.filter_map(|x| x.ok()).collect(), Err(_) => return None }
     };
-    let mut written=0usize;
-    for (sn_opt, path, blob) in rows {
-        let use_name: String = sn_opt.as_ref().filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| Path::new(&path).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or("lib.so".to_string()));
+    if list.is_empty(){ return None; }
+    let mut dir_created: Option<PathBuf> = None;
+    let mut written = 0usize;
+    for (sn_opt, path, hash_opt) in list {
+        let use_name: String = sn_opt.as_ref().filter(|s| !s.is_empty()).cloned()
+            .unwrap_or_else(|| Path::new(&path).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or("lib.so".to_string()));
         if use_name.is_empty(){ continue; }
-        let dir=get_dir();
-        let out=dir.join(&use_name);
-        if out.exists(){ continue; }
-        if let Ok(mut f)=std::fs::File::create(&out) {
-            use std::io::Write;
-            if !blob.is_empty(){ let _=f.write_all(&blob); }
-            let _=f.sync_all();
-            unsafe{ libc::chmod(CString::new(out.as_os_str().as_bytes()).unwrap().as_ptr(), 0o755); }
-            written+=1;
-            let base=Path::new(&path).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
-            if base!=use_name && !base.is_empty(){ let alt=dir.join(&base); if !alt.exists(){ let _=std::os::unix::fs::symlink(&use_name, &alt); } }
+        // cache entry name: stored hash, or (old bundles) the hash of the content read now
+        let key: String = match hash_opt {
+            Some(h) if !h.is_empty() => h,
+            _ => {
+                let blob: Vec<u8> = db.query_row("SELECT content FROM bundle_objects WHERE path=?1", [&path], |r| r.get(0)).unwrap_or_default();
+                Sha256::digest(&blob).iter().map(|b| format!("{:02x}", b)).collect()
+            }
+        };
+        let entry = cache.join(&key);
+        // A present entry is trusted only if its size matches the stored size (cheap, no read of
+        // the bytes). Mismatch means a truncated or foreign file: rebuild it.
+        let want_size: Option<i64> = db.query_row("SELECT size FROM bundle_objects WHERE path=?1", [&path], |r| r.get(0)).ok();
+        let have_ok = match (std::fs::metadata(&entry), want_size) {
+            (Ok(m), Some(sz)) => m.len() as i64 == sz,
+            (Ok(_), None) => true,   // old bundles: no stored size to compare; content hash names the file
+            (Err(_), _) => false,
+        };
+        if !have_ok {
+            // only now is the content needed: fetch it, write atomically (tmp + rename)
+            let blob: Vec<u8> = match db.query_row("SELECT content FROM bundle_objects WHERE path=?1", [&path], |r| r.get(0)) { Ok(b)=>b, Err(_)=>continue };
+            let tmp = cache.join(format!(".{}.{}", key, std::process::id()));
+            let ok = std::fs::write(&tmp, &blob).and_then(|_| std::fs::rename(&tmp, &entry)).is_ok();
+            let _ = std::fs::remove_file(&tmp);
+            if !ok { continue; }
+        }
+        let dir = match dir_created.clone() {
+            Some(d) => d,
+            None => {
+                let d = selfdb::vm::make_tmp_dir("self-bundle-").unwrap_or_else(|e| { eprintln!("self-exec: {e}"); std::process::exit(126) });
+                dir_created = Some(d.clone());
+                d
+            }
+        };
+        let out = dir.join(&use_name);
+        if std::fs::symlink_metadata(&out).is_ok() { continue; }
+        if std::os::unix::fs::symlink(&entry, &out).is_ok() { written += 1; }
+        let base = Path::new(&path).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+        if base != use_name && !base.is_empty() {
+            let alt = dir.join(&base);
+            if std::fs::symlink_metadata(&alt).is_err() { let _ = std::os::unix::fs::symlink(&use_name, &alt); }
         }
     }
-    if dir_created.is_none(){ return None; }
-    let d=dir_created.unwrap();
-    if written==0{ let _=std::fs::remove_dir(&d); return None; }
+    let d = dir_created?;
+    if written == 0 { let _ = std::fs::remove_dir_all(&d); return None; }
     Some(d)
 }
 fn build_argv(guest: &[String]) -> (Vec<CString>, Vec<*const libc::c_char>) {
