@@ -74,7 +74,7 @@ impl Overlay {
         let p = normalize_vm_path(vm_path);
         self.conn.execute_batch("SAVEPOINT ov_write;")?;
         let res: Result<()> = (|| {
-            self.conn.execute("DELETE FROM main.vm_whiteouts WHERE path=?1", params![p])?;
+            self.clear_whiteouts_for(&p)?;
             crate::vm::vm_add_bytes(&self.conn, &p, data, mode, mtime)?;
             Ok(())
         })();
@@ -84,13 +84,95 @@ impl Overlay {
         }
     }
 
+    /// Create a directory in Delta (clears whiteouts on it and its ancestors).
+    pub fn mkdir(&self, vm_path: &str) -> Result<()> {
+        let p = normalize_vm_path(vm_path);
+        self.conn.execute_batch("SAVEPOINT ov_mkdir;")?;
+        let res: Result<()> = (|| {
+            self.clear_whiteouts_for(&p)?;
+            crate::vm::vm_add_dir(&self.conn, &p, 0o755, crate::vm::now_secs())?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => { self.conn.execute_batch("RELEASE ov_mkdir;")?; Ok(()) }
+            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK TO ov_mkdir; RELEASE ov_mkdir;"); Err(e) }
+        }
+    }
+
+    /// Create a symlink in Delta. The target is stored verbatim, as in the VM.
+    pub fn symlink(&self, vm_path: &str, target: &str) -> Result<()> {
+        let p = normalize_vm_path(vm_path);
+        self.conn.execute_batch("SAVEPOINT ov_symlink;")?;
+        let res: Result<()> = (|| {
+            self.clear_whiteouts_for(&p)?;
+            crate::vm::vm_add_symlink(&self.conn, &p, target)?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => { self.conn.execute_batch("RELEASE ov_symlink;")?; Ok(()) }
+            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK TO ov_symlink; RELEASE ov_symlink;"); Err(e) }
+        }
+    }
+
+    /// Target of a symlink as seen through the overlay.
+    pub fn readlink(&self, vm_path: &str) -> Result<String> {
+        let p = normalize_vm_path(vm_path);
+        let (schema, layer) = match self.locate(&p)? {
+            Layer::Delta => ("main", ()),
+            Layer::Base => ("base", ()),
+            Layer::Missing => return Err(anyhow!("not found in overlay: {}", p)),
+        };
+        let _ = layer;
+        let target: Option<String> = self.conn.query_row(
+            &format!("SELECT link_target FROM {}.vm_fs WHERE path=?1 AND kind='symlink'", schema),
+            params![p], |r| r.get(0)).optional()?.flatten();
+        target.ok_or_else(|| anyhow!("not a symlink: {}", p))
+    }
+
+    /// Names of the direct children of a directory, merged across layers. A Delta entry hides
+    /// the Base entry with the same path; whiteouts hide Base entries; Delta entries are added.
+    pub fn list(&self, vm_path: &str) -> Result<Vec<String>> {
+        let p = normalize_vm_path(vm_path);
+        if self.kind_in_overlay(&p)?.as_deref() != Some("dir") {
+            return Err(anyhow!("not a directory: {}", p));
+        }
+        let prefix = if p == "/" { "/".to_string() } else { format!("{}/", p) };
+        let like = format!("{}%", prefix);
+        let mut seen = std::collections::BTreeSet::new();
+        for schema in ["main", "base"] {
+            let sql = format!("SELECT path FROM {}.vm_fs WHERE path LIKE ?1", schema);
+            let mut st = self.conn.prepare(&sql)?;
+            for r in st.query_map(params![like], |r| r.get::<_, String>(0))? {
+                let child = r?;
+                let rest = &child[prefix.len()..];
+                if rest.is_empty() || rest.contains('/') { continue; }
+                let full = format!("{}{}", prefix, rest);
+                if self.locate(&full)? == Layer::Missing { continue; }
+                seen.insert(rest.to_string());
+            }
+        }
+        Ok(seen.into_iter().collect())
+    }
+
+    /// Kind of a path as seen through the overlay (Delta first), or None if missing.
+    fn kind_in_overlay(&self, p: &str) -> Result<Option<String>> {
+        match self.locate(p)? {
+            Layer::Delta => self.kind_in("main", p),
+            Layer::Base => self.kind_in("base", p),
+            Layer::Missing => Ok(None),
+        }
+    }
+
     /// Delete a path as seen through the overlay. Base is untouched: a whiteout hides it.
     pub fn remove(&self, vm_path: &str) -> Result<()> {
         let p = normalize_vm_path(vm_path);
         self.conn.execute_batch("SAVEPOINT ov_remove;")?;
         let res: Result<()> = (|| {
-            self.conn.execute("DELETE FROM main.vm_fs WHERE path=?1", params![p])?;
-            if self.in_layer("base", &p)? {
+            // drop the Delta subtree (rows and their chunk references go with them)
+            let prefix = format!("{}/%", if p == "/" { "" } else { &p });
+            self.conn.execute("DELETE FROM main.vm_fs WHERE path=?1 OR path LIKE ?2", params![p, prefix])?;
+            // hide whatever Base still has under this path, including descendants
+            if self.in_base_subtree(&p)? {
                 self.conn.execute("INSERT OR IGNORE INTO main.vm_whiteouts(path) VALUES (?1)", params![p])?;
             }
             Ok(())
@@ -101,8 +183,68 @@ impl Overlay {
         }
     }
 
+    /// True if `p` or any ancestor of it is whited out.
     fn whited_out(&self, p: &str) -> Result<bool> {
-        Ok(self.conn.query_row("SELECT 1 FROM main.vm_whiteouts WHERE path=?1", params![p], |_| Ok(())).optional()?.is_some())
+        let mut cur = p.to_string();
+        loop {
+            if self.conn.query_row("SELECT 1 FROM main.vm_whiteouts WHERE path=?1", params![cur], |_| Ok(())).optional()?.is_some() {
+                return Ok(true);
+            }
+            match cur.rfind('/') {
+                Some(0) | None => return Ok(false),
+                Some(i) => cur.truncate(i),
+            }
+        }
+    }
+
+    /// Make `p` visible for writing. If an ancestor of `p` is whited out, that whiteout is what
+    /// hides the Base subtree below it. Clearing it must not revive those Base paths, so each
+    /// Base path under the ancestor (other than `p` and its ancestors) gets its own whiteout first.
+    /// Then the ancestor whiteouts are cleared and `p` becomes visible.
+    fn clear_whiteouts_for(&self, p: &str) -> Result<()> {
+        // ancestors of p (excluding p itself), nearest first
+        let mut ancestors = Vec::new();
+        let mut cur = p.to_string();
+        while let Some(i) = cur.rfind('/') {
+            if i == 0 { break; }
+            cur.truncate(i);
+            ancestors.push(cur.clone());
+        }
+        // which ancestors are currently whited out (directly, not via a higher ancestor)?
+        let whited: Vec<String> = ancestors.iter()
+            .filter(|a| self.conn.query_row("SELECT 1 FROM main.vm_whiteouts WHERE path=?1", params![a], |_| Ok(())).optional().ok().flatten().is_some())
+            .cloned().collect();
+        if !whited.is_empty() {
+            // keep every Base path under a whited-out ancestor hidden, except p and its ancestors
+            let keep_prefix = format!("{}/", p);
+            for anc in &whited {
+                let prefix = format!("{}/%", anc);
+                let mut st = self.conn.prepare("SELECT path FROM base.vm_fs WHERE path LIKE ?1")?;
+                let base_paths: Vec<String> = st.query_map(params![prefix], |r| r.get(0))?.map(|x| x.unwrap()).collect();
+                for bp in base_paths {
+                    if bp == p || bp.starts_with(&keep_prefix) { continue; }
+                    if ancestors.iter().any(|a| a == &bp) { continue; }
+                    self.conn.execute("INSERT OR IGNORE INTO main.vm_whiteouts(path) VALUES (?1)", params![bp])?;
+                }
+            }
+        }
+        // now clear whiteouts on p and its ancestors so p is visible
+        self.conn.execute("DELETE FROM main.vm_whiteouts WHERE path=?1", params![p])?;
+        for a in &ancestors {
+            self.conn.execute("DELETE FROM main.vm_whiteouts WHERE path=?1", params![a])?;
+        }
+        Ok(())
+    }
+
+    /// Kind of a path in one layer, or None.
+    fn kind_in(&self, schema: &str, p: &str) -> Result<Option<String>> {
+        let sql = format!("SELECT kind FROM {}.vm_fs WHERE path=?1", schema);
+        Ok(self.conn.query_row(&sql, params![p], |r| r.get(0)).optional()?)
+    }
+
+    fn in_base_subtree(&self, p: &str) -> Result<bool> {
+        let prefix = format!("{}/%", if p == "/" { "" } else { p });
+        Ok(self.conn.query_row("SELECT 1 FROM base.vm_fs WHERE path=?1 OR path LIKE ?2 LIMIT 1", params![p, prefix], |_| Ok(())).optional()?.is_some())
     }
 
     fn in_layer(&self, schema: &str, p: &str) -> Result<bool> {

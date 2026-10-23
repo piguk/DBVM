@@ -1,6 +1,7 @@
 //! Read-only Base + Delta overlay via ATTACH. Base is never written. Delta holds additions,
 //! overwrites and whiteouts (deletions). A path is resolved in Delta first, then Base.
 use selfdb::vm;
+use selfdb::overlay::Layer;
 use std::path::{Path, PathBuf};
 
 fn setup(name: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -126,5 +127,91 @@ fn base_blocks_use_base_dictionaries() {
         let got = ov.read(&format!("/d/{}", i)).unwrap();
         assert_eq!(got, rec(1000 + i).as_bytes(), "base file {} decodes with its own dictionary", i);
     }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+fn setup_tree(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let d = std::env::temp_dir().join(format!("overlay-tree-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let base = d.join("base.db");
+    let b = vm::init_vm_db_with_opts(base.to_str().unwrap(), true, true).unwrap();
+    vm::vm_add_dir(&b, "/work", 0o755, 1).unwrap();
+    vm::vm_add_bytes(&b, "/work/src/a.rs", b"fn a(){}", 0o644, 1).unwrap();
+    vm::vm_add_bytes(&b, "/work/src/deep/b.rs", b"fn b(){}", 0o644, 1).unwrap();
+    vm::vm_add_symlink(&b, "/work/link", "src/a.rs").unwrap();
+    drop(b);
+    let delta = d.join("delta.db");
+    (d, base, delta)
+}
+
+#[test]
+fn directories_are_listed_from_the_merged_view() {
+    let (d, base, delta) = setup_tree("list");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    assert_eq!(ov.locate("/work/src").unwrap(), Layer::Base);
+    ov.write("/work/src/new.rs", b"fn n(){}", 0o644, 2).unwrap();
+    let names = ov.list("/work/src").unwrap();
+    assert_eq!(names, vec!["a.rs".to_string(), "deep".to_string(), "new.rs".to_string()]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn symlinks_are_read_as_targets_not_followed_by_read() {
+    let (d, base, delta) = setup_tree("link");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    assert_eq!(ov.readlink("/work/link").unwrap(), "src/a.rs");
+    assert!(ov.read("/work/link").is_err(), "read() refuses a symlink; callers use readlink()");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn removing_a_directory_hides_its_whole_base_subtree() {
+    let (d, base, delta) = setup_tree("rmdir");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    ov.remove("/work/src").unwrap();
+    assert_eq!(ov.locate("/work/src").unwrap(), Layer::Missing);
+    assert_eq!(ov.locate("/work/src/a.rs").unwrap(), Layer::Missing, "base child must be hidden");
+    assert_eq!(ov.locate("/work/src/deep/b.rs").unwrap(), Layer::Missing, "base grandchild must be hidden");
+    // a removed directory is "not found", not an empty directory
+    assert!(ov.list("/work/src").is_err(), "listing a removed directory is an error");
+    // the base is untouched
+    let c = rusqlite::Connection::open(&base).unwrap();
+    // the subtree is /work/src itself, a.rs, deep, deep/b.rs: four rows, all still present
+    let n: i64 = c.query_row("SELECT count(*) FROM vm_fs WHERE path = '/work/src' OR path LIKE '/work/src/%'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 4);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn writing_under_a_removed_directory_makes_it_visible_again() {
+    let (d, base, delta) = setup_tree("revive");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    ov.remove("/work/src").unwrap();
+    ov.write("/work/src/fresh.rs", b"x", 0o644, 2).unwrap();
+    assert_eq!(ov.locate("/work/src").unwrap(), Layer::Delta, "ancestor created in delta is visible");
+    assert_eq!(ov.locate("/work/src/a.rs").unwrap(), Layer::Missing, "old base children stay hidden");
+    assert_eq!(ov.list("/work/src").unwrap(), vec!["fresh.rs".to_string()]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn symlink_in_delta_overrides_base_and_removal_hides_it() {
+    let (d, base, delta) = setup_tree("dlink");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    ov.symlink("/work/link", "src/deep/b.rs").unwrap();
+    assert_eq!(ov.readlink("/work/link").unwrap(), "src/deep/b.rs");
+    ov.remove("/work/link").unwrap();
+    assert_eq!(ov.locate("/work/link").unwrap(), Layer::Missing);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn mkdir_then_list_shows_empty_directory() {
+    let (d, base, delta) = setup_tree("mkdir");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    ov.mkdir("/work/empty").unwrap();
+    assert_eq!(ov.locate("/work/empty").unwrap(), Layer::Delta);
+    assert!(ov.list("/work/empty").unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&d);
 }
