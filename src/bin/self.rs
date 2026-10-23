@@ -62,6 +62,10 @@ enum Cmd {
     VmRollback{ db: String, name: String },
     /// per-path diff between the live tree and a content snapshot
     VmSnapDiff{ db: String, name: String },
+    /// delete a content snapshot; blobs no other holder uses are released
+    VmSnapDelete{ db: String, name: String },
+    /// keep the newest N content snapshots, delete the rest (reports each removed name)
+    VmRetain{ db: String, keep: usize },
     VmMount{ db: String, mountpoint: String, #[arg(long)] allow_other: bool },
     VmMemTrace{ db: String, prog: String, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String> },
     VmDiskInit{ db: String, #[arg(long, default_value="20G")] size: String },
@@ -474,6 +478,17 @@ fn main() -> anyhow::Result<()> {
             let c=selfdb::vm::vm_open(&db)?;
             selfdb::vm::snapshot_restore(&c, &name)?;
             println!("rolled back to {}", name);
+        },
+        Cmd::VmSnapDelete{db, name} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            selfdb::vm::snapshot_delete(&c, &name)?;
+            println!("deleted snapshot {}", name);
+        },
+        Cmd::VmRetain{db, keep} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            let removed=selfdb::vm::snapshot_retain(&c, keep)?;
+            for n in &removed { println!("removed {}", n); }
+            println!("kept newest {}; removed {}", keep, removed.len());
         },
         Cmd::VmSnapDiff{db, name} => {
             let c=selfdb::vm::vm_open(&db)?;

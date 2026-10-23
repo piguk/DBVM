@@ -2094,6 +2094,38 @@ pub fn snapshot_restore(conn: &Connection, name: &str) -> Result<()> {
     }
 }
 
+/// Delete a content snapshot. Its chunk rows go with it (ON DELETE CASCADE), and the
+/// refcount triggers release each blob it referenced. A blob still held by the live tree or by
+/// another snapshot keeps its row.
+pub fn snapshot_delete(conn: &Connection, name: &str) -> Result<()> {
+    let id = snapshot_id(conn, name)?;
+    conn.execute_batch("SAVEPOINT snap_delete;")?;
+    let res: Result<()> = (|| {
+        conn.prepare_cached("DELETE FROM vm_snapshots WHERE id=?1")?.execute(params![id])?;
+        conn.prepare_cached("INSERT INTO vm_log(op, path, detail) VALUES ('snapshot_delete', ?1, 'content')")?
+            .execute(params![name])?;
+        Ok(())
+    })();
+    match res {
+        Ok(()) => { conn.execute_batch("RELEASE snap_delete;")?; Ok(()) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK TO snap_delete; RELEASE snap_delete;"); Err(e) }
+    }
+}
+
+/// Keep the newest `keep` snapshots (by creation order) and delete the rest. Returns the names
+/// removed, oldest first, so the caller can report exactly what was deleted.
+pub fn snapshot_retain(conn: &Connection, keep: usize) -> Result<Vec<String>> {
+    let names: Vec<String> = conn.prepare_cached("SELECT name FROM vm_snapshots ORDER BY id")?
+        .query_map([], |r| r.get(0))?.map(|x| x.unwrap()).collect();
+    let drop_n = names.len().saturating_sub(keep);
+    let mut removed = Vec::with_capacity(drop_n);
+    for name in names.into_iter().take(drop_n) {
+        snapshot_delete(conn, &name)?;
+        removed.push(name);
+    }
+    Ok(removed)
+}
+
 /// Compare the live tree with a snapshot. A path counts as modified when its kind, content hash,
 /// mode, or link target differs; deleted paths exist only in the snapshot.
 pub fn snapshot_diff_live(conn: &Connection, name: &str) -> Result<SnapDiff> {

@@ -119,3 +119,63 @@ fn unchanged_directories_are_not_reported_modified() {
     assert!(diff.modified.is_empty(), "directory /t must not be reported modified: {:?}", diff.modified);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn delete_releases_only_unshared_blobs() {
+    let (d, db) = tmpdb("del");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/shared", &vec![1u8; 70_000], 0o644, 1).unwrap();
+    vm::vm_add_bytes(&c, "/only_snap", &vec![2u8; 70_000], 0o644, 1).unwrap();
+    vm::snapshot_create(&c, "old", "").unwrap();
+    // drop /only_snap from the live tree; /shared stays live
+    c.execute("DELETE FROM vm_fs WHERE path='/only_snap'", []).unwrap();
+    let blobs_before: i64 = c.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap();
+    vm::snapshot_delete(&c, "old").unwrap();
+    let blobs_after: i64 = c.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap();
+    // /only_snap's two chunks (65536 + 4464 bytes) were held only by the snapshot: both are freed.
+    // /shared's chunks are still live and must keep their rows.
+    assert_eq!(blobs_before - blobs_after, 2, "exactly the two snapshot-only chunks are freed");
+    let live_chunks: i64 = c.query_row("SELECT count(*) FROM vm_blobs b WHERE EXISTS (SELECT 1 FROM vm_file_chunks f WHERE f.hash=b.hash)", [], |r| r.get(0)).unwrap();
+    assert_eq!(live_chunks, 2, "both live chunks keep their blob rows");
+    assert_eq!(vm::vm_cat(&c, "/shared").unwrap(), vec![1u8; 70_000], "live data must survive");
+    assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn delete_unknown_snapshot_is_an_error() {
+    let (d, db) = tmpdb("del-missing");
+    let c = open(&db);
+    assert!(vm::snapshot_delete(&c, "nope").is_err());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn retention_keeps_newest_and_reports_what_it_removed() {
+    let (d, db) = tmpdb("retain");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/f", b"x", 0o644, 1).unwrap();
+    for i in 0..5 { vm::snapshot_create(&c, &format!("s{}", i), "").unwrap(); }
+    let removed = vm::snapshot_retain(&c, 2).unwrap();
+    assert_eq!(removed, vec!["s0".to_string(), "s1".to_string(), "s2".to_string()]);
+    let left: Vec<String> = c.prepare("SELECT name FROM vm_snapshots ORDER BY id").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect();
+    assert_eq!(left, vec!["s3".to_string(), "s4".to_string()]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn snapshot_deletion_keeps_the_restore_source_of_other_snapshots() {
+    // A blob shared by two snapshots must survive deleting either one.
+    let (d, db) = tmpdb("two");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/f", &vec![5u8; 90_000], 0o644, 1).unwrap();
+    vm::snapshot_create(&c, "a", "").unwrap();
+    vm::snapshot_create(&c, "b", "").unwrap();
+    vm::snapshot_delete(&c, "a").unwrap();
+    c.execute("DELETE FROM vm_fs", []).unwrap();
+    c.execute("DELETE FROM vm_file_chunks", []).unwrap();
+    vm::snapshot_restore(&c, "b").unwrap();
+    assert_eq!(vm::vm_cat(&c, "/f").unwrap(), vec![5u8; 90_000]);
+    let _ = std::fs::remove_dir_all(&d);
+}
