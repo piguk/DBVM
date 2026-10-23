@@ -714,3 +714,48 @@ fn needed_sonames_resolve_inside_vm() {
         assert!(found, "DT_NEEDED {} does not resolve inside the VM", lib);
     }
 }
+
+fn index_names(c: &rusqlite::Connection) -> Vec<String> {
+    c.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_vm%' ORDER BY name").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+}
+
+#[test]
+fn bulk_indexes_restored_after_failed_import() {
+    let (_g, db) = tmpdb("s7-fail");
+    let c = open(&db);
+    let before = index_names(&c);
+    assert!(!before.is_empty());
+    let r: anyhow::Result<()> = vm::with_bulk_indexes_dropped(&c, || {
+        // indexes are gone during the load
+        assert!(index_names(&c).is_empty());
+        Err(anyhow::anyhow!("simulated failure mid-load"))
+    });
+    assert!(r.is_err());
+    assert_eq!(index_names(&c), before, "indexes must come back after an error");
+}
+
+#[test]
+fn bulk_indexes_restored_after_panic() {
+    let (_g, db) = tmpdb("s7-panic");
+    let c = open(&db);
+    let before = index_names(&c);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: anyhow::Result<()> = vm::with_bulk_indexes_dropped(&c, || panic!("boom mid-load"));
+    }));
+    assert!(res.is_err(), "panic must propagate");
+    assert_eq!(index_names(&c), before, "indexes must come back after a panic");
+}
+
+#[test]
+fn bulk_index_definitions_are_unchanged() {
+    let (_g, db) = tmpdb("s7-same");
+    let c = open(&db);
+    let defs = |c: &rusqlite::Connection| -> Vec<(String, String)> {
+        c.prepare("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND tbl_name IN ('vm_fs','vm_blobs','vm_file_chunks') ORDER BY name").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|x| x.unwrap()).collect()
+    };
+    let before = defs(&c);
+    vm::with_bulk_indexes_dropped(&c, || Ok(())).unwrap();
+    assert_eq!(defs(&c), before);
+}

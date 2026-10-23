@@ -1190,11 +1190,68 @@ pub fn vm_pack_host_dir(conn: &Connection, host_dir: &str, vm_prefix: &str) -> R
     conn.execute_batch("COMMIT;")?;
     Ok(n)
 }
+/// Secondary indexes on the tables a bulk load writes. Dropping them for the load and rebuilding
+/// afterwards is much cheaper than maintaining them row by row. Definitions are read from
+/// sqlite_master, so the rebuilt indexes are exactly the schema's, not a second copy.
+fn bulk_index_defs(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut st = conn.prepare("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND tbl_name IN ('vm_fs','vm_blobs','vm_file_chunks') ORDER BY name")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Run `load` with the bulk-path indexes dropped and restored afterwards.
+///
+/// Restore happens on every exit path. A restore failure is reported as an error, never
+/// swallowed: a database left without its indexes must not look like a successful import.
+/// Panics unwind through the guard, which still restores the indexes (best effort, since a
+/// panic cannot return an error; the panic itself is still propagated).
+pub fn with_bulk_indexes_dropped<T>(conn: &Connection, load: impl FnOnce() -> Result<T>) -> Result<T> {
+    let defs = bulk_index_defs(conn)?;
+    for (name, _) in &defs {
+        conn.execute(&format!("DROP INDEX IF EXISTS \"{}\"", name), [])?;
+    }
+    struct Restore<'a> { conn: &'a Connection, defs: &'a [(String, String)], armed: bool }
+    impl Restore<'_> {
+        fn run(&mut self) -> Result<()> {
+            self.armed = false;
+            for (_, sql) in self.defs {
+                self.conn.execute_batch(&format!("{};", sql))
+                    .map_err(|e| anyhow!("rebuild index failed (database left unindexed): {}", e))?;
+            }
+            Ok(())
+        }
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            // reached only on panic (run() disarms it): best-effort restore
+            if self.armed { for (_, sql) in self.defs { let _ = self.conn.execute_batch(&format!("{};", sql)); } }
+        }
+    }
+    let mut guard = Restore { conn, defs: &defs, armed: true };
+    let out = load();
+    let restored = guard.run();
+    match (out, restored) {
+        (Ok(v), Ok(())) => Ok(v),
+        // keep the import's own error; still surface that the database is unindexed
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(r)) => Err(anyhow!("{}; and {}", e, r)),
+        (Ok(_), Err(r)) => Err(r),
+    }
+}
+
 /// Parallel directory import. Compression (CPU) runs on rayon workers in bounded batches;
 /// SQLite writes stay serial in walk order inside short transactions. The dictionary is read
 /// once per run, so every file is encoded exactly as the serial path would encode it.
 /// Output matches `vm_pack_host_dir` (verified by a test); only wall time differs.
 pub fn vm_pack_host_dir_parallel(conn: &Connection, host_dir: &str, vm_prefix: &str) -> Result<usize> {
+    let n = vm_pack_host_dir_parallel_inner(conn, host_dir, vm_prefix)?;
+    // a bulk load changes the data distribution the planner relies on; refresh statistics
+    // (cheap: a few ms on a 30k-file tree). Failure here is harmless, so it is not an error.
+    let _ = conn.execute_batch("PRAGMA optimize;");
+    Ok(n)
+}
+
+fn vm_pack_host_dir_parallel_inner(conn: &Connection, host_dir: &str, vm_prefix: &str) -> Result<usize> {
     use rayon::prelude::*;
     const BATCH: usize = 256;
     // 1) plan: (host path, normalized vm path) in walk order, regular files only
@@ -1209,6 +1266,7 @@ pub fn vm_pack_host_dir_parallel(conn: &Connection, host_dir: &str, vm_prefix: &
     }
     // 2) one dictionary snapshot for the whole run
     let dict = latest_dict(conn);
+    with_bulk_indexes_dropped(conn, || {
     let mut n = 0usize;
     for chunk in plan.chunks(BATCH) {
         // parallel: read + encode each file's chunks (pure CPU, no DB)
@@ -1257,6 +1315,7 @@ pub fn vm_pack_host_dir_parallel(conn: &Connection, host_dir: &str, vm_prefix: &
         conn.execute_batch("COMMIT;")?;
     }
     Ok(n)
+    })
 }
 
 pub fn vm_import_tar_filtered(conn: &Connection, tar_path: &str, strip_prefix: &str, whitelist: Option<&[String]>, exclude: Option<&[String]>) -> Result<usize> {
