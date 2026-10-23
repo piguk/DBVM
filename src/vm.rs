@@ -1285,6 +1285,43 @@ pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,u
     }
     Ok((created, updated, deleted))
 }
+/// Re-split legacy single-chunk files larger than CHUNK_SIZE into CHUNK_SIZE chunks.
+/// Each file is rewritten in its own transaction and verified by re-reading the new chunk
+/// list before commit; any mismatch rolls that file back and is reported. Idempotent:
+/// files already chunked are skipped. Returns (rechunked, skipped_already_chunked, failed).
+pub fn vm_rechunk(conn: &Connection) -> Result<(usize, usize, usize)> {
+    let candidates: Vec<(String, i64)> = {
+        let mut st = conn.prepare("SELECT f.path, f.size FROM vm_fs f WHERE f.kind='file' AND f.size > ?1 AND f.hash IS NOT NULL")?;
+        let rows = st.query_map(params![CHUNK_SIZE as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let (mut done, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    for (path, _size) in candidates {
+        let nchunks: i64 = conn.prepare_cached("SELECT count(*) FROM vm_file_chunks WHERE path=?1")?.query_row(params![path], |r| r.get(0))?;
+        if nchunks != 1 { skipped += 1; continue; }
+        let before = file_bytes(conn, &path)?;
+        let want = blob_key(&before);
+        conn.execute_batch("SAVEPOINT rechunk_one;")?;
+        let res: Result<()> = (|| {
+            chunks_replace(conn, &path, &before)?;
+            let after = file_bytes(conn, &path)?;
+            if blob_key(&after) != want || after != before {
+                return Err(anyhow!("verify failed after rechunk"));
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => { conn.execute_batch("RELEASE rechunk_one;")?; done += 1; }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK TO rechunk_one; RELEASE rechunk_one;")?;
+                eprintln!("rechunk {}: {}", path, e);
+                failed += 1;
+            }
+        }
+    }
+    Ok((done, skipped, failed))
+}
+
 pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
     // recompress legacy gz blobs to zstd and move inline content to blobs
     let mut n=0usize;

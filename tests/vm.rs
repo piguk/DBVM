@@ -309,3 +309,40 @@ fn overwrite_and_delete_release_chunk_references() {
     let rows: i64 = c.query_row("SELECT count(*) FROM vm_file_chunks", [], |r| r.get(0)).unwrap();
     assert_eq!(rows, 0);
 }
+
+#[test]
+fn rechunk_splits_legacy_single_chunk_files_idempotently() {
+    use vm::CHUNK_SIZE;
+    let (_g, db) = tmpdb("rechunk");
+    let c = open(&db);
+    let big: Vec<u8> = (0..(3 * CHUNK_SIZE + 999)).map(|i| (i * 7 % 253) as u8).collect();
+    let small = vec![9u8; 100];
+    vm::vm_add_bytes(&c, "/big", &big, 0o644, 1).unwrap();
+    vm::vm_add_bytes(&c, "/small", &small, 0o644, 1).unwrap();
+    // simulate the legacy layout: /big is ONE chunk holding the whole file.
+    // Store that blob directly, then point /big at it (the release of the 3-chunk
+    // layout happens through the normal trigger path).
+    c.execute_batch("DELETE FROM vm_file_chunks WHERE path='/big';").unwrap();
+    let key = vm::blob_key(&big);
+    let z = zstd::bulk::compress(&big, 3).unwrap();
+    c.execute("INSERT INTO vm_blobs(hash,content,compressed,raw_size,refcnt) VALUES (?1,?2,2,?3,0)",
+        rusqlite::params![key.as_slice(), z, big.len() as i64]).unwrap();
+    c.execute("INSERT INTO vm_file_chunks(path,idx,hash) VALUES ('/big',0,?1)", rusqlite::params![key.as_slice()]).unwrap();
+    let exists: i64 = c.query_row("SELECT refcnt FROM vm_blobs WHERE hash=?1", rusqlite::params![key.as_slice()], |r| r.get(0)).unwrap();
+    assert_eq!(exists, 1, "legacy single blob referenced once");
+    let (done, skipped, failed) = vm::vm_rechunk(&c).unwrap();
+    assert_eq!((done, failed), (1, 0));
+    // /small is below CHUNK_SIZE and not a candidate; no candidate is already multi-chunk yet
+    assert_eq!(skipped, 0);
+    let chunks: i64 = c.query_row("SELECT count(*) FROM vm_file_chunks WHERE path='/big'", [], |r| r.get(0)).unwrap();
+    assert_eq!(chunks, 4);
+    assert_eq!(vm::vm_cat(&c, "/big").unwrap(), big);
+    assert_eq!(vm::read_range(&c, "/big", (CHUNK_SIZE - 3) as u64, 10).unwrap(), big[CHUNK_SIZE - 3..CHUNK_SIZE + 7].to_vec());
+    // whole-file blob released: no 3*CHUNK+999 sized orphan remains
+    let orphan: i64 = c.query_row("SELECT count(*) FROM vm_blobs WHERE raw_size=?1", rusqlite::params![big.len() as i64], |r| r.get(0)).unwrap();
+    assert_eq!(orphan, 0);
+    assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
+    // second run is a no-op: /big is now multi-chunk, so it is counted as skipped
+    let (done2, skipped2, failed2) = vm::vm_rechunk(&c).unwrap();
+    assert_eq!((done2, skipped2, failed2), (0, 1, 0));
+}
