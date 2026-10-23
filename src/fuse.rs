@@ -71,7 +71,7 @@ pub mod fuse_impl {
             self.ino_to_attr.insert(1, root_attr);
 
             let conn = &self.conn;
-            let mut stmt = conn.prepare("SELECT path, kind, mode, size, mtime, uid, gid, link_target, hash, compressed FROM vm_fs ORDER BY length(path), path")?;
+            let mut stmt = conn.prepare("SELECT path, kind, mode, size, mtime, uid, gid, link_target, compressed FROM vm_fs ORDER BY length(path), path")?;
             let rows = stmt.query_map([], |r| Ok((
                 r.get::<_,String>(0)?,
                 r.get::<_,String>(1)?,
@@ -81,11 +81,10 @@ pub mod fuse_impl {
                 r.get::<_,i64>(5)?,
                 r.get::<_,i64>(6)?,
                 r.get::<_,Option<String>>(7)?,
-                r.get::<_,Option<String>>(8)?,
-                r.get::<_,Option<i64>>(9)?,
+                r.get::<_,Option<i64>>(8)?,
             )))?;
             for row in rows {
-                let (path, kind, mode, size, mtime, uid, gid, link_target, _hash, _comp) = row?;
+                let (path, kind, mode, size, mtime, uid, gid, link_target, _comp) = row?;
                 let norm = normalize_vm_path(&path);
                 if norm == "/" { 
                     // update root mtime if needed but keep ino 1
@@ -144,20 +143,6 @@ pub mod fuse_impl {
             let parent = Path::new(path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or("/".to_string());
             let parent_norm = normalize_vm_path(&if parent.is_empty() { "/".to_string() } else { parent });
             self.path_to_ino.get(&parent_norm).copied()
-        }
-
-        fn fetch_file_content(&self, path: &str) -> Result<Vec<u8>> {
-            let conn = &self.conn;
-            // use vm_cat logic but inline to avoid borrowing issues
-            // resolve symlink? if path is symlink, vm_cat will resolve; for regular file we just fetch blob
-            // we should use vm_resolve then content
-            match crate::vm::vm_cat(&conn, path) {
-                Ok(d) => Ok(d),
-                Err(_) => {
-                    // maybe is dir or not found
-                    Ok(Vec::new())
-                }
-            }
         }
 
         fn flush_staged(&mut self, ino: u64) -> Result<()> {
@@ -281,17 +266,9 @@ pub mod fuse_impl {
             let kind = self.ino_to_kind.get(&ino).map(|s| s.as_str()).unwrap_or("");
             if kind == "dir" { reply.error(libc::EISDIR); return; }
             if kind == "symlink" { reply.error(libc::EINVAL); return; }
-            match self.fetch_file_content(&path) {
-                Ok(data) => {
-                    let start = offset as usize;
-                    if start >= data.len() {
-                        reply.data(&[]);
-                    } else {
-                        let end = std::cmp::min(data.len(), start + size as usize);
-                        reply.data(&data[start..end]);
-                    }
-                },
-                Err(_) => reply.error(libc::EIO),
+            match crate::vm::read_range(&self.conn, &path, offset as u64, size as usize) {
+                Ok(bytes) => reply.data(&bytes),
+                Err(e) => { eprintln!("vm-fuse read {}: {}", path, e); reply.error(libc::EIO) },
             }
         }
         fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
@@ -304,8 +281,11 @@ pub mod fuse_impl {
             if !self.staged.contains_key(&ino) {
                 // load existing
                 let p = self.ino_to_path.get(&ino).unwrap().clone();
-                let existing = self.fetch_file_content(&p).unwrap_or_default();
-                self.staged.insert(ino, existing);
+                // A failed read must NOT be treated as empty: that would overwrite real data.
+                match crate::vm::read_range(&self.conn, &p, 0, usize::MAX) {
+                    Ok(existing) => { self.staged.insert(ino, existing); }
+                    Err(e) => { eprintln!("vm-fuse load {}: {}", p, e); reply.error(libc::EIO); return; }
+                }
             }
             let buf = self.staged.get_mut(&ino).unwrap();
             let off = offset as usize;
@@ -634,8 +614,10 @@ pub mod fuse_impl {
                 };
                 if sz != cur_len {
                     if !self.staged.contains_key(&ino) {
-                        let existing = self.fetch_file_content(&path).unwrap_or_default();
-                        self.staged.insert(ino, existing);
+                        match crate::vm::read_range(&self.conn, &path, 0, usize::MAX) {
+                            Ok(existing) => { self.staged.insert(ino, existing); }
+                            Err(e) => { eprintln!("vm-fuse load {}: {}", path, e); reply.error(libc::EIO); return; }
+                        }
                     }
                     let need_flush;
                     {

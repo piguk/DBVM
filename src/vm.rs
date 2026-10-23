@@ -778,6 +778,20 @@ pub fn vm_ls(conn: &Connection, vm_path: &str) -> Result<Vec<(String,String,i64,
     }
     Ok(direct)
 }
+/// Chunk size for file content. Each chunk is an independent blob (compressed, deduplicated).
+pub const CHUNK_SIZE: usize = 64 * 1024;
+
+/// Unified file-range reader. Every content read goes through here so the storage layout
+/// (single blob today, chunks after schema v5) is decided in one place.
+/// Returns bytes in [off, off+len) clamped to the file size.
+pub fn read_range(conn: &Connection, vm_path: &str, off: u64, len: usize) -> Result<Vec<u8>> {
+    let (real, kind, content, _link, _mode) = vm_resolve(conn, vm_path)?;
+    if kind == "dir" { return Err(anyhow!("is a directory: {}", vm_path)); }
+    let data = content.ok_or_else(|| anyhow!("no content for {} (resolved {})", vm_path, real))?;
+    let start = (off as usize).min(data.len());
+    let end = start.saturating_add(len).min(data.len());
+    Ok(data[start..end].to_vec())
+}
 pub fn vm_cat(conn: &Connection, vm_path: &str) -> Result<Vec<u8>> {
     let (real, kind, content, _link, _mode) = vm_resolve(conn, vm_path)?;
     if kind == "dir" { return Err(anyhow!("is a directory: {}", vm_path)); }
