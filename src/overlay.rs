@@ -48,6 +48,17 @@ impl Overlay {
 
     pub fn conn(&self) -> &Connection { &self.conn }
 
+    /// Run `f` in an immediate write transaction. The write lock is taken up front, so a
+    /// competing writer makes this wait (up to the busy timeout) instead of failing mid-way with
+    /// "database is locked", which a deferred savepoint does when it must upgrade its lock.
+    fn write_tx<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        match f() {
+            Ok(v) => { self.conn.execute_batch("COMMIT;")?; Ok(v) }
+            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK;"); Err(e) }
+        }
+    }
+
     /// Where a path currently resolves.
     pub fn locate(&self, vm_path: &str) -> Result<Layer> {
         let p = normalize_vm_path(vm_path);
@@ -87,46 +98,31 @@ impl Overlay {
     /// Write a regular file. Always goes to Delta; clears any whiteout for the path.
     pub fn write(&self, vm_path: &str, data: &[u8], mode: i64, mtime: i64) -> Result<()> {
         let p = normalize_vm_path(vm_path);
-        self.conn.execute_batch("SAVEPOINT ov_write;")?;
-        let res: Result<()> = (|| {
+        self.write_tx(|| {
             self.clear_whiteouts_for(&p)?;
             crate::vm::vm_add_bytes(&self.conn, &p, data, mode, mtime)?;
             Ok(())
-        })();
-        match res {
-            Ok(()) => { self.conn.execute_batch("RELEASE ov_write;")?; Ok(()) }
-            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK TO ov_write; RELEASE ov_write;"); Err(e) }
-        }
+        })
     }
 
     /// Create a directory in Delta (clears whiteouts on it and its ancestors).
     pub fn mkdir(&self, vm_path: &str) -> Result<()> {
         let p = normalize_vm_path(vm_path);
-        self.conn.execute_batch("SAVEPOINT ov_mkdir;")?;
-        let res: Result<()> = (|| {
+        self.write_tx(|| {
             self.clear_whiteouts_for(&p)?;
             crate::vm::vm_add_dir(&self.conn, &p, 0o755, crate::vm::now_secs())?;
             Ok(())
-        })();
-        match res {
-            Ok(()) => { self.conn.execute_batch("RELEASE ov_mkdir;")?; Ok(()) }
-            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK TO ov_mkdir; RELEASE ov_mkdir;"); Err(e) }
-        }
+        })
     }
 
     /// Create a symlink in Delta. The target is stored verbatim, as in the VM.
     pub fn symlink(&self, vm_path: &str, target: &str) -> Result<()> {
         let p = normalize_vm_path(vm_path);
-        self.conn.execute_batch("SAVEPOINT ov_symlink;")?;
-        let res: Result<()> = (|| {
+        self.write_tx(|| {
             self.clear_whiteouts_for(&p)?;
             crate::vm::vm_add_symlink(&self.conn, &p, target)?;
             Ok(())
-        })();
-        match res {
-            Ok(()) => { self.conn.execute_batch("RELEASE ov_symlink;")?; Ok(()) }
-            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK TO ov_symlink; RELEASE ov_symlink;"); Err(e) }
-        }
+        })
     }
 
     /// Target of a symlink as seen through the overlay.
@@ -227,8 +223,7 @@ impl Overlay {
     /// Delete a path as seen through the overlay. Base is untouched: a whiteout hides it.
     pub fn remove(&self, vm_path: &str) -> Result<()> {
         let p = normalize_vm_path(vm_path);
-        self.conn.execute_batch("SAVEPOINT ov_remove;")?;
-        let res: Result<()> = (|| {
+        self.write_tx(|| {
             // drop the Delta subtree (rows and their chunk references go with them)
             let prefix = format!("{}/%", if p == "/" { "" } else { &p });
             self.conn.execute("DELETE FROM main.vm_fs WHERE path=?1 OR path LIKE ?2", params![p, prefix])?;
@@ -237,11 +232,7 @@ impl Overlay {
                 self.conn.execute("INSERT OR IGNORE INTO main.vm_whiteouts(path) VALUES (?1)", params![p])?;
             }
             Ok(())
-        })();
-        match res {
-            Ok(()) => { self.conn.execute_batch("RELEASE ov_remove;")?; Ok(()) }
-            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK TO ov_remove; RELEASE ov_remove;"); Err(e) }
-        }
+        })
     }
 
     /// True if `p` or any ancestor of it is whited out.
