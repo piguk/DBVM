@@ -4,10 +4,11 @@
 
 - `vm_fs(path UNIQUE, kind, mode, uid, gid, mtime, size, link_target, hash, compressed, content)`：路径/权限/内容
 - `vm_blobs(hash PK, content, compressed, raw_size, refcnt)`：内容去重，`compressed 0=raw 2=zstd 3=zstd+dict`
-- `vm_dict`：zstd 字典（`vm-train-dict` 生成）
+- `vm_dicts`：zstd 字典，追加写入、不覆盖（`vm-train-dict` 每次新增一行）。压缩块的 `vm_blobs.dict_id` 记录其所用字典，因此重训后旧块仍可读
+- `vm_meta`：O(1) 计数器（文件数、逻辑字节、blob 字节），由触发器维护，`vm-verify --deep` 可逐项对账
 - `vm_mem`：内存镜像；`vm_snapshots` / `vm_log`：checkpoint 与变更日志
 - `vm_disk_blocks(block_id PK, content, compressed, raw_size)`：4K 稀疏分页块设备；`vm_meta.disk_size` 记录逻辑大小
-- 库 `application_id = 0x564D5351 ("VMSQ")`，`user_version = 1`
+- 库 `application_id = 0x564D5351 ("VMSQ")`，`user_version = 6`（当前 schema）。旧库在打开时按序迁移，每步一个事务；历史版本见 `src/vm.rs` 顶部注释
 
 新库 `page_size 8192`, `auto_vacuum=INCREMENTAL`；`--vm-only` 跳过 SELF 专用表（`segments/symbols/self_blob/bundle_*` 等）。连接 PRAGMA：`journal_mode=WAL synchronous=NORMAL mmap_size=256M busy_timeout=5000 journal_size_limit=64M`。
 
