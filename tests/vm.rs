@@ -84,7 +84,7 @@ fn verify_reports_integrity_ok() {
     let (_g, db) = tmpdb("verify");
     let c = open(&db);
     vm::vm_add_bytes(&c, "/f", b"hello", 0o644, 1).unwrap();
-    assert!(vm::vm_verify(&c).unwrap().contains("integrity=ok"));
+    assert!(vm::vm_verify(&c, true).unwrap().contains("integrity=ok"));
 }
 
 #[test]
@@ -193,4 +193,37 @@ fn sync_updates_keep_refcounts_exact() {
     vm::vm_sync_from_host(&c, &host).unwrap(); assert_refcounts(&c);
     let n: i64 = c.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 1);
+}
+
+#[test]
+fn counters_match_raw_aggregates_through_mutations() {
+    let (_g, db) = tmpdb("cnt");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/a", &vec![1u8; 700], 0o644, 1).unwrap();
+    vm::vm_add_bytes(&c, "/b", &vec![2u8; 9000], 0o644, 1).unwrap();
+    vm::vm_add_symlink(&c, "/l", "/a").unwrap();
+    vm::vm_add_dir(&c, "/d", 0o755, 1).unwrap();
+    vm::vm_add_bytes(&c, "/a", &vec![3u8; 50], 0o644, 2).unwrap();
+    c.execute("DELETE FROM vm_fs WHERE path='/b'", []).unwrap();
+    let rep = vm::vm_verify(&c, true).unwrap();
+    assert!(rep.contains("deep=ok"), "{}", rep);
+}
+
+#[test]
+fn v2_database_upgrades_to_counters() {
+    let (_g, db) = tmpdb("v2");
+    {
+        let c = open(&db);
+        vm::vm_add_bytes(&c, "/x", &vec![4u8; 2000], 0o644, 1).unwrap();
+        // simulate a schema-2 database: drop counter triggers and meta rows
+        c.execute_batch("DROP TRIGGER vm_cnt_fs_ins; DROP TRIGGER vm_cnt_fs_del; DROP TRIGGER vm_cnt_fs_upd;
+            DROP TRIGGER vm_cnt_blob_ins; DROP TRIGGER vm_cnt_blob_del; DROP TRIGGER vm_cnt_blob_upd;
+            DELETE FROM vm_meta WHERE key LIKE 'count_%' OR key IN ('logical_bytes','blob_bytes');
+            PRAGMA user_version=2;").unwrap();
+    }
+    let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+    let ver: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(ver, vm::VM_USER_VERSION as i64);
+    let rep = vm::vm_verify(&c, true).unwrap();
+    assert!(rep.contains("deep=ok"), "{}", rep);
 }

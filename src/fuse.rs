@@ -242,7 +242,7 @@ pub mod fuse_impl {
                 None => { reply.error(libc::ENOENT); return; }
             };
             let conn = &self.conn;
-            let target: Result<String, _> = conn.query_row("SELECT link_target FROM vm_fs WHERE path=?1", params![path], |r| r.get(0));
+            let target: Result<String, _> = conn.prepare_cached("SELECT link_target FROM vm_fs WHERE path=?1").and_then(|mut st| st.query_row(params![path], |r| r.get(0)));
             match target {
                 Ok(t) => reply.data(t.as_bytes()),
                 Err(_) => reply.error(libc::ENOENT),
@@ -389,8 +389,8 @@ pub mod fuse_impl {
             // df reports stored blob bytes (compressed), not host tmpfs
             let (blocks, files) = match Some(&self.conn) {
                 Some(c) => {
-                    let blob_bytes: i64 = c.query_row("SELECT COALESCE(sum(length(content)),0) FROM vm_blobs", [], |r| r.get(0)).unwrap_or(0);
-                    let files: i64 = c.query_row("SELECT count(*) FROM vm_fs", [], |r| r.get(0)).unwrap_or(0);
+                    let blob_bytes: i64 = c.prepare_cached("SELECT COALESCE(sum(length(content)),0) FROM vm_blobs").and_then(|mut st| st.query_row([], |r| r.get(0))).unwrap_or(0);
+                    let files: i64 = c.prepare_cached("SELECT count(*) FROM vm_fs").and_then(|mut st| st.query_row([], |r| r.get(0))).unwrap_or(0);
                     ((blob_bytes as u64).div_ceil(BLOCK_SIZE as u64), files as u64)
                 }
                 None => (0, 0),
@@ -485,7 +485,7 @@ pub mod fuse_impl {
             if kind == "dir" { reply.error(libc::EISDIR); return; }
             let conn = &self.conn;
             // DELETE fires vm_fs_hash_del, which releases the blob reference
-            let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1", params![norm.clone()]);
+            let _ = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![norm.clone()]));
             self.path_to_ino.remove(&norm);
             self.ino_to_path.remove(&ino);
             self.ino_to_kind.remove(&ino);
@@ -510,7 +510,7 @@ pub mod fuse_impl {
                 }
             }
             let conn = &self.conn;
-            let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1", params![norm.clone()]);
+            let _ = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![norm.clone()]));
             self.path_to_ino.remove(&norm);
             self.ino_to_path.remove(&ino);
             self.ino_to_kind.remove(&ino);
@@ -568,7 +568,7 @@ pub mod fuse_impl {
                     let kind = self.ino_to_kind.get(&ino).cloned().unwrap_or_default();
                     if kind == "dir" { reply.error(libc::EEXIST); return; }
                     let conn = &self.conn;
-                    let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1", params![new_path.clone()]);
+                    let _ = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![new_path.clone()]));
                     let old_ino = self.path_to_ino.remove(&new_path).unwrap();
                     self.ino_to_path.remove(&old_ino);
                     self.ino_to_kind.remove(&old_ino);
@@ -590,7 +590,7 @@ pub mod fuse_impl {
             affected.sort_by(|a,b| b.len().cmp(&a.len())); // longer first to avoid collision
             for old_p in affected {
                 let new_p = if old_p == old_path { new_path.clone() } else { format!("{}{}", new_prefix, &old_p[old_prefix.len()..]) };
-                let _ = conn.execute("UPDATE vm_fs SET path=?1 WHERE path=?2", params![new_p.clone(), old_p.clone()]);
+                let _ = conn.prepare_cached("UPDATE vm_fs SET path=?1 WHERE path=?2").and_then(|mut st| st.execute(params![new_p.clone(), old_p.clone()]));
                 if let Some(ino) = self.path_to_ino.remove(&old_p) {
                     self.path_to_ino.insert(new_p.clone(), ino);
                     self.ino_to_path.insert(ino, new_p);
@@ -604,15 +604,15 @@ pub mod fuse_impl {
             let conn = Some(&self.conn);
             if let Some(m) = mode {
                 if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.perm = (m & 0o7777) as u16; }
-                if let Some(ref c) = conn { let _ = c.execute("UPDATE vm_fs SET mode=?1 WHERE path=?2", params![m as i64, path.clone()]); }
+                if let Some(ref c) = conn { let _ = c.prepare_cached("UPDATE vm_fs SET mode=?1 WHERE path=?2").and_then(|mut st| st.execute(params![m as i64, path.clone()])); }
             }
             if let Some(u) = uid {
                 if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.uid = u; }
-                if let Some(ref c) = conn { let _ = c.execute("UPDATE vm_fs SET uid=?1 WHERE path=?2", params![u as i64, path.clone()]); }
+                if let Some(ref c) = conn { let _ = c.prepare_cached("UPDATE vm_fs SET uid=?1 WHERE path=?2").and_then(|mut st| st.execute(params![u as i64, path.clone()])); }
             }
             if let Some(g) = gid {
                 if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.gid = g; }
-                if let Some(ref c) = conn { let _ = c.execute("UPDATE vm_fs SET gid=?1 WHERE path=?2", params![g as i64, path.clone()]); }
+                if let Some(ref c) = conn { let _ = c.prepare_cached("UPDATE vm_fs SET gid=?1 WHERE path=?2").and_then(|mut st| st.execute(params![g as i64, path.clone()])); }
             }
             if let Some(at) = atime {
                 let t = match at { fuser::TimeOrNow::SpecificTime(t)=> t, fuser::TimeOrNow::Now => SystemTime::now() };
@@ -623,7 +623,7 @@ pub mod fuse_impl {
                 if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.mtime = t; attr.ctime = t; }
                 if let Some(ref c) = conn {
                     let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                    let _ = c.execute("UPDATE vm_fs SET mtime=?1 WHERE path=?2", params![secs, path.clone()]);
+                    let _ = c.prepare_cached("UPDATE vm_fs SET mtime=?1 WHERE path=?2").and_then(|mut st| st.execute(params![secs, path.clone()]));
                 }
             }
             if let Some(sz) = size {

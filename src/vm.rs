@@ -10,8 +10,9 @@ use std::num::NonZeroUsize;
 pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 /// Schema versions (PRAGMA user_version):
 ///   1 = legacy: FxHash text keys, no triggers, manual refcnt
-///   2 = triggers maintain vm_blobs.refcnt; vm_meta counters (blob_bytes/file_count/logical_bytes)
-pub const VM_USER_VERSION: u32 = 2;
+///   2 = triggers maintain vm_blobs.refcnt
+///   3 = triggers maintain vm_meta counters (blob_bytes/file_count/logical_bytes)
+pub const VM_USER_VERSION: u32 = 3;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -98,7 +99,7 @@ fn ensure_disk_blocks_table(conn: &Connection) -> Result<()> {
 /// Upgrade schema in order. Each step runs in its own transaction; user_version is
 /// bumped inside the same transaction so a crash leaves the DB at the last good version.
 fn vm_migrate(conn: &Connection) -> Result<()> {
-    let mut ver: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let mut ver: u32 = conn.prepare_cached("PRAGMA user_version")?.query_row( [], |r| r.get(0))?;
     if ver >= VM_USER_VERSION { return Ok(()); }
     if ver == 0 { ver = 1; } // pre-versioned DBs are schema 1
     while ver < VM_USER_VERSION {
@@ -106,6 +107,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
         let step: Result<()> = (|| {
             match ver {
                 1 => migrate_1_to_2(conn)?,
+                2 => migrate_2_to_3(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -127,7 +129,13 @@ fn migrate_1_to_2(conn: &Connection) -> Result<()> {
         UPDATE vm_blobs SET refcnt=(SELECT count(*) FROM vm_fs f WHERE f.hash=vm_blobs.hash);
         DELETE FROM vm_blobs WHERE refcnt=0;")?;
     conn.execute_batch(VM_TRIGGERS_SQL)?;
+    Ok(())
+}
+
+/// 2 -> 3: O(1) aggregate counters maintained by triggers, initialised from current data.
+fn migrate_2_to_3(conn: &Connection) -> Result<()> {
     conn.execute_batch(VM_COUNTERS_INIT_SQL)?;
+    conn.execute_batch(VM_COUNTER_TRIGGERS_SQL)?;
     Ok(())
 }
 
@@ -147,20 +155,53 @@ BEGIN
 END;
 ";
 
-const VM_COUNTERS_INIT_SQL: &str = "
-INSERT OR REPLACE INTO vm_meta(key,value)
-  SELECT 'file_count', CAST(count(*) AS TEXT) FROM vm_fs;
-INSERT OR REPLACE INTO vm_meta(key,value)
-  SELECT 'logical_bytes', CAST(COALESCE(sum(size),0) AS TEXT) FROM vm_fs WHERE kind='file';
-INSERT OR REPLACE INTO vm_meta(key,value)
-  SELECT 'blob_bytes', CAST(COALESCE(sum(length(content)),0) AS TEXT) FROM vm_blobs;
+/// Counter maintenance. Values are TEXT in vm_meta; updated with CAST arithmetic.
+const VM_COUNTER_TRIGGERS_SQL: &str = "
+CREATE TRIGGER IF NOT EXISTS vm_cnt_fs_ins AFTER INSERT ON vm_fs
+BEGIN
+  UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='count_' || NEW.kind;
+  UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)+NEW.size AS TEXT) WHERE key='logical_bytes' AND NEW.kind='file';
+END;
+CREATE TRIGGER IF NOT EXISTS vm_cnt_fs_del AFTER DELETE ON vm_fs
+BEGIN
+  UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)-1 AS TEXT) WHERE key='count_' || OLD.kind;
+  UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)-OLD.size AS TEXT) WHERE key='logical_bytes' AND OLD.kind='file';
+END;
+CREATE TRIGGER IF NOT EXISTS vm_cnt_fs_upd AFTER UPDATE OF size, kind ON vm_fs
+BEGIN
+  UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)-OLD.size AS TEXT) WHERE key='logical_bytes' AND OLD.kind='file';
+  UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)+NEW.size AS TEXT) WHERE key='logical_bytes' AND NEW.kind='file';
+  UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)-1 AS TEXT) WHERE key='count_' || OLD.kind AND OLD.kind IS NOT NEW.kind;
+  UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='count_' || NEW.kind AND OLD.kind IS NOT NEW.kind;
+END;
+CREATE TRIGGER IF NOT EXISTS vm_cnt_blob_ins AFTER INSERT ON vm_blobs
+BEGIN UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)+length(NEW.content) AS TEXT) WHERE key='blob_bytes'; END;
+CREATE TRIGGER IF NOT EXISTS vm_cnt_blob_del AFTER DELETE ON vm_blobs
+BEGIN UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)-length(OLD.content) AS TEXT) WHERE key='blob_bytes'; END;
+CREATE TRIGGER IF NOT EXISTS vm_cnt_blob_upd AFTER UPDATE OF content ON vm_blobs
+BEGIN UPDATE vm_meta SET value=CAST(CAST(value AS INTEGER)-length(OLD.content)+length(NEW.content) AS TEXT) WHERE key='blob_bytes'; END;
 ";
+
+const VM_COUNTERS_INIT_SQL: &str = "
+INSERT OR REPLACE INTO vm_meta(key,value) VALUES
+  ('count_file',    CAST((SELECT count(*) FROM vm_fs WHERE kind='file') AS TEXT)),
+  ('count_dir',     CAST((SELECT count(*) FROM vm_fs WHERE kind='dir') AS TEXT)),
+  ('count_symlink', CAST((SELECT count(*) FROM vm_fs WHERE kind='symlink') AS TEXT)),
+  ('logical_bytes', CAST((SELECT COALESCE(sum(size),0) FROM vm_fs WHERE kind='file') AS TEXT)),
+  ('blob_bytes',    CAST((SELECT COALESCE(sum(length(content)),0) FROM vm_blobs) AS TEXT));
+";
+
+/// O(1) read of an aggregate counter maintained by triggers (see VM_COUNTER_TRIGGERS_SQL).
+pub fn vm_counter(conn: &Connection, key: &str) -> Result<i64> {
+    let v: Option<String> = conn.prepare_cached("SELECT value FROM vm_meta WHERE key=?1")?.query_row( params![key], |r| r.get(0)).optional()?;
+    Ok(v.and_then(|x| x.parse().ok()).unwrap_or(0))
+}
 
 pub fn vm_open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     let _ = vm_apply_pragmas(&conn);
     // Brand-new DBs get the current schema directly; existing ones are upgraded in order.
-    let fresh = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='vm_fs'", [], |r| r.get::<_,i64>(0))? == 0;
+    let fresh = conn.prepare_cached("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='vm_fs'")?.query_row( [], |r| r.get::<_,i64>(0))? == 0;
     if fresh { return Err(anyhow!("not a VM database: {}", path)); }
     vm_migrate(&conn)?;
     let cols: Vec<String> = {
@@ -171,10 +212,10 @@ pub fn vm_open(path: &str) -> Result<Connection> {
     };
     let needs_compressed = !cols.contains(&"compressed".to_string());
     if needs_compressed {
-        let _ = conn.execute("ALTER TABLE vm_fs ADD COLUMN compressed INTEGER DEFAULT 0", []);
+        let _ = conn.prepare_cached("ALTER TABLE vm_fs ADD COLUMN compressed INTEGER DEFAULT 0")?.execute( []);
     }
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_vm_fs_path ON vm_fs(path)", []);
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_vm_fs_hash ON vm_fs(hash)", []);
+    let _ = conn.prepare_cached("CREATE INDEX IF NOT EXISTS idx_vm_fs_path ON vm_fs(path)")?.execute( []);
+    let _ = conn.prepare_cached("CREATE INDEX IF NOT EXISTS idx_vm_fs_hash ON vm_fs(hash)")?.execute( []);
     ensure_blob_table(&conn)?;
     ensure_dict_table(&conn)?;
     let _ = ensure_disk_blocks_table(&conn);
@@ -252,7 +293,8 @@ CREATE TABLE IF NOT EXISTS vm_disk_blocks(
 );
 {triggers}
 {counters}
-"#, app=VM_APP_ID, ver=VM_USER_VERSION, triggers=VM_TRIGGERS_SQL, counters=VM_COUNTERS_INIT_SQL)
+{counter_triggers}
+"#, app=VM_APP_ID, ver=VM_USER_VERSION, triggers=VM_TRIGGERS_SQL, counters=VM_COUNTERS_INIT_SQL, counter_triggers=VM_COUNTER_TRIGGERS_SQL)
 }
 
 pub fn init_vm_db_with_opts(path: &str, overwrite: bool, vm_only: bool) -> Result<Connection> {
@@ -275,10 +317,10 @@ pub fn init_vm_db_with_opts(path: &str, overwrite: bool, vm_only: bool) -> Resul
     CREATE TABLE IF NOT EXISTS bundle_needs(object_id INTEGER NOT NULL REFERENCES bundle_objects(id), ord INTEGER NOT NULL, soname TEXT NOT NULL, resolved_path TEXT REFERENCES bundle_objects(path));
     "#)?;
     }
-    conn.execute("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)", params!["vm_version", "1"])?;
-    conn.execute("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)", params!["created_at", format!("{}", now_secs())])?;
-    conn.execute("INSERT OR IGNORE INTO vm_fs(path,kind,mode,mtime,size,compressed) VALUES ('/','dir',493,?1,0,0)", params![now_secs()])?;
-    conn.execute("INSERT INTO vm_log(op, detail) VALUES ('init', ?1)", params![path])?;
+    conn.prepare_cached("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)")?.execute( params!["vm_version", "1"])?;
+    conn.prepare_cached("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)")?.execute( params!["created_at", format!("{}", now_secs())])?;
+    conn.prepare_cached("INSERT OR IGNORE INTO vm_fs(path,kind,mode,mtime,size,compressed) VALUES ('/','dir',493,?1,0,0)")?.execute( params![now_secs()])?;
+    conn.prepare_cached("INSERT INTO vm_log(op, detail) VALUES ('init', ?1)")?.execute( params![path])?;
     Ok(conn)
 }
 pub fn init_vm_db(path: &str, overwrite: bool) -> Result<Connection> {
@@ -300,10 +342,10 @@ pub fn init_vm_db(path: &str, overwrite: bool) -> Result<Connection> {
     CREATE TABLE IF NOT EXISTS bundle_objects(id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, soname TEXT, kind TEXT NOT NULL, is_root INTEGER NOT NULL, size INTEGER NOT NULL, content BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS bundle_needs(object_id INTEGER NOT NULL REFERENCES bundle_objects(id), ord INTEGER NOT NULL, soname TEXT NOT NULL, resolved_path TEXT REFERENCES bundle_objects(path));
     "#)?;
-    conn.execute("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)", params!["vm_version", "1"])?;
-    conn.execute("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)", params!["created_at", format!("{}", now_secs())])?;
-    conn.execute("INSERT OR IGNORE INTO vm_fs(path,kind,mode,mtime,size,compressed) VALUES ('/','dir',493,?1,0,0)", params![now_secs()])?;
-    conn.execute("INSERT INTO vm_log(op, detail) VALUES ('init', ?1)", params![path])?;
+    conn.prepare_cached("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)")?.execute( params!["vm_version", "1"])?;
+    conn.prepare_cached("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)")?.execute( params!["created_at", format!("{}", now_secs())])?;
+    conn.prepare_cached("INSERT OR IGNORE INTO vm_fs(path,kind,mode,mtime,size,compressed) VALUES ('/','dir',493,?1,0,0)")?.execute( params![now_secs()])?;
+    conn.prepare_cached("INSERT INTO vm_log(op, detail) VALUES ('init', ?1)")?.execute( params![path])?;
     Ok(conn)
 }
 pub fn now_secs() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 }
@@ -329,7 +371,7 @@ pub fn ensure_parent_dirs(conn: &Connection, vm_path: &str) -> Result<()> {
     let mut cur = String::new();
     for comp in dir.split('/').filter(|s| !s.is_empty()) {
         cur.push('/'); cur.push_str(comp);
-        conn.execute("INSERT OR IGNORE INTO vm_fs(path,kind,mode,mtime,size,compressed) VALUES (?1,'dir',493,?2,0,0)", params![cur, now_secs()])?;
+        conn.prepare_cached("INSERT OR IGNORE INTO vm_fs(path,kind,mode,mtime,size,compressed) VALUES (?1,'dir',493,?2,0,0)")?.execute( params![cur, now_secs()])?;
     }
     Ok(())
 }
@@ -349,13 +391,13 @@ pub fn fx_hash_u64(data: &[u8]) -> String {
 pub fn path_key(p: &str) -> String { format!("{:x}", fx_hash(p.as_bytes())) }
 
 pub fn vm_get_dict(conn: &Connection) -> Result<Option<Vec<u8>>> {
-    let dict: Option<Vec<u8>> = conn.query_row("SELECT dict FROM vm_dict WHERE id=1", [], |r| r.get(0)).optional()?.flatten().map(|v| v);
+    let dict: Option<Vec<u8>> = conn.prepare_cached("SELECT dict FROM vm_dict WHERE id=1")?.query_row( [], |r| r.get(0)).optional()?.flatten().map(|v| v);
     // vm_dict table may not exist yet, ignore error already handled via ensure_dict_table
     Ok(dict)
 }
 pub fn vm_set_dict(conn: &Connection, dict: &[u8], samples: usize) -> Result<()> {
     ensure_dict_table(conn)?;
-    conn.execute("INSERT OR REPLACE INTO vm_dict(id, dict, samples, dict_size, created_at) VALUES (1, ?1, ?2, ?3, ?4)", params![dict, samples as i64, dict.len() as i64, now_secs()])?;
+    conn.prepare_cached("INSERT OR REPLACE INTO vm_dict(id, dict, samples, dict_size, created_at) VALUES (1, ?1, ?2, ?3, ?4)")?.execute( params![dict, samples as i64, dict.len() as i64, now_secs()])?;
     Ok(())
 }
 pub fn vm_train_dict(conn: &Connection, max_dict_size: usize) -> Result<Option<Vec<u8>>> {
@@ -364,7 +406,7 @@ pub fn vm_train_dict(conn: &Connection, max_dict_size: usize) -> Result<Option<V
     let mut total_raw: usize = 0;
     // Sample without a full-table sort: start at a pseudo-random rowid (seconds-based; only
     // affects which samples are chosen, not correctness), read forward, wrap once.
-    let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(rowid),0) FROM vm_blobs", [], |r| r.get(0))?;
+    let max_id: i64 = conn.prepare_cached("SELECT COALESCE(MAX(rowid),0) FROM vm_blobs")?.query_row( [], |r| r.get(0))?;
     let start: i64 = if max_id > 0 { (now_secs().wrapping_mul(2654435761) as i64).rem_euclid(max_id) + 1 } else { 1 };
     let mut rows: Vec<(Vec<u8>, i64)> = Vec::new();
     {
@@ -524,14 +566,14 @@ pub fn decompress_bytes_cached(hash: &str, data: &[u8], compressed: i64) -> Arc<
 
 /// Ensure a blob row exists for `hash` (refcnt starts at 0; triggers count references).
 fn blob_ensure(conn: &Connection, hash: &str, data: &[u8]) -> Result<i64> {
-    if let Some(flag) = conn.query_row("SELECT compressed FROM vm_blobs WHERE hash=?1", params![hash], |r| r.get::<_,i64>(0)).optional()? {
+    if let Some(flag) = conn.prepare_cached("SELECT compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![hash], |r| r.get::<_,i64>(0)).optional()? {
         return Ok(flag);
     }
     let (body, flag) = match compress_bytes_with_conn(conn, data) {
         Some((c, f)) => (c, f),
         None => (data.to_vec(), 0),
     };
-    conn.execute("INSERT INTO vm_blobs(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,?3,?4,0)",
+    conn.prepare_cached("INSERT INTO vm_blobs(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,?3,?4,0)")?.execute(
         params![hash, body, flag, data.len() as i64])?;
     let cache_p = cache_path_for_hash(hash);
     if !cache_p.exists() {
@@ -605,7 +647,7 @@ pub fn vm_add_file(conn: &Connection, host_path: &str, vm_path: &str) -> Result<
     }
     let data = std::fs::read(hp)?;
     vm_add_bytes(conn, &vm_p, &data, mode, mtime)?;
-    conn.execute("INSERT INTO vm_log(op, path, detail) VALUES ('add', ?1, ?2)", params![vm_p, host_path])?;
+    conn.prepare_cached("INSERT INTO vm_log(op, path, detail) VALUES ('add', ?1, ?2)")?.execute( params![vm_p, host_path])?;
     Ok(())
 }
 pub fn fx_hash_u64_static(data: &[u8]) -> String { fx_hash_u64(data) }
@@ -651,9 +693,9 @@ pub fn vm_import_closure(conn: &Connection, host_elf: &str, vm_prefix: &str) -> 
 }
 pub fn vm_ls(conn: &Connection, vm_path: &str) -> Result<Vec<(String,String,i64,i64,String)>> {
     let p = normalize_vm_path(vm_path);
-    let cnt: i64 = conn.query_row("SELECT count(*) FROM vm_fs WHERE path=?1", params![p], |r| r.get(0))?;
+    let cnt: i64 = conn.prepare_cached("SELECT count(*) FROM vm_fs WHERE path=?1")?.query_row( params![p], |r| r.get(0))?;
     if cnt>0 {
-        let row: (String,String,i64,i64,String) = conn.query_row("SELECT path,kind,mode,size,coalesce(hash,'') FROM vm_fs WHERE path=?1", params![p], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?, r.get::<_,String>(4)?)))?;
+        let row: (String,String,i64,i64,String) = conn.prepare_cached("SELECT path,kind,mode,size,coalesce(hash,'') FROM vm_fs WHERE path=?1")?.query_row( params![p], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?, r.get::<_,String>(4)?)))?;
         return Ok(vec![row]);
     }
     let like = if p == "/" { "/%".to_string() } else { format!("{}/%", p) };
@@ -675,7 +717,7 @@ pub fn vm_cat(conn: &Connection, vm_path: &str) -> Result<Vec<u8>> {
 }
 pub fn vm_stat(conn: &Connection, vm_path: &str) -> Result<(String,String,i64,i64,i64,String)> {
     let p = normalize_vm_path(vm_path);
-    let row: Option<(String,String,i64,i64,i64,Option<String>,Option<Vec<u8>>,Option<String>)> = conn.query_row("SELECT path,kind,mode,size,mtime,link_target,content,hash FROM vm_fs WHERE path=?1", params![p], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).optional()?;
+    let row: Option<(String,String,i64,i64,i64,Option<String>,Option<Vec<u8>>,Option<String>)> = conn.prepare_cached("SELECT path,kind,mode,size,mtime,link_target,content,hash FROM vm_fs WHERE path=?1")?.query_row( params![p], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).optional()?;
     let (path,kind,mode,size,mtime,link,content,hash_opt) = match row { Some(x)=>x, None=> return Err(anyhow!("not found: {}", p)) };
     if kind == "symlink" {
         let target = link.clone().unwrap_or_default();
@@ -696,14 +738,14 @@ pub fn vm_resolve(conn: &Connection, vm_path: &str) -> Result<(String, String, O
     let mut visited = std::collections::HashSet::new();
     for _ in 0..40 {
         if !visited.insert(cur.clone()) { return Err(anyhow!("symlink loop at {}", cur)); }
-        let row: Option<(String, Option<Vec<u8>>, Option<String>, i64, Option<String>, Option<i64>)> = conn.query_row("SELECT kind, content, link_target, mode, hash, compressed FROM vm_fs WHERE path=?1", params![cur], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).optional()?;
+        let row: Option<(String, Option<Vec<u8>>, Option<String>, i64, Option<String>, Option<i64>)> = conn.prepare_cached("SELECT kind, content, link_target, mode, hash, compressed FROM vm_fs WHERE path=?1")?.query_row( params![cur], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).optional()?;
         let (kind, content_opt, link, mode, hash_opt, compressed) = match row { Some(x)=>x, None=> return Err(anyhow!("not found in VM: {}", cur)) };
         if kind != "symlink" {
             let cflag = compressed.unwrap_or(0);
             let content: Option<Vec<u8>> = match (hash_opt, content_opt) {
                 // content-addressed: key cache by stored hash, decompress only on miss
                 (Some(h), inline) => {
-                    let blob: Option<(Vec<u8>, i64)> = conn.query_row("SELECT content, compressed FROM vm_blobs WHERE hash=?1", params![h], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+                    let blob: Option<(Vec<u8>, i64)> = conn.prepare_cached("SELECT content, compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![h], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
                     match (blob, inline) {
                         (Some((b,c)), _) => Some(decompress_bytes_cached(&h, &b, c).to_vec()),
                         (None, Some(b)) => Some(decompress_bytes_cached(&h, &b, cflag).to_vec()),
@@ -813,7 +855,7 @@ pub fn vm_import_tar_filtered(conn: &Connection, tar_path: &str, strip_prefix: &
         if n % 2000 == 0 { conn.execute_batch("COMMIT; BEGIN IMMEDIATE;")?; }
     }
     conn.execute_batch("COMMIT;")?;
-    conn.execute("INSERT INTO vm_log(op, detail) VALUES ('import_tar', ?1)", params![tar_path])?;
+    conn.prepare_cached("INSERT INTO vm_log(op, detail) VALUES ('import_tar', ?1)")?.execute( params![tar_path])?;
     Ok(n)
 }
 thread_local! {
@@ -995,12 +1037,12 @@ pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,u
                     let target = String::from_utf8_lossy(data).to_string();
                     let db_target = db_link.as_deref().unwrap_or("");
                     if db_target != target || db_mode != mode {
-                        let _ = conn.execute("UPDATE vm_fs SET mode=?2, link_target=?3, mtime=?4 WHERE path=?1", params![vm_p, *mode, target, now_secs()]);
+                        let _ = conn.prepare_cached("UPDATE vm_fs SET mode=?2, link_target=?3, mtime=?4 WHERE path=?1")?.execute( params![vm_p, *mode, target, now_secs()]);
                         updated+=1;
                     }
                 } else if kind == "dir" {
                     if db_mode != mode {
-                        let _ = conn.execute("UPDATE vm_fs SET mode=?2, mtime=?3 WHERE path=?1", params![vm_p, *mode, now_secs()]);
+                        let _ = conn.prepare_cached("UPDATE vm_fs SET mode=?2, mtime=?3 WHERE path=?1")?.execute( params![vm_p, *mode, now_secs()]);
                         updated+=1;
                     }
                 }
@@ -1018,11 +1060,11 @@ pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,u
     for p in to_delete {
         // DELETE fires vm_fs_hash_del, which releases the blob reference.
         // prefix match via substr (LIKE treats _ and % as wildcards)
-        let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1 OR substr(path,1,?2)=?3", params![p.clone(), p.len() as i64 + 1, format!("{}/", p)]);
+        let _ = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1 OR substr(path,1,?2)=?3")?.execute( params![p.clone(), p.len() as i64 + 1, format!("{}/", p)]);
         deleted+=1;
     }
     conn.execute_batch("COMMIT;")?;
-    let _ = conn.execute("INSERT INTO vm_log(op, detail) VALUES ('sync', ?1)", params![format!("host:{} created:{} updated:{} deleted:{}", host_root.display(), created, updated, deleted)]);
+    let _ = conn.prepare_cached("INSERT INTO vm_log(op, detail) VALUES ('sync', ?1)")?.execute( params![format!("host:{} created:{} updated:{} deleted:{}", host_root.display(), created, updated, deleted)]);
     // checkpoint throttled: only if wal size > 4M
     let wal_size: i64 = conn.path().and_then(|pp| std::fs::metadata(format!("{}-wal", pp)).ok()).map(|m| m.len() as i64).unwrap_or(0);
     if wal_size > 4*1024*1024 {
@@ -1049,7 +1091,7 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
         let raw = decompress_bytes_raw(&data, cflag).unwrap_or(data.clone());
         before += data.len() as i64;
         let hash = fx_hash_u64(&raw);
-        let sz_before: Option<i64> = conn.query_row("SELECT length(content) FROM vm_blobs WHERE hash=?1", params![hash], |r| r.get(0)).optional()?;
+        let sz_before: Option<i64> = conn.prepare_cached("SELECT length(content) FROM vm_blobs WHERE hash=?1")?.query_row( params![hash], |r| r.get(0)).optional()?;
         match sz_before {
             Some(sz) => after += sz,
             None => {
@@ -1060,8 +1102,8 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
         }
         // move inline content onto the blob: hash column now references it, content becomes NULL.
         // The UPDATE trigger adds the reference (old hash was NULL for legacy rows).
-        let blob_flag: i64 = conn.query_row("SELECT compressed FROM vm_blobs WHERE hash=?1", params![hash.clone()], |r| r.get(0)).unwrap_or(2);
-        conn.execute("UPDATE vm_fs SET hash=?2, content=NULL, compressed=?3, size=?4 WHERE path=?1", params![path, hash, blob_flag, raw.len() as i64])?;
+        let blob_flag: i64 = conn.prepare_cached("SELECT compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![hash.clone()], |r| r.get(0)).unwrap_or(2);
+        conn.prepare_cached("UPDATE vm_fs SET hash=?2, content=NULL, compressed=?3, size=?4 WHERE path=?1")?.execute( params![path, hash, blob_flag, raw.len() as i64])?;
         n+=1;
     }
     // also recompress blobs that are gz
@@ -1075,8 +1117,8 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
         before += gz.len() as i64;
         if let Some((z, flag)) = compress_bytes_with_conn(conn, &raw) {
             after += z.len() as i64;
-            let _ = conn.execute("UPDATE vm_blobs SET content=?2, compressed=?3 WHERE hash=?1", params![hash, z, flag]);
-            let _ = conn.execute("UPDATE vm_fs SET compressed=?2 WHERE hash=?1", params![hash.clone(), flag]);
+            let _ = conn.prepare_cached("UPDATE vm_blobs SET content=?2, compressed=?3 WHERE hash=?1")?.execute( params![hash, z, flag]);
+            let _ = conn.prepare_cached("UPDATE vm_fs SET compressed=?2 WHERE hash=?1")?.execute( params![hash.clone(), flag]);
             n+=1;
         } else {
             after += gz.len() as i64;
@@ -1095,8 +1137,8 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
         if let Some((z, flag)) = compress_bytes_with_conn(conn, &raw) {
             before += raw.len() as i64;
             after += z.len() as i64;
-            let _ = conn.execute("UPDATE vm_blobs SET content=?2, compressed=?3 WHERE hash=?1", params![hash.clone(), z, flag]);
-            let _ = conn.execute("UPDATE vm_fs SET compressed=?2 WHERE hash=?1", params![hash, flag]);
+            let _ = conn.prepare_cached("UPDATE vm_blobs SET content=?2, compressed=?3 WHERE hash=?1")?.execute( params![hash.clone(), z, flag]);
+            let _ = conn.prepare_cached("UPDATE vm_fs SET compressed=?2 WHERE hash=?1")?.execute( params![hash, flag]);
             n+=1;
         }
     }
@@ -1115,7 +1157,7 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
             if c19.len() + 64 < raw.len() && c19.len() + 32 < cur_len {
                 before += cur_len as i64;
                 after += c19.len() as i64;
-                let _ = conn.execute("UPDATE vm_blobs SET content=?2 WHERE hash=?1", params![hash.clone(), c19]);
+                let _ = conn.prepare_cached("UPDATE vm_blobs SET content=?2 WHERE hash=?1")?.execute( params![hash.clone(), c19]);
                 n+=1;
             }
         }
@@ -1124,8 +1166,8 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
     Ok((n, before, after))
 }
 pub fn vm_gc(conn: &Connection) -> Result<(i64,i64)> {
-    let before: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
-    let ps_before: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let before: i64 = conn.prepare_cached("PRAGMA page_count")?.query_row( [], |r| r.get(0))?;
+    let ps_before: i64 = conn.prepare_cached("PRAGMA page_size")?.query_row( [], |r| r.get(0))?;
     let needs_migrate = ps_before == 4096;
     if needs_migrate {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;");
@@ -1138,8 +1180,8 @@ pub fn vm_gc(conn: &Connection) -> Result<(i64,i64)> {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
     }
     let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
-    let after: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
-    let ps: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let after: i64 = conn.prepare_cached("PRAGMA page_count")?.query_row( [], |r| r.get(0))?;
+    let ps: i64 = conn.prepare_cached("PRAGMA page_size")?.query_row( [], |r| r.get(0))?;
     let actual_saved = before * ps_before - after * ps;
     Ok((before, actual_saved))
 }
@@ -1178,27 +1220,25 @@ pub fn vm_cache_prune(max_bytes: u64) -> Result<(usize, u64)> {
     Ok((removed, freed))
 }
 pub fn vm_status(conn: &Connection) -> Result<String> {
-    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
-    let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
-    let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
-    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    let files: i64 = conn.query_row("SELECT count(*) FROM vm_fs", [], |r| r.get(0))?;
-    let dirs: i64 = conn.query_row("SELECT count(*) FROM vm_fs WHERE kind='dir'", [], |r| r.get(0))?;
-    let syms: i64 = conn.query_row("SELECT count(*) FROM vm_fs WHERE kind='symlink'", [], |r| r.get(0))?;
-    let fcnt: i64 = conn.query_row("SELECT count(*) FROM vm_fs WHERE kind='file'", [], |r| r.get(0))?;
-    let logical: Option<i64> = conn.query_row("SELECT sum(size) FROM vm_fs WHERE kind='file'", [], |r| r.get(0))?;
-    let blob_storage: Option<i64> = conn.query_row("SELECT sum(length(content)) FROM vm_blobs", [], |r| r.get(0))?;
-    // fallback if no blobs
-    let blob_storage = blob_storage.or_else(|| conn.query_row("SELECT sum(length(content)) FROM vm_fs WHERE kind='file' AND content IS NOT NULL", [], |r| r.get(0)).ok().flatten()).unwrap_or(0);
-    let blob_cnt: i64 = conn.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap_or(0);
-    let comp_cnt: i64 = conn.query_row("SELECT count(*) FROM vm_blobs WHERE compressed!=0", [], |r| r.get(0)).unwrap_or(0);
-    let snaps: i64 = conn.query_row("SELECT count(*) FROM vm_snapshots", [], |r| r.get(0))?;
-    let mmap: i64 = conn.query_row("PRAGMA mmap_size", [], |r| r.get(0))?;
-    let cache_size: i64 = conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;
-    let auto_vac: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap_or(0);
+    let page_size: i64 = conn.prepare_cached("PRAGMA page_size")?.query_row( [], |r| r.get(0))?;
+    let page_count: i64 = conn.prepare_cached("PRAGMA page_count")?.query_row( [], |r| r.get(0))?;
+    let freelist: i64 = conn.prepare_cached("PRAGMA freelist_count")?.query_row( [], |r| r.get(0))?;
+    let journal: String = conn.prepare_cached("PRAGMA journal_mode")?.query_row( [], |r| r.get(0))?;
+    let integrity: String = conn.prepare_cached("PRAGMA integrity_check")?.query_row( [], |r| r.get(0))?;
+    // aggregates come from vm_meta counters (trigger-maintained, O(1))
+    let dirs = vm_counter(conn, "count_dir")?;
+    let syms = vm_counter(conn, "count_symlink")?;
+    let fcnt = vm_counter(conn, "count_file")?;
+    let files = dirs + syms + fcnt;
+    let logical = vm_counter(conn, "logical_bytes")?;
+    let blob_storage = vm_counter(conn, "blob_bytes")?;
+    let blob_cnt: i64 = conn.prepare_cached("SELECT count(*) FROM vm_blobs")?.query_row( [], |r| r.get(0)).unwrap_or(0);
+    let comp_cnt: i64 = conn.prepare_cached("SELECT count(*) FROM vm_blobs WHERE compressed!=0")?.query_row( [], |r| r.get(0)).unwrap_or(0);
+    let snaps: i64 = conn.prepare_cached("SELECT count(*) FROM vm_snapshots")?.query_row( [], |r| r.get(0))?;
+    let mmap: i64 = conn.prepare_cached("PRAGMA mmap_size")?.query_row( [], |r| r.get(0))?;
+    let cache_size: i64 = conn.prepare_cached("PRAGMA cache_size")?.query_row( [], |r| r.get(0))?;
+    let auto_vac: i64 = conn.prepare_cached("PRAGMA auto_vacuum")?.query_row( [], |r| r.get(0)).unwrap_or(0);
     let (cache_dir, cache_files, cache_bytes) = vm_cache_info();
-    let logical = logical.unwrap_or(0);
     let ratio = if logical>0 { 100.0 * blob_storage as f64 / logical as f64 } else { 0.0 };
     let disk_line = vm_disk_info(conn).unwrap_or_else(|_| "disk: none".to_string());
     Ok(format!(
@@ -1211,8 +1251,8 @@ pub fn vm_status(conn: &Connection) -> Result<String> {
 }
 pub fn vm_diff(conn: &Connection, snap_a: &str, snap_b: &str) -> Result<String> {
     // snapshots table only has page stats, not file diff; we diff vm_log if available, else file count diff
-    let a: Option<(i64,i64,String)> = conn.query_row("SELECT page_count, bytes, coalesce(note,'') FROM vm_snapshots WHERE name=?1", params![snap_a], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
-    let b: Option<(i64,i64,String)> = conn.query_row("SELECT page_count, bytes, coalesce(note,'') FROM vm_snapshots WHERE name=?1", params![snap_b], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    let a: Option<(i64,i64,String)> = conn.prepare_cached("SELECT page_count, bytes, coalesce(note,'') FROM vm_snapshots WHERE name=?1")?.query_row( params![snap_a], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    let b: Option<(i64,i64,String)> = conn.prepare_cached("SELECT page_count, bytes, coalesce(note,'') FROM vm_snapshots WHERE name=?1")?.query_row( params![snap_b], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
     if a.is_none() || b.is_none() { return Err(anyhow!("snapshot not found: {} or {}", snap_a, snap_b)); }
     let (apc, abytes, anot) = a.unwrap();
     let (bpc, bbytes, bnot) = b.unwrap();
@@ -1226,12 +1266,12 @@ pub fn vm_diff(conn: &Connection, snap_a: &str, snap_b: &str) -> Result<String> 
     Ok(out)
 }
 pub fn vm_checkpoint(conn: &Connection, name: &str, note: &str) -> Result<()> {
-    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.prepare_cached("PRAGMA page_size")?.query_row( [], |r| r.get(0))?;
+    let page_count: i64 = conn.prepare_cached("PRAGMA page_count")?.query_row( [], |r| r.get(0))?;
     let bytes = page_size * page_count;
-    conn.execute("INSERT INTO vm_snapshots(name, page_count, page_size, bytes, note) VALUES (?1,?2,?3,?4,?5)", params![name, page_count, page_size, bytes, note])?;
+    conn.prepare_cached("INSERT INTO vm_snapshots(name, page_count, page_size, bytes, note) VALUES (?1,?2,?3,?4,?5)")?.execute( params![name, page_count, page_size, bytes, note])?;
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-    conn.execute("INSERT INTO vm_log(op, detail) VALUES ('snapshot', ?1)", params![name])?;
+    conn.prepare_cached("INSERT INTO vm_log(op, detail) VALUES ('snapshot', ?1)")?.execute( params![name])?;
     Ok(())
 }
 pub fn vm_list_snapshots(conn: &Connection) -> Result<Vec<(i64,String,i64,i64,i64,String)>> {
@@ -1240,7 +1280,7 @@ pub fn vm_list_snapshots(conn: &Connection) -> Result<Vec<(i64,String,i64,i64,i6
     let mut out=Vec::new(); for r in rows { out.push(r?); } Ok(out)
 }
 pub fn vm_mem_insert(conn: &Connection, addr: i64, size: i64, prot: i64, content: &[u8]) -> Result<()> {
-    conn.execute("INSERT INTO vm_mem(addr,size,prot,content) VALUES (?1,?2,?3,?4)", params![addr,size,prot,content])?;
+    conn.prepare_cached("INSERT INTO vm_mem(addr,size,prot,content) VALUES (?1,?2,?3,?4)")?.execute( params![addr,size,prot,content])?;
     Ok(())
 }
 pub fn vm_mem_list(conn: &Connection) -> Result<Vec<(i64,i64,i64,i64)>> {
@@ -1249,7 +1289,7 @@ pub fn vm_mem_list(conn: &Connection) -> Result<Vec<(i64,i64,i64,i64)>> {
     let mut out=Vec::new(); for r in rows{ out.push(r?); } Ok(out)
 }
 pub fn vm_mem_clear(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM vm_mem", [])?;
+    conn.prepare_cached("DELETE FROM vm_mem")?.execute( [])?;
     Ok(())
 }
 
@@ -1365,33 +1405,51 @@ pub fn vm_restore_file(db_path: &str, name: &str) -> Result<()> {
     }
     Ok(())
 }
-pub fn vm_verify(conn: &Connection) -> Result<String> {
-    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
-    let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
-    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    let files: i64 = conn.query_row("SELECT count(*) FROM vm_fs", [], |r| r.get(0))?;
-    let bytes: Option<i64> = conn.query_row("SELECT sum(size) FROM vm_fs WHERE kind='file'", [], |r| r.get(0))?;
-    Ok(format!("integrity={} page_size={} page_count={} freelist={} files={} bytes={}", integrity, page_size, page_count, freelist, files, bytes.unwrap_or(0)))
+/// Quick check uses counters; `deep` recomputes every counter and refcount from raw rows
+/// and reports any drift (use after crashes or manual SQL edits).
+pub fn vm_verify(conn: &Connection, deep: bool) -> Result<String> {
+    let page_size: i64 = conn.prepare_cached("PRAGMA page_size")?.query_row( [], |r| r.get(0))?;
+    let page_count: i64 = conn.prepare_cached("PRAGMA page_count")?.query_row( [], |r| r.get(0))?;
+    let freelist: i64 = conn.prepare_cached("PRAGMA freelist_count")?.query_row( [], |r| r.get(0))?;
+    let integrity: String = conn.prepare_cached("PRAGMA integrity_check")?.query_row( [], |r| r.get(0))?;
+    let files = vm_counter(conn, "count_file")? + vm_counter(conn, "count_dir")? + vm_counter(conn, "count_symlink")?;
+    let bytes = vm_counter(conn, "logical_bytes")?;
+    let mut out = format!("integrity={} page_size={} page_count={} freelist={} files={} bytes={}", integrity, page_size, page_count, freelist, files, bytes);
+    if deep {
+        let mut drift = Vec::new();
+        let real_files: i64 = conn.prepare_cached("SELECT count(*) FROM vm_fs")?.query_row( [], |r| r.get(0))?;
+        let real_bytes: i64 = conn.prepare_cached("SELECT COALESCE(sum(size),0) FROM vm_fs WHERE kind='file'")?.query_row( [], |r| r.get(0))?;
+        let real_blob: i64 = conn.prepare_cached("SELECT COALESCE(sum(length(content)),0) FROM vm_blobs")?.query_row( [], |r| r.get(0))?;
+        if real_files != files { drift.push(format!("files {}!={}", files, real_files)); }
+        if real_bytes != bytes { drift.push(format!("logical {}!={}", bytes, real_bytes)); }
+        if real_blob != vm_counter(conn, "blob_bytes")? { drift.push(format!("blob_bytes {}!={}", vm_counter(conn, "blob_bytes")?, real_blob)); }
+        let bad_rc: i64 = conn.prepare_cached("SELECT count(*) FROM vm_blobs b WHERE b.refcnt != (SELECT count(*) FROM vm_fs f WHERE f.hash=b.hash)")?.query_row( [], |r| r.get(0))?;
+        if bad_rc > 0 { drift.push(format!("{} blobs with bad refcnt", bad_rc)); }
+        let orphan: i64 = conn.prepare_cached("SELECT count(*) FROM vm_fs f WHERE f.hash IS NOT NULL AND NOT EXISTS (SELECT 1 FROM vm_blobs b WHERE b.hash=f.hash)")?.query_row( [], |r| r.get(0))?;
+        if orphan > 0 { drift.push(format!("{} files reference missing blobs", orphan)); }
+        out.push_str(if drift.is_empty() { " deep=ok" } else { " deep=DRIFT" });
+        for d in drift { out.push_str(&format!("\n  {}", d)); }
+    }
+    Ok(out)
 }
 
 pub const DISK_BLOCK_SIZE: i64 = 4096;
 pub fn vm_disk_init(conn: &Connection, size_bytes: i64) -> Result<()> {
     ensure_disk_blocks_table(conn)?;
     if size_bytes % DISK_BLOCK_SIZE != 0 { return Err(anyhow!("size must be multiple of {}", DISK_BLOCK_SIZE)); }
-    conn.execute("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)", params!["disk_size", size_bytes.to_string()])?;
-    conn.execute("UPDATE vm_meta SET value=?1 WHERE key='disk_size'", params![size_bytes.to_string()])?;
+    conn.prepare_cached("INSERT OR IGNORE INTO vm_meta VALUES (?1,?2)")?.execute( params!["disk_size", size_bytes.to_string()])?;
+    conn.prepare_cached("UPDATE vm_meta SET value=?1 WHERE key='disk_size'")?.execute( params![size_bytes.to_string()])?;
     let bs: i64 = DISK_BLOCK_SIZE;
-    if let Ok(v) = conn.query_row("SELECT value FROM vm_meta WHERE key='disk_block_size'", [], |r| r.get::<_,String>(0)) {
-        if v != bs.to_string() { conn.execute("UPDATE vm_meta SET value=?1 WHERE key='disk_block_size'", params![bs.to_string()])?; }
+    if let Ok(v) = conn.prepare_cached("SELECT value FROM vm_meta WHERE key='disk_block_size'")?.query_row( [], |r| r.get::<_,String>(0)) {
+        if v != bs.to_string() { conn.prepare_cached("UPDATE vm_meta SET value=?1 WHERE key='disk_block_size'")?.execute( params![bs.to_string()])?; }
     } else {
-        conn.execute("INSERT INTO vm_meta VALUES (?1,?2)", params!["disk_block_size", bs.to_string()])?;
+        conn.prepare_cached("INSERT INTO vm_meta VALUES (?1,?2)")?.execute( params!["disk_block_size", bs.to_string()])?;
     }
     Ok(())
 }
 pub fn vm_disk_size(conn: &Connection) -> Result<i64> {
     ensure_disk_blocks_table(conn)?;
-    let v: Option<String> = conn.query_row("SELECT value FROM vm_meta WHERE key='disk_size'", [], |r| r.get(0)).optional()?;
+    let v: Option<String> = conn.prepare_cached("SELECT value FROM vm_meta WHERE key='disk_size'")?.query_row( [], |r| r.get(0)).optional()?;
     if let Some(s) = v { if let Ok(n) = s.parse::<i64>() { return Ok(n); } }
     Ok(0)
 }
@@ -1413,10 +1471,10 @@ pub fn vm_disk_import_raw(conn: &Connection, raw_path: &str, disk_size: i64) -> 
         if !is_all_zero(slice) {
             let comp_opt = compress_bytes(slice);
             let (content, compressed, raw_size): (Vec<u8>, i64, i64) = if let Some(c)=comp_opt { (c, 2, DISK_BLOCK_SIZE) } else { (slice.to_vec(), 0, DISK_BLOCK_SIZE) };
-            conn.execute("INSERT OR REPLACE INTO vm_disk_blocks(block_id, content, compressed, raw_size) VALUES (?1,?2,?3,?4)", params![bid, content, compressed, raw_size])?;
+            conn.prepare_cached("INSERT OR REPLACE INTO vm_disk_blocks(block_id, content, compressed, raw_size) VALUES (?1,?2,?3,?4)")?.execute( params![bid, content, compressed, raw_size])?;
             nonzero += 1;
         } else {
-            conn.execute("DELETE FROM vm_disk_blocks WHERE block_id=?1", params![bid])?;
+            conn.prepare_cached("DELETE FROM vm_disk_blocks WHERE block_id=?1")?.execute( params![bid])?;
         }
         total +=1;
         bid+=1;
@@ -1424,7 +1482,7 @@ pub fn vm_disk_import_raw(conn: &Connection, raw_path: &str, disk_size: i64) -> 
         if bid*DISK_BLOCK_SIZE >= disk_size { break; }
     }
     for id in bid..(disk_size/DISK_BLOCK_SIZE) {
-        conn.execute("DELETE FROM vm_disk_blocks WHERE block_id=?1", params![id])?;
+        conn.prepare_cached("DELETE FROM vm_disk_blocks WHERE block_id=?1")?.execute( params![id])?;
     }
     Ok((total, nonzero))
 }
@@ -1458,13 +1516,13 @@ pub fn vm_disk_info(conn: &Connection) -> Result<String> {
     ensure_disk_blocks_table(conn)?;
     let disk = vm_disk_size(conn)?;
     let blocks = disk/DISK_BLOCK_SIZE;
-    let stored: i64 = conn.query_row("SELECT count(*) FROM vm_disk_blocks", [], |r| r.get(0))?;
-    let raw_storage: Option<i64> = conn.query_row("SELECT sum(length(content)) FROM vm_disk_blocks", [], |r| r.get(0))?;
+    let stored: i64 = conn.prepare_cached("SELECT count(*) FROM vm_disk_blocks")?.query_row( [], |r| r.get(0))?;
+    let raw_storage: Option<i64> = conn.prepare_cached("SELECT sum(length(content)) FROM vm_disk_blocks")?.query_row( [], |r| r.get(0))?;
     let raw_storage = raw_storage.unwrap_or(0);
     let logical = stored*DISK_BLOCK_SIZE;
     Ok(format!("disk size={} bytes ({:.2}G) blocks={} stored_blocks={} logical_stored={} sparse_hole={} bytes compressed_storage={} bytes ratio={:.1}% page_size={} page_count={}",
         disk, disk as f64/1024.0/1024.0/1024.0, blocks, stored, logical, disk-logical, raw_storage, if disk>0 {100.0*raw_storage as f64/disk as f64} else {0.0},
-        conn.query_row("PRAGMA page_size", [], |r| r.get::<_,i64>(0)).unwrap_or(0),
-        conn.query_row("PRAGMA page_count", [], |r| r.get::<_,i64>(0)).unwrap_or(0)))
+        conn.prepare_cached("PRAGMA page_size")?.query_row( [], |r| r.get::<_,i64>(0)).unwrap_or(0),
+        conn.prepare_cached("PRAGMA page_count")?.query_row( [], |r| r.get::<_,i64>(0)).unwrap_or(0)))
 }
 
