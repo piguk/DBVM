@@ -14,10 +14,12 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///   3 = triggers maintain vm_meta counters (blob_bytes/file_count/logical_bytes)
 ///   4 = blob keys are raw 32-byte SHA-256 BLOBs (UNIQUE); vm_blobs keeps a rowid so large
 ///       content is not stored inside a key B-tree (WITHOUT ROWID measured no smaller)
+///   6 = zstd dictionaries are append-only rows in vm_dicts; every flag-3 blob records its
+///       dictionary in vm_blobs.dict_id. Retraining no longer makes older blocks unreadable.
 ///   5 = file content is split into CHUNK_SIZE chunks listed in vm_file_chunks; a file's
 ///       refcount on vm_blobs comes from its chunk rows. vm_fs.hash = whole-file sha256
 ///       (informational, no refcounting). Legacy single-blob files keep working via vm_fs.hash.
-pub const VM_USER_VERSION: u32 = 5;
+pub const VM_USER_VERSION: u32 = 6;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -102,6 +104,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
                 2 => migrate_2_to_3(conn)?,
                 3 => migrate_3_to_4(conn)?,
                 4 => migrate_4_to_5(conn)?,
+                5 => migrate_5_to_6(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -199,6 +202,29 @@ fn migrate_4_to_5(conn: &Connection) -> Result<()> {
         DELETE FROM vm_blobs WHERE refcnt = 0;
     ")?;
     conn.execute_batch(VM_TRIGGERS_SQL)?;
+    Ok(())
+}
+
+/// 5 -> 6: dictionaries become append-only (vm_dicts) and blobs record their dictionary id.
+/// The single legacy dictionary (vm_dict id=1) becomes vm_dicts row 1; every existing flag-3
+/// blob was written with it, so they get dict_id=1.
+fn migrate_5_to_6(conn: &Connection) -> Result<()> {
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS vm_dicts(
+            id INTEGER PRIMARY KEY,
+            dict BLOB NOT NULL,
+            samples INTEGER NOT NULL,
+            dict_size INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        INSERT INTO vm_dicts(id, dict, samples, dict_size, created_at)
+          SELECT 1, dict, samples, dict_size, created_at FROM vm_dict WHERE id=1;
+    ")?;
+    let has_col: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info('vm_blobs') WHERE name='dict_id'", [], |r| r.get(0))?;
+    if has_col == 0 {
+        conn.execute_batch("ALTER TABLE vm_blobs ADD COLUMN dict_id INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    conn.execute_batch("UPDATE vm_blobs SET dict_id=1 WHERE compressed=3 AND dict_id=0;")?;
     Ok(())
 }
 
@@ -309,8 +335,6 @@ pub fn vm_open(path: &str) -> Result<Connection> {
     let _ = conn.prepare_cached("CREATE INDEX IF NOT EXISTS idx_vm_fs_hash ON vm_fs(hash)")?.execute( []);
     ensure_dict_table(&conn)?;
     let _ = ensure_disk_blocks_table(&conn);
-    // load dict into global cache for decompress of flag 3
-    let _ = vm_dict_load_global(&conn);
     // migrate page_size if still 4096 -> suggest VACUUM with 8192 on next gc if desired; we don't force rewrite here to avoid surprise slowdown
     Ok(conn)
 }
@@ -327,7 +351,8 @@ CREATE TABLE IF NOT EXISTS vm_blobs(
     content BLOB NOT NULL,
     compressed INTEGER NOT NULL DEFAULT 0,
     raw_size INTEGER NOT NULL,
-    refcnt INTEGER NOT NULL DEFAULT 0
+    refcnt INTEGER NOT NULL DEFAULT 0,
+    dict_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_vm_blobs_refcnt ON vm_blobs(refcnt);
 CREATE TABLE IF NOT EXISTS vm_fs(
@@ -375,6 +400,13 @@ CREATE TABLE IF NOT EXISTS vm_log(
   op TEXT NOT NULL,
   path TEXT,
   detail TEXT
+);
+CREATE TABLE IF NOT EXISTS vm_dicts(
+  id INTEGER PRIMARY KEY,
+  dict BLOB NOT NULL,
+  samples INTEGER NOT NULL,
+  dict_size INTEGER NOT NULL,
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE TABLE IF NOT EXISTS vm_dict(
   id INTEGER PRIMARY KEY CHECK(id=1),
@@ -498,15 +530,51 @@ pub fn fx_hash_u64(data: &[u8]) -> String { key_hex(&blob_key(data)) }
 /// Short non-crypto key for a DB path (history/cache dir naming only).
 pub fn path_key(p: &str) -> String { format!("{:x}", fx_hash(p.as_bytes())) }
 
+/// Latest dictionary (CLI display and new writes). Dictionaries are append-only rows.
 pub fn vm_get_dict(conn: &Connection) -> Result<Option<Vec<u8>>> {
-    let dict: Option<Vec<u8>> = conn.prepare_cached("SELECT dict FROM vm_dict WHERE id=1")?.query_row( [], |r| r.get(0)).optional()?.flatten().map(|v| v);
-    // vm_dict table may not exist yet, ignore error already handled via ensure_dict_table
-    Ok(dict)
-}
-pub fn vm_set_dict(conn: &Connection, dict: &[u8], samples: usize) -> Result<()> {
     ensure_dict_table(conn)?;
-    conn.prepare_cached("INSERT OR REPLACE INTO vm_dict(id, dict, samples, dict_size, created_at) VALUES (1, ?1, ?2, ?3, ?4)")?.execute( params![dict, samples as i64, dict.len() as i64, now_secs()])?;
-    Ok(())
+    let d: Option<Vec<u8>> = conn.prepare_cached("SELECT dict FROM vm_dicts ORDER BY id DESC LIMIT 1")?
+        .query_row([], |r| r.get(0)).optional()?;
+    Ok(d)
+}
+/// Latest dictionary id, or None if no dictionary has been trained.
+pub fn vm_latest_dict_id(conn: &Connection) -> Result<Option<i64>> {
+    ensure_dict_table(conn)?;
+    Ok(conn.prepare_cached("SELECT id FROM vm_dicts ORDER BY id DESC LIMIT 1")?
+        .query_row([], |r| r.get(0)).optional()?)
+}
+/// Append a new dictionary. Existing dictionaries are never overwritten, so blobs written
+/// under them stay readable. Returns the new dictionary id.
+pub fn vm_set_dict(conn: &Connection, dict: &[u8], samples: usize) -> Result<i64> {
+    ensure_dict_table(conn)?;
+    conn.prepare_cached("INSERT INTO vm_dicts(dict, samples, dict_size, created_at) VALUES (?1, ?2, ?3, ?4)")?
+        .execute(params![dict, samples as i64, dict.len() as i64, now_secs()])?;
+    Ok(conn.last_insert_rowid())
+}
+/// Dictionary bytes for a given id. Cached per (database path, id): rows are immutable.
+fn dict_by_id(conn: &Connection, id: i64) -> Result<Arc<Vec<u8>>> {
+    let key = (conn.path().unwrap_or("").to_string(), id);
+    if let Some(d) = dict_cache().lock().unwrap().get(&key) { return Ok(d.clone()); }
+    let bytes: Vec<u8> = conn.prepare_cached("SELECT dict FROM vm_dicts WHERE id=?1")?
+        .query_row(params![id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| anyhow!("missing dictionary {} (block written with it cannot be read)", id))?;
+    let d = Arc::new(bytes);
+    dict_cache().lock().unwrap().put(key, d.clone());
+    Ok(d)
+}
+fn dict_cache() -> &'static Mutex<LruCache<(String, i64), Arc<Vec<u8>>>> {
+    static C: OnceLock<Mutex<LruCache<(String, i64), Arc<Vec<u8>>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(16).unwrap())))
+}
+/// Decode one stored block. The only decode entry point: flag 3 uses the dictionary the block
+/// was written with (dict_id), never a process-global one.
+pub fn decode_block(conn: &Connection, body: &[u8], flag: i64, dict_id: i64) -> Result<Vec<u8>> {
+    if flag == 3 {
+        let d = dict_by_id(conn, dict_id)?;
+        return decompress_bytes_zstd_with_dict(body, &d);
+    }
+    decompress_bytes_raw(body, flag)
 }
 pub fn vm_train_dict(conn: &Connection, max_dict_size: usize) -> Result<Option<Vec<u8>>> {
     // collect raw samples: files with raw_size between 256 and 16384, up to 120 samples
@@ -517,17 +585,19 @@ pub fn vm_train_dict(conn: &Connection, max_dict_size: usize) -> Result<Option<V
     // only affects which samples are chosen, not correctness.
     let seed = (now_secs() as u64).wrapping_mul(0x9E3779B97F4A7C15);
     let start: Vec<u8> = seed.to_be_bytes().iter().chain(seed.rotate_left(17).to_be_bytes().iter()).cloned().chain(std::iter::repeat(0u8)).take(32).collect();
-    let mut rows: Vec<(Vec<u8>, i64)> = Vec::new();
+    let mut rows: Vec<(Vec<u8>, i64, i64)> = Vec::new();
     {
-        let mut st = conn.prepare_cached("SELECT content, compressed FROM vm_blobs WHERE hash >= ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT 150")?;
-        for r in st.query_map(params![start], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?)))? { rows.push(r?); }
+        let mut st = conn.prepare_cached("SELECT content, compressed, dict_id FROM vm_blobs WHERE hash >= ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT 150")?;
+        for r in st.query_map(params![start], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?)))? { rows.push(r?); }
         if rows.len() < 150 {
-            let mut st = conn.prepare_cached("SELECT content, compressed FROM vm_blobs WHERE hash < ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT ?2")?;
-            for r in st.query_map(params![start, 150 - rows.len() as i64], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?)))? { rows.push(r?); }
+            let mut st = conn.prepare_cached("SELECT content, compressed, dict_id FROM vm_blobs WHERE hash < ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT ?2")?;
+            for r in st.query_map(params![start, 150 - rows.len() as i64], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?)))? { rows.push(r?); }
         }
     }
-    for (data, comp) in rows.into_iter() {
-        let raw = decompress_bytes_raw(&data, comp).unwrap_or(data);
+    for (data, comp, dict_id) in rows.into_iter() {
+        // A block that cannot be decoded is skipped: its compressed bytes must never become
+        // training samples (they would silently poison the dictionary).
+        let raw = match decode_block(conn, &data, comp, dict_id) { Ok(r) => r, Err(_) => continue };
         if raw.len() >= 256 && raw.len() < 16384 {
             total_raw += raw.len();
             samples.push(raw);
@@ -563,56 +633,51 @@ pub fn compress_bytes(data: &[u8]) -> Option<Vec<u8>> {
     }
     None
 }
-pub fn compress_bytes_with_conn(conn: &Connection, data: &[u8]) -> Option<(Vec<u8>, i64)> {
+/// Choose the smallest encoding. Returns (stored bytes, flag, dict_id); dict_id is non-zero
+/// only for flag 3. None means store raw.
+pub fn compress_bytes_with_conn(conn: &Connection, data: &[u8]) -> Option<(Vec<u8>, i64, i64)> {
     if data.len() < 512 {
-        // for tiny files only dict can help; try dict if available
-        if let Ok(Some(dict)) = vm_get_dict(conn) {
-            if dict.len() >= 512 {
-                if let Ok(c) = zstd::bulk::Compressor::with_dictionary(3, &dict).and_then(|mut enc| enc.compress(data)) {
-                    if c.len() + 32 < data.len() {
-                        return Some((c, 3));
-                    }
-                }
-            }
+        // tiny files only benefit from a dictionary
+        if let Some((c, id)) = try_dict(conn, data, 3) {
+            if c.len() + 32 < data.len() { return Some((c, 3, id)); }
         }
         if data.len() < 1024 { return None; }
     }
     let level = if data.len() > 100*1024 { 19 } else if data.len() > 16*1024 { 6 } else { 3 };
-    let mut best: Option<(Vec<u8>, i64)> = None;
+    let mut best: Option<(Vec<u8>, i64, i64)> = None;
     let mut best_len = usize::MAX;
-    // try dict first for small/medium files
     if data.len() < 16384 {
-        if let Ok(Some(dict)) = vm_get_dict(conn) {
-            if dict.len() >= 512 {
-                if let Ok(c) = zstd::bulk::Compressor::with_dictionary(level, &dict).and_then(|mut enc| enc.compress(data)) {
-                    if c.len() + 32 < data.len() && c.len() < best_len {
-                        best_len = c.len();
-                        best = Some((c, 3));
-                    }
-                }
+        if let Some((c, id)) = try_dict(conn, data, level) {
+            if c.len() + 32 < data.len() && c.len() < best_len {
+                best_len = c.len();
+                best = Some((c, 3, id));
             }
         }
     }
-    // try plain zstd at chosen level
-    if let Ok(c) = zstd::bulk::compress(data, level) {
+    let plain = zstd::bulk::compress(data, level).or_else(|_| zstd::bulk::compress(data, 3));
+    if let Ok(c) = plain {
         if c.len() + 64 < data.len() && c.len() < best_len {
             best_len = c.len();
-            best = Some((c, 2));
-        }
-    } else if let Ok(c) = zstd::bulk::compress(data, 3) {
-        if c.len() + 64 < data.len() && c.len() < best_len {
-            best = Some((c, 2));
+            best = Some((c, 2, 0));
         }
     }
-    // for large files try level 19 if not already (fallback already level 19 for >100k, but try 19 for medium as alternative)
-    if level != 19 && data.len() > 16384 {
+    if data.len() > 16384 {
         if let Ok(c) = zstd::bulk::compress(data, 19) {
             if c.len() + 64 < data.len() && c.len() < best_len {
-                best = Some((c, 2));
+                best = Some((c, 2, 0));
             }
         }
     }
     best
+}
+
+/// Compress with the latest dictionary, if one exists. Returns the dictionary id used.
+fn try_dict(conn: &Connection, data: &[u8], level: i32) -> Option<(Vec<u8>, i64)> {
+    let id = vm_latest_dict_id(conn).ok().flatten()?;
+    let dict = dict_by_id(conn, id).ok()?;
+    if dict.len() < 512 { return None; }
+    let c = zstd::bulk::Compressor::with_dictionary(level, &dict).ok()?.compress(data).ok()?;
+    Some((c, id))
 }
 /// Decompressed size from the zstd frame header. Never truncates: a missing or implausible
 /// header is an error, and the output buffer is sized to exactly the declared content size.
@@ -629,21 +694,6 @@ pub fn decompress_bytes_zstd(data: &[u8]) -> Result<Vec<u8>> {
     if out.len() != n { return Err(anyhow!("zstd short read: {} of {}", out.len(), n)); }
     Ok(out)
 }
-static VM_DICT_GLOBAL: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
-fn vm_dict_global() -> &'static Mutex<Option<Vec<u8>>> {
-    VM_DICT_GLOBAL.get_or_init(|| Mutex::new(None))
-}
-pub fn vm_dict_set_global(dict: Option<Vec<u8>>) {
-    *vm_dict_global().lock().unwrap() = dict;
-}
-pub fn vm_dict_get_global() -> Option<Vec<u8>> {
-    vm_dict_global().lock().unwrap().clone()
-}
-pub fn vm_dict_load_global(conn: &Connection) {
-    if let Ok(Some(d)) = vm_get_dict(conn) {
-        vm_dict_set_global(Some(d));
-    }
-}
 pub fn decompress_bytes_zstd_with_dict(data: &[u8], dict: &[u8]) -> Result<Vec<u8>> {
     let n = zstd_frame_size(data)?;
     let mut dec = zstd::bulk::Decompressor::with_dictionary(dict).map_err(|e| anyhow!("{}", e))?;
@@ -651,12 +701,11 @@ pub fn decompress_bytes_zstd_with_dict(data: &[u8], dict: &[u8]) -> Result<Vec<u
     if out.len() != n { return Err(anyhow!("zstd+dict short read: {} of {}", out.len(), n)); }
     Ok(out)
 }
+/// Decode without database context. Flag 3 (dictionary) cannot be decoded here; callers must
+/// use `decode_block` so the block's own dictionary is selected. Never falls back silently.
 pub fn decompress_bytes_raw(data: &[u8], compressed: i64) -> Result<Vec<u8>> {
     if compressed == 3 {
-        if let Some(dict) = vm_dict_get_global() {
-            if let Ok(v) = decompress_bytes_zstd_with_dict(data, &dict) { return Ok(v); }
-        }
-        if let Ok(v) = decompress_bytes_zstd(data) { return Ok(v); }
+        return Err(anyhow!("dictionary-compressed block needs decode_block (dict_id)"));
     }
     if compressed == 2 {
         return decompress_bytes_zstd(data);
@@ -680,25 +729,17 @@ pub fn decompress_bytes_raw(data: &[u8], compressed: i64) -> Result<Vec<u8>> {
     }
     Ok(data.to_vec())
 }
-/// Decompressed bytes keyed by content hash; LRU hit = refcount bump, no copy.
-pub fn decompress_bytes_cached(hash: &str, data: &[u8], compressed: i64) -> Arc<Vec<u8>> {
-    if let Some(v) = decompress_cache().lock().unwrap().get(hash) { return v.clone(); }
-    let raw = Arc::new(decompress_bytes_raw(data, compressed).unwrap_or_else(|_| data.to_vec()));
-    decompress_cache().lock().unwrap().put(hash.to_string(), raw.clone());
-    raw
-}
-
 /// Ensure a blob row exists for `key` (refcnt starts at 0; triggers count references).
 fn blob_ensure(conn: &Connection, key: &BlobKey, data: &[u8]) -> Result<i64> {
     if let Some(flag) = conn.prepare_cached("SELECT compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![key.as_slice()], |r| r.get::<_,i64>(0)).optional()? {
         return Ok(flag);
     }
-    let (body, flag) = match compress_bytes_with_conn(conn, data) {
-        Some((c, f)) => (c, f),
-        None => (data.to_vec(), 0),
+    let (body, flag, dict_id) = match compress_bytes_with_conn(conn, data) {
+        Some(t) => t,
+        None => (data.to_vec(), 0, 0),
     };
-    conn.prepare_cached("INSERT INTO vm_blobs(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,?3,?4,0)")?.execute(
-        params![key.as_slice(), body, flag, data.len() as i64])?;
+    conn.prepare_cached("INSERT INTO vm_blobs(hash, content, compressed, raw_size, refcnt, dict_id) VALUES (?1,?2,?3,?4,0,?5)")?.execute(
+        params![key.as_slice(), body, flag, data.len() as i64, dict_id])?;
     let cache_p = cache_path_for_hash(&key_hex(key));
     if !cache_p.exists() {
         if let Some(par)=cache_p.parent(){ let _ = std::fs::create_dir_all(par); }
@@ -919,14 +960,14 @@ pub fn read_range(conn: &Connection, vm_path: &str, off: u64, len: usize) -> Res
     let first = (start / CHUNK_SIZE as u64) as i64;
     let last = ((end - 1) / CHUNK_SIZE as u64) as i64;
     let mut st = conn.prepare_cached(
-        "SELECT c.idx, b.content, b.compressed, c.hash FROM vm_file_chunks c JOIN vm_blobs b ON b.hash=c.hash
+        "SELECT c.idx, b.content, b.compressed, c.hash, b.dict_id FROM vm_file_chunks c JOIN vm_blobs b ON b.hash=c.hash
          WHERE c.path=?1 AND c.idx BETWEEN ?2 AND ?3 ORDER BY c.idx")?;
-    let rows = st.query_map(params![real, first, last], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?)))?;
+    let rows = st.query_map(params![real, first, last], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?, r.get::<_,i64>(4)?)))?;
     let mut out: Vec<u8> = Vec::with_capacity((end - start) as usize);
     let mut got_last = false;
     for row in rows {
-        let (idx, body, comp, key) = row?;
-        let piece = decompress_bytes_raw(&body, comp).map_err(|e| anyhow!("{}: chunk {} undecodable: {}", real, idx, e))?;
+        let (idx, body, comp, key, dict_id) = row?;
+        let piece = decode_block(conn, &body, comp, dict_id).map_err(|e| anyhow!("{}: chunk {} undecodable: {}", real, idx, e))?;
         if blob_key(&piece).as_slice() != key.as_slice() { return Err(anyhow!("{}: chunk {} hash mismatch", real, idx)); }
         // slice this chunk to the requested window
         let chunk_base = idx as u64 * CHUNK_SIZE as u64;
@@ -985,15 +1026,15 @@ pub fn vm_stat(conn: &Connection, vm_path: &str) -> Result<(String,String,i64,i6
 /// Assemble a regular file's bytes from its chunk list. Chunks are verified against their
 /// key (sha256) so a corrupt or mis-keyed chunk is an error, never silently wrong data.
 pub fn file_bytes(conn: &Connection, path: &str) -> Result<Vec<u8>> {
-    let mut st = conn.prepare_cached("SELECT c.idx, b.content, b.compressed, c.hash FROM vm_file_chunks c JOIN vm_blobs b ON b.hash=c.hash WHERE c.path=?1 ORDER BY c.idx")?;
-    let rows = st.query_map(params![path], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?)))?;
+    let mut st = conn.prepare_cached("SELECT c.idx, b.content, b.compressed, c.hash, b.dict_id FROM vm_file_chunks c JOIN vm_blobs b ON b.hash=c.hash WHERE c.path=?1 ORDER BY c.idx")?;
+    let rows = st.query_map(params![path], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?, r.get::<_,i64>(4)?)))?;
     let mut out = Vec::new();
     let mut expect = 0i64;
     for row in rows {
-        let (idx, body, comp, key) = row?;
+        let (idx, body, comp, key, dict_id) = row?;
         if idx != expect { return Err(anyhow!("{}: chunk index gap at {}", path, expect)); }
         expect += 1;
-        let piece = decompress_bytes_raw(&body, comp).map_err(|e| anyhow!("{}: chunk {} undecodable: {}", path, idx, e))?;
+        let piece = decode_block(conn, &body, comp, dict_id).map_err(|e| anyhow!("{}: chunk {} undecodable: {}", path, idx, e))?;
         if blob_key(&piece).as_slice() != key.as_slice() { return Err(anyhow!("{}: chunk {} hash mismatch", path, idx)); }
         out.extend_from_slice(&piece);
     }
@@ -1017,7 +1058,7 @@ pub fn vm_resolve(conn: &Connection, vm_path: &str) -> Result<(String, String, O
                 file_bytes(conn, &cur)?
             } else if let Some(b) = inline {
                 // legacy inline row (pre-blob); never produced by current code
-                decompress_bytes_raw(&b, comp).unwrap_or(b)
+                decompress_bytes_raw(&b, comp).map_err(|e| anyhow!("corrupt inline content for {}: {}", cur, e))?
             } else {
                 // a regular file must have either a hash (chunked) or legacy inline bytes.
                 // Neither means the row is corrupt: fail instead of returning an empty file.
@@ -1389,7 +1430,7 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     for (path, data, comp) in rows {
         let cflag = comp.unwrap_or(0);
-        let raw = decompress_bytes_raw(&data, cflag).unwrap_or(data.clone());
+        let raw = decompress_bytes_raw(&data, cflag)?;
         before += data.len() as i64;
         let hash = blob_key(&raw);
         let sz_before: Option<i64> = conn.prepare_cached("SELECT length(content) FROM vm_blobs WHERE hash=?1")?.query_row( params![hash.as_slice()], |r| r.get(0)).optional()?;
@@ -1411,48 +1452,50 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
     let mut gz_blobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     {
         let mut st = conn.prepare("SELECT hash, content FROM vm_blobs WHERE compressed=1")?;
-        for r in st.query_map([], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,Vec<u8>>(1)?)))? { if let Ok(x)=r { gz_blobs.push(x); } }
+        for r in st.query_map([], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,Vec<u8>>(1)?)))? { gz_blobs.push(r?); }
     }
     for (hash, gz) in gz_blobs {
-        let raw = decompress_bytes_raw(&gz, 1).unwrap_or(gz.clone());
+        // undecodable input is an error, never a silent pass-through of compressed bytes
+        let raw = decompress_bytes_raw(&gz, 1)?;
         before += gz.len() as i64;
-        if let Some((z, flag)) = compress_bytes_with_conn(conn, &raw) {
+        if let Some((z, flag, dict_id)) = compress_bytes_with_conn(conn, &raw) {
             after += z.len() as i64;
-            let _ = conn.prepare_cached("UPDATE vm_blobs SET content=?2, compressed=?3 WHERE hash=?1")?.execute( params![hash, z, flag]);
-            let _ = conn.prepare_cached("UPDATE vm_fs SET compressed=?2 WHERE hash=?1")?.execute( params![hash.clone(), flag]);
+            conn.prepare_cached("UPDATE vm_blobs SET content=?2, compressed=?3, dict_id=?4 WHERE hash=?1")?.execute( params![hash, z, flag, dict_id])?;
             n+=1;
         } else {
             after += gz.len() as i64;
         }
     }
     // recompress uncompressed blobs that would benefit from level 19 or dict
-    let mut plain_blobs: Vec<(String, Vec<u8>, i64)> = Vec::new();
+    // (Previously read the BLOB key as String and dropped the error with `if let Ok`,
+    // so this pass silently did nothing. Keys are now read as bytes and errors propagate.)
+    let mut plain_blobs: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
     {
         let mut st = conn.prepare("SELECT hash, content, raw_size FROM vm_blobs WHERE compressed=0 AND raw_size > 1024 LIMIT 200")?;
-        for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?)))? {
-            if let Ok(x)=r { plain_blobs.push(x); }
+        for r in st.query_map([], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?)))? {
+            plain_blobs.push(r?);
         }
     }
     for (hash, data, _raw) in plain_blobs {
         let raw = data.clone();
-        if let Some((z, flag)) = compress_bytes_with_conn(conn, &raw) {
+        if let Some((z, flag, dict_id)) = compress_bytes_with_conn(conn, &raw) {
             before += raw.len() as i64;
             after += z.len() as i64;
-            let _ = conn.prepare_cached("UPDATE vm_blobs SET content=?2, compressed=?3 WHERE hash=?1")?.execute( params![hash.clone(), z, flag]);
-            let _ = conn.prepare_cached("UPDATE vm_fs SET compressed=?2 WHERE hash=?1")?.execute( params![hash, flag]);
+            conn.prepare_cached("UPDATE vm_blobs SET content=?2, compressed=?3, dict_id=?4 WHERE hash=?1")?.execute( params![hash.clone(), z, flag, dict_id])?;
             n+=1;
         }
     }
     // recompress zstd level 3 blobs to level 19 if beneficial
-    let mut zstd_blobs: Vec<(String, Vec<u8>, i64)> = Vec::new();
+    let mut zstd_blobs: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
     {
         let mut st = conn.prepare("SELECT hash, content, compressed FROM vm_blobs WHERE compressed=2 LIMIT 300")?;
-        for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?)))? {
-            if let Ok(x)=r { zstd_blobs.push(x); }
+        for r in st.query_map([], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?)))? {
+            zstd_blobs.push(r?);
         }
     }
     for (hash, data, comp) in zstd_blobs {
-        let raw = decompress_bytes_raw(&data, comp).unwrap_or(data.clone());
+        // flag 2 only (no dictionary): an undecodable block is an error, not a pass-through
+        let raw = decompress_bytes_raw(&data, comp)?;
         let cur_len = data.len();
         if let Ok(c19) = zstd::bulk::compress(&raw, 19) {
             if c19.len() + 64 < raw.len() && c19.len() + 32 < cur_len {

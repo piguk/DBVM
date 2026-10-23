@@ -466,3 +466,79 @@ fn sync_is_incremental_and_reports_exact_counts() {
     assert!(vm::vm_cat(&c, "/d/sub/b").is_err());
     assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
 }
+
+/// Records that share a long template (where a dictionary helps) and differ by id. Sized above
+/// the trainer's 256-byte sampling floor so they are eligible samples.
+fn small_record(tag: &str, i: u32) -> String {
+    format!("{{\"schema\":\"com.example.record.v1\",\"kind\":\"inventory-item\",\"owner\":\"{}\",\"id\":{},\"status\":\"active\",\"flags\":[\"audited\",\"synced\",\"archived-false\",\"public-false\"],\"labels\":{{\"region\":\"eu-west-1\",\"tier\":\"gold\",\"team\":\"platform-storage\",\"env\":\"production\"}},\"history\":[{{\"at\":\"2025-01-01T00:00:00Z\",\"op\":\"create\"}},{{\"at\":\"2025-02-01T00:00:00Z\",\"op\":\"update\"}}],\"note\":\"generated record {} for owner {} in the nightly batch run\"}}", tag, i, i, tag)
+}
+
+#[test]
+fn dictionary_is_per_database_not_per_process() {
+    // Two databases in one process with different trained dictionaries. Reading each back
+    // must use its own dictionary; a process-global dictionary would mix them up.
+    // A dictionary only applies to data written AFTER training, so: train first, then write.
+    let (_g1, db1) = tmpdb("dict-a");
+    let (_g2, db2) = tmpdb("dict-b");
+    let mk = |db: &std::path::PathBuf, tag: &str| -> rusqlite::Connection {
+        let c = open(db);
+        for i in 0..60u32 {
+            let body = small_record(tag, i);
+            vm::vm_add_bytes(&c, &format!("/train/{}", i), body.as_bytes(), 0o644, 1).unwrap();
+        }
+        assert!(vm::vm_train_dict(&c, 16384).unwrap().is_some());
+        // post-training data must be NEW content (same template, different ids), otherwise
+        // dedup reuses the training blobs and the dictionary is never applied to them
+        for i in 1000..1060u32 {
+            let body = small_record(tag, i);
+            vm::vm_add_bytes(&c, &format!("/d/{}", i - 1000), body.as_bytes(), 0o644, 1).unwrap();
+        }
+        c
+    };
+    let a = mk(&db1, "alpha");
+    let b = mk(&db2, "beta");
+    // the post-training files must actually use the dictionary (flag 3), or the test proves nothing
+    let flag3: i64 = a.query_row("SELECT count(*) FROM vm_blobs WHERE compressed=3", [], |r| r.get(0)).unwrap();
+    assert!(flag3 > 0, "dictionary path not exercised");
+    for i in 0..60u32 {
+        let got = vm::vm_cat(&a, &format!("/d/{}", i)).unwrap();
+        assert!(String::from_utf8(got).unwrap().contains("\"owner\":\"alpha\""), "file {} read with wrong dictionary", i);
+        let got = vm::vm_cat(&b, &format!("/d/{}", i)).unwrap();
+        assert!(String::from_utf8(got).unwrap().contains("\"owner\":\"beta\""));
+    }
+}
+
+#[test]
+fn retraining_keeps_old_dictionary_blocks_readable() {
+    // Blocks written under dictionary #1 must still read after dictionary #2 replaces it.
+    let (_g, db) = tmpdb("dict-retrain");
+    let c = open(&db);
+    for i in 0..60u32 {
+        vm::vm_add_bytes(&c, &format!("/t/{}", i), small_record("gen1", i).as_bytes(), 0o644, 1).unwrap();
+    }
+    vm::vm_train_dict(&c, 16384).unwrap();
+    for i in 1000..1060u32 {
+        vm::vm_add_bytes(&c, &format!("/g1/{}", i), small_record("gen1", i).as_bytes(), 0o644, 1).unwrap();
+    }
+    // second training with different data replaces the stored dictionary
+    for i in 0..60u32 {
+        vm::vm_add_bytes(&c, &format!("/u/{}", i), format!("unrelated {} {}", i, "z".repeat(300)).as_bytes(), 0o644, 1).unwrap();
+    }
+    vm::vm_train_dict(&c, 16384).unwrap();
+    for i in 0..60u32 {
+        let got = vm::vm_cat(&c, &format!("/g1/{}", 1000 + i)).unwrap();
+        assert!(String::from_utf8(got).unwrap().contains("gen1"), "gen1 file {} unreadable after retrain", i);
+    }
+}
+
+#[test]
+fn recompress_runs_on_current_schema() {
+    let (_g, db) = tmpdb("recompress");
+    let c = open(&db);
+    let data: Vec<u8> = (0..5000u32).map(|i| (i % 97) as u8).collect();
+    vm::vm_add_bytes(&c, "/r", &data, 0o644, 1).unwrap();
+    let r = vm::vm_recompress(&c);
+    assert!(r.is_ok(), "vm_recompress failed on current schema: {:?}", r.err());
+    assert_eq!(vm::vm_cat(&c, "/r").unwrap(), data);
+    assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
+}

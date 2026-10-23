@@ -443,10 +443,13 @@ fn main() -> anyhow::Result<()> {
         },
         Cmd::VmDictInfo{db} => {
             let c=selfdb::vm::vm_open(&db)?;
-            match selfdb::vm::vm_get_dict(&c)? {
-                Some(d) => println!("dict {}: {} bytes (vm_dict id=1)", db, d.len()),
-                None => println!("dict {}: none", db),
+            let mut st=c.prepare("SELECT id, length(dict), samples, created_at, (SELECT count(*) FROM vm_blobs WHERE dict_id=vm_dicts.id) FROM vm_dicts ORDER BY id")?;
+            let mut any=false;
+            for r in st.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?, r.get::<_,i64>(4)?)))? {
+                let (id,len,samples,ts,blobs)=r?; any=true;
+                println!("dict id={} bytes={} samples={} created_at={} blocks_using={}", id, len, samples, ts, blobs);
             }
+            if !any { println!("no dictionary trained"); }
         },
         Cmd::VmDiff{db, a, b} => {
             let c=selfdb::vm::vm_open(&db)?;
