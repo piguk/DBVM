@@ -603,3 +603,114 @@ fn parallel_pack_matches_serial_pack() {
     assert_eq!(vm::vm_cat(&parallel, "/data/empty").unwrap(), b"");
     assert!(vm::vm_verify(&parallel, true).unwrap().contains("deep=ok"));
 }
+
+#[test]
+fn reused_scratch_dir_reflects_db_not_stale_host_edits() {
+    // A stable materialize directory is reused across chroot runs. A file edited on the host
+    // (size/mtime differ from the DB) must be rewritten from the DB on the next materialize,
+    // and a file with a matching size+mtime must be left alone.
+    let (_g, db) = tmpdb("scratch");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/etc/a", b"from-db-aaa", 0o644, 1000).unwrap();
+    vm::vm_add_bytes(&c, "/etc/b", b"from-db-bbb", 0o644, 1000).unwrap();
+    let scratch = _g.path().join("scratch");
+    vm::vm_materialize_tree(&c, &scratch).unwrap();
+    // host-side tamper with a: same size, different content, different mtime
+    std::fs::write(scratch.join("etc/a"), b"TAMPER-----").unwrap();
+    filetime_set(&scratch.join("etc/a"), 5000);
+    let n = vm::vm_materialize_tree(&c, &scratch).unwrap();
+    assert_eq!(std::fs::read(scratch.join("etc/a")).unwrap(), b"from-db-aaa", "tampered file must be restored from DB");
+    assert_eq!(std::fs::read(scratch.join("etc/b")).unwrap(), b"from-db-bbb");
+    assert!(n >= 2);
+}
+
+fn filetime_set(p: &std::path::Path, secs: i64) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    let ts = libc::timespec { tv_sec: secs as libc::time_t, tv_nsec: 0 };
+    unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [ts, ts].as_ptr(), 0); }
+}
+
+#[test]
+fn reused_scratch_does_not_resurrect_deleted_files() {
+    // The DB deletes /etc/gone between runs. The scratch dir still has it from the last run.
+    // Materialize must not leave it behind, or the next sync-back would re-add it.
+    let (_g, db) = tmpdb("scratch-del");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/etc/keep", b"k", 0o644, 1).unwrap();
+    vm::vm_add_bytes(&c, "/etc/gone", b"g", 0o644, 1).unwrap();
+    let scratch = _g.path().join("scratch");
+    vm::vm_materialize_tree(&c, &scratch).unwrap();
+    c.execute("DELETE FROM vm_fs WHERE path='/etc/gone'", []).unwrap();
+    vm::vm_materialize_tree(&c, &scratch).unwrap();
+    assert!(!scratch.join("etc/gone").exists(), "deleted file must not survive re-materialize");
+    assert!(scratch.join("etc/keep").exists());
+}
+
+#[test]
+fn prune_keeps_runtime_mountpoints_and_tmp() {
+    let (_g, db) = tmpdb("prune-keep");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/etc/a", b"a", 0o644, 1).unwrap();
+    let s = _g.path().join("scratch");
+    vm::vm_materialize_tree(&c, &s).unwrap();
+    for m in ["dev", "proc", "sys", "tmp"] { std::fs::create_dir_all(s.join(m)).unwrap(); }
+    std::fs::write(s.join("tmp/session-file"), b"x").unwrap();
+    vm::vm_materialize_tree(&c, &s).unwrap();
+    for m in ["dev", "proc", "sys", "tmp"] { assert!(s.join(m).is_dir(), "{} must survive", m); }
+    assert!(s.join("tmp/session-file").exists());
+}
+
+#[test]
+fn import_closure_includes_elf_interpreter() {
+    // A dynamically linked executable needs its PT_INTERP (ld-linux) inside the VM, or it cannot
+    // be exec'd there. DT_NEEDED alone does not list the interpreter.
+    let host = "/bin/true";
+    if !std::path::Path::new(host).exists() { return; }
+    let (_g, db) = tmpdb("interp");
+    let c = open(&db);
+    vm::vm_import_closure(&c, host, "/").unwrap();
+    let interp = elf_interp(host).expect("host /bin/true has an interpreter");
+    let have: i64 = c.query_row("SELECT count(*) FROM vm_fs WHERE path=?1", rusqlite::params![interp], |r| r.get(0)).unwrap();
+    assert_eq!(have, 1, "interpreter {} must be imported", interp);
+}
+
+/// PT_INTERP path of an ELF file, via goblin (already a dependency).
+fn elf_interp(path: &str) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let elf = goblin::elf::Elf::parse(&data).ok()?;
+    elf.interpreter.map(|s| s.to_string())
+}
+
+#[test]
+fn imported_interpreter_resolves_inside_vm() {
+    // The interpreter path must resolve to a real file inside the VM. A relative host symlink
+    // (e.g. /lib64/ld-linux -> ../lib/...) breaks when the VM has no /lib alias.
+    let host = "/bin/true";
+    if !std::path::Path::new(host).exists() { return; }
+    let (_g, db) = tmpdb("interp-resolve");
+    let c = open(&db);
+    vm::vm_import_closure(&c, host, "/").unwrap();
+    let interp = elf_interp(host).expect("interpreter");
+    let (real, kind, content, _l, _m) = vm::vm_resolve(&c, &interp).expect("interpreter must resolve in the VM");
+    assert_eq!(kind, "file", "{} resolved to {} ({})", interp, real, kind);
+    assert!(content.map(|b| b.len() > 0).unwrap_or(false), "interpreter has no content");
+}
+
+#[test]
+fn needed_sonames_resolve_inside_vm() {
+    // Every DT_NEEDED name of an imported object must resolve inside the VM. A soname that
+    // differs from the real file name (libcap.so.2 -> libcap.so.2.75) needs its own link.
+    let host = "/bin/ls";
+    if !std::path::Path::new(host).exists() { return; }
+    let (_g, db) = tmpdb("soname");
+    let c = open(&db);
+    vm::vm_import_closure(&c, host, "/").unwrap();
+    let data = std::fs::read(host).unwrap();
+    let elf = goblin::elf::Elf::parse(&data).unwrap();
+    for lib in &elf.libraries {
+        let dirs = ["/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu", "/usr/lib", "/lib"];
+        let found = dirs.iter().any(|d| vm::vm_resolve(&c, &format!("{}/{}", d, lib)).is_ok());
+        assert!(found, "DT_NEEDED {} does not resolve inside the VM", lib);
+    }
+}

@@ -302,8 +302,15 @@ fn main() -> anyhow::Result<()> {
             {
                 eprintln!("hint: rebuild with --features fuse for zero-materialize: `cargo build --release --features fuse` (pure-rust, no libfuse3-dev)");
             }
-            // fallback: materialize (88 files) then bwrap; still auto-persists via vm_sync_from_host + WAL
-            let tmp = selfdb::vm::make_tmp_dir("self-vm-")?;
+            // fallback: materialize then bwrap; still auto-persists via vm_sync_from_host + WAL.
+            // The scratch dir is stable per database and reused: materialize only rewrites files
+            // whose size/mtime differ from the DB and prunes entries the DB no longer has, so a
+            // repeat run costs a metadata walk instead of a full copy. Ephemeral runs still remove it.
+            let tmp = {
+                let d = selfdb::vm::cache_dir().join("scratch").join(selfdb::vm::path_key(&db));
+                std::fs::create_dir_all(&d)?;
+                d
+            };
             let n=selfdb::vm::vm_materialize_tree(&c, &tmp)?;
             eprintln!("materialized {} files -> {} (fallback, would be 0 with FUSE)", n, tmp.display());
             for d in ["proc","sys","dev","tmp"] { let _=std::fs::create_dir_all(tmp.join(d)); }

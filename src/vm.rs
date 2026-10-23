@@ -903,6 +903,9 @@ pub fn vm_import_closure(conn: &Connection, host_elf: &str, vm_prefix: &str) -> 
     let ld_dirs: Vec<PathBuf> = std::env::var("LD_LIBRARY_PATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect();
     let mut seen: FxHashMap<PathBuf, String> = FxHashMap::default();
     let mut order: Vec<PathBuf> = Vec::new();
+    // (host path where the soname was found, soname). The loader looks these names up, so each
+    // name that differs from its real file gets a link in the VM at the same location.
+    let mut soname_links: Vec<(PathBuf, String)> = Vec::new();
     let mut q: Vec<PathBuf> = vec![host_real.clone()];
     seen.insert(host_real.clone(), "exe".to_string()); order.push(host_real.clone());
     let mut qi=0;
@@ -910,10 +913,35 @@ pub fn vm_import_closure(conn: &Connection, host_elf: &str, vm_prefix: &str) -> 
         let cur = q[qi].clone(); qi+=1;
         let sdirs = crate::closure::search_dirs_for_cached(&cur, &[], &mut meta_cache, &mut search_cache, &ld_dirs);
         let sh = crate::closure::search_dirs_hash(&sdirs);
+        // PT_INTERP (e.g. /lib64/ld-linux-x86-64.so.2) is not a DT_NEEDED entry, but the kernel
+        // needs it at exactly that literal path to exec the object inside the VM. The literal
+        // path is imported as-is (keeping the host symlink, which points at the real file);
+        // the real file is queued like any other dependency so the link resolves.
+        if let Ok(data) = std::fs::read(&cur) {
+            if let Ok(elf) = goblin::elf::Elf::parse(&data) {
+                if let Some(interp) = elf.interpreter {
+                    let lit = PathBuf::from(interp);
+                    if lit.exists() {
+                        if !order.contains(&lit) {
+                            seen.insert(lit.clone(), "interp".to_string());
+                            order.push(lit.clone());
+                        }
+                        let real = std::fs::canonicalize(&lit).unwrap_or(lit.clone());
+                        if !seen.contains_key(&real) {
+                            seen.insert(real.clone(), "interp-target".to_string());
+                            order.push(real.clone());
+                            q.push(real);
+                        }
+                    }
+                }
+            }
+        }
         let needed = crate::elf::meta_for_path_cached(&cur, &mut meta_cache).needed.clone();
         for soname in needed {
-            if let Some(rp) = crate::closure::resolve_soname_cached(&soname, &sdirs, &mut resolve_cache, sh) {
-                let rp = std::fs::canonicalize(&rp).unwrap_or(rp);
+            if let Some(hit) = crate::closure::resolve_soname_cached(&soname, &sdirs, &mut resolve_cache, sh) {
+                // the name the loader asks for (may differ from the real file, e.g. libcap.so.2)
+                soname_links.push((hit.clone(), soname.clone()));
+                let rp = std::fs::canonicalize(&hit).unwrap_or(hit);
                 if !seen.contains_key(&rp) {
                     seen.insert(rp.clone(), "lib".to_string());
                     order.push(rp.clone());
@@ -923,9 +951,36 @@ pub fn vm_import_closure(conn: &Connection, host_elf: &str, vm_prefix: &str) -> 
         }
     }
     let prefix = normalize_vm_path(vm_prefix);
+    // DT_NEEDED names: link each soname to the real file it resolved to, at its host location.
+    // The name must exist in the VM: whether the host name equals the real file name does not
+    // matter (libcap.so.2 is a host link even though its name equals the hit path).
+    for (hit, name) in &soname_links {
+        let Some(parent) = hit.parent() else { continue };
+        let link_path = parent.join(name);
+        let link_s = link_path.to_string_lossy().to_string();
+        if vm_resolve(conn, &link_s).is_ok() { continue; }
+        let real = std::fs::canonicalize(hit).unwrap_or(hit.clone());
+        ensure_parent_dirs(conn, &link_s)?;
+        vm_add_symlink(conn, &link_s, &real.to_string_lossy())?;
+    }
+    // Interpreter literal paths are host symlinks, often relative (../lib/...). Inside the VM the
+    // target would resolve against a /lib alias that may not exist, so store the link with the
+    // absolute path of the real file, which is imported below.
+    let interp_literals: Vec<PathBuf> = order.iter().filter(|p| seen.get(*p).map(|k| k == "interp").unwrap_or(false)).cloned().collect();
+    for lit in interp_literals {
+        if let Ok(real) = std::fs::canonicalize(&lit) {
+            let md = std::fs::symlink_metadata(&lit)?;
+            if md.file_type().is_symlink() {
+                let lit_s = lit.to_string_lossy().to_string();
+                vm_add_symlink(conn, &lit_s, &real.to_string_lossy())?;
+            }
+        }
+    }
     for p in &order {
         let vm_path = if prefix == "/" { p.to_string_lossy().to_string() } else { format!("{}/{}", prefix.trim_end_matches('/'), p.file_name().unwrap().to_string_lossy()) };
         let target = p.to_string_lossy().to_string();
+        // interpreter literals were stored above as absolute links; do not overwrite them
+        if seen.get(p).map(|k| k == "interp").unwrap_or(false) { continue; }
         vm_add_file(conn, &target, &target)?;
         if vm_path != target {
             vm_add_file(conn, &target, &vm_path)?;
@@ -1272,9 +1327,37 @@ fn load_task_bytes<T: TaskLike>(db_path: Option<&str>, t: &T) -> Option<Vec<u8>>
 
 trait TaskLike { fn path_ref(&self) -> &str; }
 
+/// Remove host entries under `dest` that the DB no longer contains (files, dirs, symlinks).
+/// Without this, a reused scratch directory would keep deleted files, and the next sync-back
+/// would resurrect them. Only paths below `dest` are touched; children are removed before
+/// their parents, and a path the DB still has is kept.
+fn prune_scratch(conn: &Connection, dest: &Path) -> Result<usize> {
+    use std::collections::HashSet;
+    let mut keep: HashSet<String> = HashSet::new();
+    let mut st = conn.prepare("SELECT path FROM vm_fs")?;
+    for r in st.query_map([], |r| r.get::<_,String>(0))? { keep.insert(r?); }
+    let mut victims: Vec<PathBuf> = Vec::new();
+    for e in walkdir::WalkDir::new(dest).follow_links(false).min_depth(1).contents_first(true) {
+        let e = match e { Ok(v) => v, Err(_) => continue };
+        let rel = e.path().strip_prefix(dest).unwrap_or(e.path()).to_string_lossy().to_string();
+        let vm_p = normalize_vm_path(&format!("/{}", rel));
+        if vm_p == "/dev" || vm_p.starts_with("/dev/") || vm_p == "/proc" || vm_p.starts_with("/proc/")
+            || vm_p == "/sys" || vm_p.starts_with("/sys/") || vm_p == "/tmp" || vm_p.starts_with("/tmp/") { continue; }
+        if !keep.contains(&vm_p) { victims.push(e.path().to_path_buf()); }
+    }
+    let mut removed = 0usize;
+    for v in victims {
+        let md = match std::fs::symlink_metadata(&v) { Ok(m) => m, Err(_) => continue };
+        let ok = if md.is_dir() { std::fs::remove_dir(&v).or_else(|_| std::fs::remove_dir_all(&v)).is_ok() } else { std::fs::remove_file(&v).is_ok() };
+        if ok { removed += 1; }
+    }
+    Ok(removed)
+}
+
 pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
     use rayon::prelude::*;
     std::fs::create_dir_all(dest)?;
+    if dest.exists() { prune_scratch(conn, dest)?; }
     let mut st = conn.prepare("SELECT path, mode FROM vm_fs WHERE kind='dir' ORDER BY length(path), path")?;
     for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?)))? {
         let (p,mode)=r?;
