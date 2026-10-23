@@ -8,7 +8,10 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 
 pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
-pub const VM_USER_VERSION: u32 = 1;
+/// Schema versions (PRAGMA user_version):
+///   1 = legacy: FxHash text keys, no triggers, manual refcnt
+///   2 = triggers maintain vm_blobs.refcnt; vm_meta counters (blob_bytes/file_count/logical_bytes)
+pub const VM_USER_VERSION: u32 = 2;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -92,9 +95,74 @@ fn ensure_disk_blocks_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Upgrade schema in order. Each step runs in its own transaction; user_version is
+/// bumped inside the same transaction so a crash leaves the DB at the last good version.
+fn vm_migrate(conn: &Connection) -> Result<()> {
+    let mut ver: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if ver >= VM_USER_VERSION { return Ok(()); }
+    if ver == 0 { ver = 1; } // pre-versioned DBs are schema 1
+    while ver < VM_USER_VERSION {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let step: Result<()> = (|| {
+            match ver {
+                1 => migrate_1_to_2(conn)?,
+                v => return Err(anyhow!("no migration from schema {}", v)),
+            }
+            conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
+            Ok(())
+        })();
+        match step {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK;"); return Err(e); }
+        }
+        ver += 1;
+    }
+    Ok(())
+}
+
+/// 1 -> 2: triggers keep refcnt in sync with vm_fs; counters in vm_meta.
+fn migrate_1_to_2(conn: &Connection) -> Result<()> {
+    // Rebuild refcnt from scratch so any drift left by manual counting is corrected.
+    conn.execute_batch("UPDATE vm_blobs SET refcnt=0;
+        UPDATE vm_blobs SET refcnt=(SELECT count(*) FROM vm_fs f WHERE f.hash=vm_blobs.hash);
+        DELETE FROM vm_blobs WHERE refcnt=0;")?;
+    conn.execute_batch(VM_TRIGGERS_SQL)?;
+    conn.execute_batch(VM_COUNTERS_INIT_SQL)?;
+    Ok(())
+}
+
+const VM_TRIGGERS_SQL: &str = "
+CREATE TRIGGER IF NOT EXISTS vm_fs_hash_ins AFTER INSERT ON vm_fs WHEN NEW.hash IS NOT NULL
+BEGIN UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=NEW.hash; END;
+CREATE TRIGGER IF NOT EXISTS vm_fs_hash_del AFTER DELETE ON vm_fs WHEN OLD.hash IS NOT NULL
+BEGIN
+  UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=OLD.hash;
+  DELETE FROM vm_blobs WHERE hash=OLD.hash AND refcnt<=0;
+END;
+CREATE TRIGGER IF NOT EXISTS vm_fs_hash_upd AFTER UPDATE OF hash ON vm_fs WHEN OLD.hash IS NOT NEW.hash
+BEGIN
+  UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=OLD.hash AND OLD.hash IS NOT NULL;
+  DELETE FROM vm_blobs WHERE hash=OLD.hash AND refcnt<=0 AND OLD.hash IS NOT NULL;
+  UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=NEW.hash AND NEW.hash IS NOT NULL;
+END;
+";
+
+const VM_COUNTERS_INIT_SQL: &str = "
+INSERT OR REPLACE INTO vm_meta(key,value)
+  SELECT 'file_count', CAST(count(*) AS TEXT) FROM vm_fs;
+INSERT OR REPLACE INTO vm_meta(key,value)
+  SELECT 'logical_bytes', CAST(COALESCE(sum(size),0) AS TEXT) FROM vm_fs WHERE kind='file';
+INSERT OR REPLACE INTO vm_meta(key,value)
+  SELECT 'blob_bytes', CAST(COALESCE(sum(length(content)),0) AS TEXT) FROM vm_blobs;
+";
+
 pub fn vm_open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     let _ = vm_apply_pragmas(&conn);
+    // Brand-new DBs get the current schema directly; existing ones are upgraded in order.
+    let fresh = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='vm_fs'", [], |r| r.get::<_,i64>(0))? == 0;
+    if fresh { return Err(anyhow!("not a VM database: {}", path)); }
+    vm_migrate(&conn)?;
     let cols: Vec<String> = {
         let mut st = conn.prepare("PRAGMA table_info(vm_fs)")?;
         let mut out=Vec::new();
@@ -182,7 +250,9 @@ CREATE TABLE IF NOT EXISTS vm_disk_blocks(
   compressed INTEGER NOT NULL DEFAULT 0,
   raw_size INTEGER NOT NULL
 );
-"#, app=VM_APP_ID, ver=VM_USER_VERSION)
+{triggers}
+{counters}
+"#, app=VM_APP_ID, ver=VM_USER_VERSION, triggers=VM_TRIGGERS_SQL, counters=VM_COUNTERS_INIT_SQL)
 }
 
 pub fn init_vm_db_with_opts(path: &str, overwrite: bool, vm_only: bool) -> Result<Connection> {
@@ -452,61 +522,62 @@ pub fn decompress_bytes_cached(hash: &str, data: &[u8], compressed: i64) -> Arc<
     raw
 }
 
+/// Ensure a blob row exists for `hash` (refcnt starts at 0; triggers count references).
+fn blob_ensure(conn: &Connection, hash: &str, data: &[u8]) -> Result<i64> {
+    if let Some(flag) = conn.query_row("SELECT compressed FROM vm_blobs WHERE hash=?1", params![hash], |r| r.get::<_,i64>(0)).optional()? {
+        return Ok(flag);
+    }
+    let (body, flag) = match compress_bytes_with_conn(conn, data) {
+        Some((c, f)) => (c, f),
+        None => (data.to_vec(), 0),
+    };
+    conn.execute("INSERT INTO vm_blobs(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,?3,?4,0)",
+        params![hash, body, flag, data.len() as i64])?;
+    let cache_p = cache_path_for_hash(hash);
+    if !cache_p.exists() {
+        if let Some(par)=cache_p.parent(){ let _ = std::fs::create_dir_all(par); }
+        let _ = std::fs::write(&cache_p, data);
+    }
+    Ok(flag)
+}
+
+/// Upsert a regular-file row. Hash-change refcounting is done by vm_fs_hash_upd.
+fn fs_put_file(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, data: &[u8]) -> Result<()> {
+    let hash = fx_hash_u64(data);
+    let flag = blob_ensure(conn, &hash, data)?;
+    conn.execute(
+        "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,NULL,?6,NULL)
+         ON CONFLICT(path) DO UPDATE SET kind='file', mode=excluded.mode, mtime=excluded.mtime, size=excluded.size,
+            hash=excluded.hash, content=NULL, compressed=excluded.compressed, link_target=NULL",
+        params![vm_p, mode, mtime, data.len() as i64, hash, flag])?;
+    Ok(())
+}
+
+/// Upsert a non-file row (dir/symlink). Any previous hash is released by the UPDATE trigger.
+fn fs_put_node(conn: &Connection, vm_p: &str, kind: &str, mode: i64, mtime: i64, link: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,?2,?3,?4,0,NULL,NULL,0,?5)
+         ON CONFLICT(path) DO UPDATE SET kind=excluded.kind, mode=excluded.mode, mtime=excluded.mtime, size=0,
+            hash=NULL, content=NULL, compressed=0, link_target=excluded.link_target",
+        params![vm_p, kind, mode, mtime, link])?;
+    Ok(())
+}
+
 pub fn vm_add_bytes(conn: &Connection, vm_path: &str, data: &[u8], mode: i64, mtime: i64) -> Result<()> {
     let vm_p = normalize_vm_path(vm_path);
     ensure_parent_dirs(conn, &vm_p)?;
-    let hash = fx_hash_u64(data);
-    let blob_exists: bool = conn.query_row("SELECT 1 FROM vm_blobs WHERE hash=?1", params![hash], |_| Ok(1)).optional()?.is_some();
-    let mut inserted_compressed: i64 = 0;
-    if !blob_exists {
-        if let Some((comp, flag)) = compress_bytes_with_conn(conn, data) {
-            inserted_compressed = flag;
-            // store compressed blob with flag 2=zstd or 3=zstd+dict
-            conn.execute("INSERT OR IGNORE INTO vm_blobs(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,?3,?4,1)", params![hash, comp, flag, data.len() as i64])?;
-        } else {
-            inserted_compressed = 0;
-            conn.execute("INSERT OR IGNORE INTO vm_blobs(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,0,?3,1)", params![hash, data, data.len() as i64])?;
-        }
-        let cache_p = cache_path_for_hash(&hash);
-        if !cache_p.exists() {
-            if let Some(par)=cache_p.parent(){ let _ = std::fs::create_dir_all(par); }
-            let _ = std::fs::write(&cache_p, data);
-        }
-    } else {
-        // bump refcnt
-        let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=?1", params![hash]);
-    }
-    // vm_fs row: store null content to leverage dedup, but keep size/mtime/hash for fast stat
-    // For backward compat readers that expect content, we keep hash and allow vm_resolve to fetch from blobs
-    // If blob was gz legacy we still handle; new ones are zstd
-    // Check existing path to handle refcnt decrement on overwrite
-    let old_hash: Option<String> = conn.query_row("SELECT hash FROM vm_fs WHERE path=?1", params![vm_p], |r| r.get(0)).optional()?;
-    if let Some(oh) = old_hash {
-        if oh != hash {
-            let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![oh]);
-            let _ = conn.execute("DELETE FROM vm_blobs WHERE hash=?1 AND refcnt<=0", params![oh]);
-        } else {
-            // same content overwrite, avoid double refcnt bump
-            let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![hash]);
-        }
-    }
-    let fs_flag = if blob_exists { conn.query_row("SELECT compressed FROM vm_blobs WHERE hash=?1", params![hash], |r| r.get::<_,i64>(0)).unwrap_or(2) } else { inserted_compressed };
-    conn.execute("INSERT OR REPLACE INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed) VALUES (?1,'file',?2,?3,?4,?5,NULL,?6)", params![vm_p, mode, mtime, data.len() as i64, hash, fs_flag])?;
-    Ok(())
+    fs_put_file(conn, &vm_p, mode, mtime, data)
 }
+
 pub fn vm_add_symlink(conn: &Connection, vm_path: &str, target: &str) -> Result<()> {
     let vm_p = normalize_vm_path(vm_path);
     ensure_parent_dirs(conn, &vm_p)?;
-    let old_hash: Option<String> = conn.query_row("SELECT hash FROM vm_fs WHERE path=?1 AND kind='file'", params![vm_p], |r| r.get(0)).optional()?;
-    if let Some(h) = old_hash { let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![h]); let _ = conn.execute("DELETE FROM vm_blobs WHERE hash=?1 AND refcnt<=0", params![h]); }
-    conn.execute("INSERT OR REPLACE INTO vm_fs(path,kind,mode,mtime,size,link_target,compressed,hash,content) VALUES (?1,'symlink',493,?2,0,?3,0,NULL,NULL)", params![vm_p, now_secs(), target])?;
-    Ok(())
+    fs_put_node(conn, &vm_p, "symlink", 493, now_secs(), Some(target))
 }
 pub fn vm_add_dir(conn: &Connection, vm_path: &str, mode: i64, mtime: i64) -> Result<()> {
     let vm_p = normalize_vm_path(vm_path);
     ensure_parent_dirs(conn, &vm_p)?;
-    conn.execute("INSERT OR IGNORE INTO vm_fs(path,kind,mode,mtime,size,compressed,content,hash) VALUES (?1,'dir',?2,?3,0,0,NULL,NULL)", params![vm_p, mode, mtime])?;
-    Ok(())
+    fs_put_node(conn, &vm_p, "dir", mode, mtime, None)
 }
 pub fn vm_add_file(conn: &Connection, host_path: &str, vm_path: &str) -> Result<()> {
     let hp = Path::new(host_path);
@@ -517,7 +588,7 @@ pub fn vm_add_file(conn: &Connection, host_path: &str, vm_path: &str) -> Result<
     #[cfg(unix)] let mode = { use std::os::unix::fs::PermissionsExt; md.permissions().mode() as i64 };
     #[cfg(not(unix))] let mode = 420;
     if md.is_dir() {
-        conn.execute("INSERT OR REPLACE INTO vm_fs(path,kind,mode,mtime,size,compressed) VALUES (?1,'dir',?2,?3,0,0)", params![vm_p, mode, mtime])?;
+        fs_put_node(conn, &vm_p, "dir", mode, mtime, None)?;
         for entry in std::fs::read_dir(hp)? {
             let e = entry?;
             let child_host = e.path().to_string_lossy().to_string();
@@ -529,8 +600,7 @@ pub fn vm_add_file(conn: &Connection, host_path: &str, vm_path: &str) -> Result<
     }
     if md.file_type().is_symlink() {
         let target = std::fs::read_link(hp)?.to_string_lossy().to_string();
-        let perm = 0o777;
-        conn.execute("INSERT OR REPLACE INTO vm_fs(path,kind,mode,mtime,size,link_target,compressed) VALUES (?1,'symlink',?2,?3,0,?4,0)", params![vm_p, perm, mtime, target])?;
+        fs_put_node(conn, &vm_p, "symlink", 0o777, mtime, Some(&target))?;
         return Ok(());
     }
     let data = std::fs::read(hp)?;
@@ -886,10 +956,10 @@ pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,u
             None => {
                 if kind == "symlink" {
                     let target = String::from_utf8_lossy(data).to_string();
-                    let _ = conn.execute("INSERT OR REPLACE INTO vm_fs(path,kind,mode,mtime,size,link_target,compressed) VALUES (?1,'symlink',?2,?3,0,?4,0)", params![vm_p, *mode, now_secs(), target]);
+                    let _ = fs_put_node(conn, vm_p, "symlink", *mode, now_secs(), Some(&target));
                     created+=1;
                 } else if kind == "dir" {
-                    let _ = conn.execute("INSERT OR IGNORE INTO vm_fs(path,kind,mode,mtime,size,compressed) VALUES (?1,'dir',?2,?3,0,0)", params![vm_p, *mode, now_secs()]);
+                    let _ = fs_put_node(conn, vm_p, "dir", *mode, now_secs(), None);
                     created+=1;
                 } else {
                     // use vm_add_bytes dedup path without extra blob fetch
@@ -901,18 +971,14 @@ pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,u
                 if db_kind != kind {
                     if kind == "symlink" {
                         let target = String::from_utf8_lossy(data).to_string();
-                        // decrement old blob refcnt
-                        if let Some(h) = db_hash { let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![h]); let _ = conn.execute("DELETE FROM vm_blobs WHERE hash=?1 AND refcnt<=0", params![h]); }
-                        let _ = conn.execute("INSERT OR REPLACE INTO vm_fs(path,kind,mode,mtime,size,link_target,compressed,hash,content) VALUES (?1,'symlink',?2,?3,0,?4,0,NULL,NULL)", params![vm_p, *mode, now_secs(), target]);
+                        let _ = fs_put_node(conn, vm_p, "symlink", *mode, now_secs(), Some(&target));
                     } else if kind == "dir" {
-                        if let Some(h) = db_hash { let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![h]); let _ = conn.execute("DELETE FROM vm_blobs WHERE hash=?1 AND refcnt<=0", params![h]); }
-                        let _ = conn.execute("INSERT OR REPLACE INTO vm_fs(path,kind,mode,mtime,size,compressed,hash,content) VALUES (?1,'dir',?2,?3,0,0,NULL,NULL)", params![vm_p, *mode, now_secs()]);
+                        let _ = fs_put_node(conn, vm_p, "dir", *mode, now_secs(), None);
                     } else {
                         let hash = fx_hash_u64(data);
                         let need = db_hash.as_deref()!=Some(&hash) || db_mode!=mode || db_size!=&(data.len() as i64);
                         if need {
-                            if let Some(h)=db_hash { let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![h]); }
-                            let _ = vm_add_bytes(conn, vm_p, data, *mode, now_secs());
+                                let _ = fs_put_file(conn, vm_p, *mode, now_secs(), data);
                             updated+=1;
                         }
                     }
@@ -950,11 +1016,9 @@ pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,u
         }
     }
     for p in to_delete {
-        let hash: Option<String> = conn.query_row("SELECT hash FROM vm_fs WHERE path=?1", params![p.clone()], |r| r.get(0)).optional()?.flatten();
-        let kind: Option<String> = conn.query_row("SELECT kind FROM vm_fs WHERE path=?1", params![p.clone()], |r| r.get(0)).optional()?;
-        let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1", params![p.clone()]);
-        if let Some(k)=kind { if k=="dir" { let _ = conn.execute("DELETE FROM vm_fs WHERE path LIKE ?1", params![format!("{}/%", p)]); } }
-        if let Some(h)=hash { let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![h]); let _ = conn.execute("DELETE FROM vm_blobs WHERE hash=?1 AND refcnt<=0", params![h]); }
+        // DELETE fires vm_fs_hash_del, which releases the blob reference.
+        // prefix match via substr (LIKE treats _ and % as wildcards)
+        let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1 OR substr(path,1,?2)=?3", params![p.clone(), p.len() as i64 + 1, format!("{}/", p)]);
         deleted+=1;
     }
     conn.execute_batch("COMMIT;")?;
@@ -985,26 +1049,19 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
         let raw = decompress_bytes_raw(&data, cflag).unwrap_or(data.clone());
         before += data.len() as i64;
         let hash = fx_hash_u64(&raw);
-        let exists: bool = conn.query_row("SELECT 1 FROM vm_blobs WHERE hash=?1", params![hash], |_| Ok(1)).optional()?.is_some();
-        if !exists {
-            if let Some((z, flag)) = compress_bytes_with_conn(conn, &raw) {
-                after += z.len() as i64;
-                let _ = conn.execute("INSERT OR IGNORE INTO vm_blobs(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,?3,?4,1)", params![hash, z, flag, raw.len() as i64]);
-            } else {
+        let sz_before: Option<i64> = conn.query_row("SELECT length(content) FROM vm_blobs WHERE hash=?1", params![hash], |r| r.get(0)).optional()?;
+        match sz_before {
+            Some(sz) => after += sz,
+            None => {
+                // blob row missing (legacy hash): create it; refcount follows from vm_fs rows via triggers
+                blob_ensure(conn, &hash, &raw)?;
                 after += raw.len() as i64;
-                let _ = conn.execute("INSERT OR IGNORE INTO vm_blobs(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,0,?3,1)", params![hash, raw, raw.len() as i64]);
             }
-        } else {
-            let sz: Option<i64> = conn.query_row("SELECT length(content) FROM vm_blobs WHERE hash=?1", params![hash], |r| r.get(0)).optional()?;
-            after += sz.unwrap_or(raw.len() as i64);
-            let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=?1", params![hash]);
         }
-        let old_hash: Option<String> = conn.query_row("SELECT hash FROM vm_fs WHERE path=?1", params![path.clone()], |r| r.get(0)).optional()?.flatten();
-        if old_hash.as_deref() != Some(&hash) {
-            if let Some(oh) = old_hash { if oh!=hash { let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![oh]); let _ = conn.execute("DELETE FROM vm_blobs WHERE hash=?1 AND refcnt<=0", params![oh]); } }
-        }
+        // move inline content onto the blob: hash column now references it, content becomes NULL.
+        // The UPDATE trigger adds the reference (old hash was NULL for legacy rows).
         let blob_flag: i64 = conn.query_row("SELECT compressed FROM vm_blobs WHERE hash=?1", params![hash.clone()], |r| r.get(0)).unwrap_or(2);
-        let _ = conn.execute("UPDATE vm_fs SET hash=?2, content=NULL, compressed=?3, size=?4 WHERE path=?1", params![path, hash, blob_flag, raw.len() as i64]);
+        conn.execute("UPDATE vm_fs SET hash=?2, content=NULL, compressed=?3, size=?4 WHERE path=?1", params![path, hash, blob_flag, raw.len() as i64])?;
         n+=1;
     }
     // also recompress blobs that are gz
@@ -1302,8 +1359,7 @@ pub fn vm_restore_file(db_path: &str, name: &str) -> Result<()> {
     if !Path::new(&snap_path).exists() { return Err(anyhow!("snapshot not found: {}", snap_path)); }
     std::fs::copy(&snap_path, db_path).map_err(|e| anyhow!("restore failed: {}", e))?;
     // auto VACUUM + incremental after restore to reclaim freelist
-    if let Ok(conn) = Connection::open(db_path) {
-        let _ = vm_apply_pragmas(&conn);
+    if let Ok(conn) = vm_open(db_path) {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
         let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
     }

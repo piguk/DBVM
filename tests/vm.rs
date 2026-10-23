@@ -150,3 +150,47 @@ fn materialize_streams_large_and_refreshes_changed() {
     vm::vm_materialize_tree(&c, &dest).unwrap();
     assert_eq!(std::fs::read(dest.join("big.bin")).unwrap(), new);
 }
+
+/// Invariant: every blob's refcnt equals the number of vm_fs rows referencing it, and
+/// no unreferenced blob survives. Checked after each mutation.
+fn assert_refcounts(c: &rusqlite::Connection) {
+    let bad: i64 = c.query_row(
+        "SELECT count(*) FROM vm_blobs b WHERE b.refcnt != (SELECT count(*) FROM vm_fs f WHERE f.hash = b.hash)",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(bad, 0, "refcnt drift detected");
+}
+
+#[test]
+fn refcounts_follow_every_mutation() {
+    let (_g, db) = tmpdb("rc");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/a", &vec![1u8; 3000], 0o644, 1).unwrap(); assert_refcounts(&c);
+    vm::vm_add_bytes(&c, "/b", &vec![1u8; 3000], 0o644, 1).unwrap(); assert_refcounts(&c);
+    vm::vm_add_bytes(&c, "/a", &vec![2u8; 3000], 0o644, 2).unwrap(); assert_refcounts(&c);
+    vm::vm_add_bytes(&c, "/a", &vec![2u8; 3000], 0o600, 3).unwrap(); assert_refcounts(&c); // same content
+    vm::vm_add_symlink(&c, "/b", "/a").unwrap(); assert_refcounts(&c);                     // file -> symlink
+    vm::vm_add_bytes(&c, "/b", &vec![9u8; 500], 0o644, 4).unwrap(); assert_refcounts(&c);  // symlink -> file
+    vm::vm_add_dir(&c, "/d", 0o755, 1).unwrap(); assert_refcounts(&c);
+    vm::vm_add_bytes(&c, "/d/x", &vec![3u8; 900], 0o644, 1).unwrap(); assert_refcounts(&c);
+    c.execute("DELETE FROM vm_fs WHERE path='/d' OR substr(path,1,3)='/d/'", []).unwrap(); assert_refcounts(&c);
+    c.execute("DELETE FROM vm_fs WHERE path='/a'", []).unwrap(); assert_refcounts(&c);
+    let n: i64 = c.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1, "only /b's blob should remain");
+}
+
+#[test]
+fn sync_updates_keep_refcounts_exact() {
+    let (_g, db) = tmpdb("rc-sync");
+    let host = _g.path().join("root");
+    std::fs::create_dir_all(host.join("etc")).unwrap();
+    std::fs::write(host.join("etc/a"), b"one").unwrap();
+    std::fs::write(host.join("etc/b"), b"one").unwrap();
+    let c = open(&db);
+    vm::vm_sync_from_host(&c, &host).unwrap(); assert_refcounts(&c);
+    std::fs::write(host.join("etc/a"), b"two two").unwrap();
+    vm::vm_sync_from_host(&c, &host).unwrap(); assert_refcounts(&c);
+    std::fs::remove_file(host.join("etc/b")).unwrap();
+    vm::vm_sync_from_host(&c, &host).unwrap(); assert_refcounts(&c);
+    let n: i64 = c.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1);
+}

@@ -484,10 +484,8 @@ pub mod fuse_impl {
             let kind = self.ino_to_kind.get(&ino).cloned().unwrap_or_default();
             if kind == "dir" { reply.error(libc::EISDIR); return; }
             let conn = &self.conn;
-            // handle blob refcnt like vm_sync does
-            let hash: Option<String> = conn.query_row("SELECT hash FROM vm_fs WHERE path=?1", params![norm.clone()], |r| r.get(0)).ok().flatten();
+            // DELETE fires vm_fs_hash_del, which releases the blob reference
             let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1", params![norm.clone()]);
-            if let Some(h) = hash { let _ = conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![h]); let _ = conn.execute("DELETE FROM vm_blobs WHERE hash=?1 AND refcnt<=0", params![h]); }
             self.path_to_ino.remove(&norm);
             self.ino_to_path.remove(&ino);
             self.ino_to_kind.remove(&ino);
@@ -570,9 +568,7 @@ pub mod fuse_impl {
                     let kind = self.ino_to_kind.get(&ino).cloned().unwrap_or_default();
                     if kind == "dir" { reply.error(libc::EEXIST); return; }
                     let conn = &self.conn;
-                    let h: Option<String> = conn.query_row("SELECT hash FROM vm_fs WHERE path=?1", params![new_path.clone()], |r| r.get(0)).ok().flatten();
                     let _ = conn.execute("DELETE FROM vm_fs WHERE path=?1", params![new_path.clone()]);
-                    if let Some(hash)=h { let _=conn.execute("UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=?1", params![hash]); let _=conn.execute("DELETE FROM vm_blobs WHERE hash=?1 AND refcnt<=0", params![hash]);}
                     let old_ino = self.path_to_ino.remove(&new_path).unwrap();
                     self.ino_to_path.remove(&old_ino);
                     self.ino_to_kind.remove(&old_ino);
