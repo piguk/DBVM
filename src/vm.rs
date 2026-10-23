@@ -12,7 +12,9 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///   1 = legacy: FxHash text keys, no triggers, manual refcnt
 ///   2 = triggers maintain vm_blobs.refcnt
 ///   3 = triggers maintain vm_meta counters (blob_bytes/file_count/logical_bytes)
-pub const VM_USER_VERSION: u32 = 3;
+///   4 = blob keys are raw 32-byte SHA-256 BLOBs (UNIQUE); vm_blobs keeps a rowid so large
+///       content is not stored inside a key B-tree (WITHOUT ROWID measured no smaller)
+pub const VM_USER_VERSION: u32 = 4;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -69,19 +71,6 @@ pub fn vm_apply_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn ensure_blob_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS vm_blobs(
-            hash TEXT PRIMARY KEY,
-            content BLOB NOT NULL,
-            compressed INTEGER NOT NULL DEFAULT 0,
-            raw_size INTEGER NOT NULL,
-            refcnt INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE INDEX IF NOT EXISTS idx_vm_blobs_refcnt ON vm_blobs(refcnt);"
-    )?;
-    Ok(())
-}
 
 fn ensure_dict_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -108,6 +97,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
             match ver {
                 1 => migrate_1_to_2(conn)?,
                 2 => migrate_2_to_3(conn)?,
+                3 => migrate_3_to_4(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -129,6 +119,58 @@ fn migrate_1_to_2(conn: &Connection) -> Result<()> {
         UPDATE vm_blobs SET refcnt=(SELECT count(*) FROM vm_fs f WHERE f.hash=vm_blobs.hash);
         DELETE FROM vm_blobs WHERE refcnt=0;")?;
     conn.execute_batch(VM_TRIGGERS_SQL)?;
+    Ok(())
+}
+
+/// 3 -> 4: re-key every blob by sha256(raw content) as a 32-byte BLOB, rebuild vm_blobs
+/// as WITHOUT ROWID, and rewrite vm_fs.hash. Triggers are dropped during the rewrite and
+/// recreated afterwards; refcnt is recomputed from vm_fs, so no drift survives.
+fn migrate_3_to_4(conn: &Connection) -> Result<()> {
+    conn.execute_batch("
+        DROP TRIGGER IF EXISTS vm_fs_hash_ins; DROP TRIGGER IF EXISTS vm_fs_hash_del; DROP TRIGGER IF EXISTS vm_fs_hash_upd;
+        DROP TRIGGER IF EXISTS vm_cnt_blob_ins; DROP TRIGGER IF EXISTS vm_cnt_blob_del; DROP TRIGGER IF EXISTS vm_cnt_blob_upd;
+        DROP TABLE IF EXISTS vm_key_map;
+        CREATE TEMP TABLE vm_key_map(old_key TEXT PRIMARY KEY, new_key BLOB NOT NULL);
+        CREATE TABLE vm_blobs_v4(
+            id INTEGER PRIMARY KEY,
+            hash BLOB UNIQUE NOT NULL,
+            content BLOB NOT NULL,
+            compressed INTEGER NOT NULL DEFAULT 0,
+            raw_size INTEGER NOT NULL,
+            refcnt INTEGER NOT NULL DEFAULT 0
+        );")?;
+
+    // Re-key blob by sha256 of raw bytes. Stored bytes are kept as-is (same compression).
+    let old: Vec<(String, Vec<u8>, i64)> = {
+        let mut st = conn.prepare("SELECT hash, content, compressed FROM vm_blobs")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (old_key, content, comp) in old {
+        let raw = decompress_bytes_raw(&content, comp)
+            .map_err(|e| anyhow!("migration: blob {} undecodable: {}", old_key, e))?;
+        let key = blob_key(&raw);
+        conn.prepare_cached("INSERT OR IGNORE INTO vm_blobs_v4(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,?3,?4,0)")?
+            .execute(params![key.to_vec(), content, comp, raw.len() as i64])?;
+        conn.prepare_cached("INSERT OR REPLACE INTO vm_key_map(old_key, new_key) VALUES (?1,?2)")?
+            .execute(params![old_key, key.to_vec()])?;
+    }
+
+    // Rewrite references. Unmapped (dangling) hashes become NULL rather than pointing nowhere.
+    conn.execute_batch("
+        UPDATE vm_fs SET hash = (SELECT new_key FROM vm_key_map m WHERE m.old_key = vm_fs.hash)
+          WHERE hash IS NOT NULL;
+        DROP TABLE vm_blobs;
+        ALTER TABLE vm_blobs_v4 RENAME TO vm_blobs;
+        DROP TABLE vm_key_map;
+        UPDATE vm_blobs SET refcnt = (SELECT count(*) FROM vm_fs f WHERE f.hash = vm_blobs.hash);
+        DELETE FROM vm_blobs WHERE refcnt = 0;
+        CREATE INDEX IF NOT EXISTS idx_vm_blobs_refcnt ON vm_blobs(refcnt);
+        CREATE INDEX IF NOT EXISTS idx_vm_fs_hash ON vm_fs(hash);
+    ")?;
+    conn.execute_batch(VM_TRIGGERS_SQL)?;
+    conn.execute_batch(VM_COUNTER_TRIGGERS_SQL)?;
+    conn.execute_batch(VM_COUNTERS_INIT_SQL)?;
     Ok(())
 }
 
@@ -216,7 +258,6 @@ pub fn vm_open(path: &str) -> Result<Connection> {
     }
     let _ = conn.prepare_cached("CREATE INDEX IF NOT EXISTS idx_vm_fs_path ON vm_fs(path)")?.execute( []);
     let _ = conn.prepare_cached("CREATE INDEX IF NOT EXISTS idx_vm_fs_hash ON vm_fs(hash)")?.execute( []);
-    ensure_blob_table(&conn)?;
     ensure_dict_table(&conn)?;
     let _ = ensure_disk_blocks_table(&conn);
     // load dict into global cache for decompress of flag 3
@@ -232,11 +273,12 @@ PRAGMA application_id = {app};
 PRAGMA user_version = {ver};
 CREATE TABLE IF NOT EXISTS vm_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS vm_blobs(
-    hash TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
+    hash BLOB UNIQUE NOT NULL,
     content BLOB NOT NULL,
     compressed INTEGER NOT NULL DEFAULT 0,
     raw_size INTEGER NOT NULL,
-    refcnt INTEGER NOT NULL DEFAULT 1
+    refcnt INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_vm_blobs_refcnt ON vm_blobs(refcnt);
 CREATE TABLE IF NOT EXISTS vm_fs(
@@ -381,12 +423,22 @@ pub fn fx_hash(data: &[u8]) -> u64 {
     data.hash(&mut h);
     h.finish()
 }
-/// Content identity for blobs: SHA-256 hex (collision-safe dedup key).
-pub fn fx_hash_u64(data: &[u8]) -> String {
+/// Content identity: raw SHA-256 (32 bytes). Stored as BLOB in vm_blobs / vm_fs.
+pub type BlobKey = [u8; 32];
+pub fn blob_key(data: &[u8]) -> BlobKey {
     use sha2::{Digest, Sha256};
-    let d = Sha256::digest(data);
-    d.iter().map(|b| format!("{:02x}", b)).collect()
+    Sha256::digest(data).into()
 }
+pub fn key_hex(k: &BlobKey) -> String { k.iter().map(|b| format!("{:02x}", b)).collect() }
+/// Parse 64-char hex back into a key.
+pub fn hex_to_key(h: &str) -> Option<BlobKey> {
+    if h.len() != 64 { return None; }
+    let mut k = [0u8; 32];
+    for i in 0..32 { k[i] = u8::from_str_radix(&h[2*i..2*i+2], 16).ok()?; }
+    Some(k)
+}
+/// Hex text of the content hash (CLI output and cache file names only).
+pub fn fx_hash_u64(data: &[u8]) -> String { key_hex(&blob_key(data)) }
 /// Short non-crypto key for a DB path (history/cache dir naming only).
 pub fn path_key(p: &str) -> String { format!("{:x}", fx_hash(p.as_bytes())) }
 
@@ -404,16 +456,17 @@ pub fn vm_train_dict(conn: &Connection, max_dict_size: usize) -> Result<Option<V
     // collect raw samples: files with raw_size between 256 and 16384, up to 120 samples
     let mut samples: Vec<Vec<u8>> = Vec::new();
     let mut total_raw: usize = 0;
-    // Sample without a full-table sort: start at a pseudo-random rowid (seconds-based; only
-    // affects which samples are chosen, not correctness), read forward, wrap once.
-    let max_id: i64 = conn.prepare_cached("SELECT COALESCE(MAX(rowid),0) FROM vm_blobs")?.query_row( [], |r| r.get(0))?;
-    let start: i64 = if max_id > 0 { (now_secs().wrapping_mul(2654435761) as i64).rem_euclid(max_id) + 1 } else { 1 };
+    // Sample without a full-table sort. vm_blobs is WITHOUT ROWID (clustered by hash), so
+    // start at a pseudo-random key prefix and read forward, wrapping once. Seeded from time:
+    // only affects which samples are chosen, not correctness.
+    let seed = (now_secs() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let start: Vec<u8> = seed.to_be_bytes().iter().chain(seed.rotate_left(17).to_be_bytes().iter()).cloned().chain(std::iter::repeat(0u8)).take(32).collect();
     let mut rows: Vec<(Vec<u8>, i64)> = Vec::new();
     {
-        let mut st = conn.prepare("SELECT content, compressed FROM vm_blobs WHERE rowid >= ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT 150")?;
+        let mut st = conn.prepare_cached("SELECT content, compressed FROM vm_blobs WHERE hash >= ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT 150")?;
         for r in st.query_map(params![start], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?)))? { rows.push(r?); }
         if rows.len() < 150 {
-            let mut st = conn.prepare("SELECT content, compressed FROM vm_blobs WHERE rowid < ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT ?2")?;
+            let mut st = conn.prepare_cached("SELECT content, compressed FROM vm_blobs WHERE hash < ?1 AND raw_size BETWEEN 256 AND 16383 LIMIT ?2")?;
             for r in st.query_map(params![start, 150 - rows.len() as i64], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,i64>(1)?)))? { rows.push(r?); }
         }
     }
@@ -505,8 +558,20 @@ pub fn compress_bytes_with_conn(conn: &Connection, data: &[u8]) -> Option<(Vec<u
     }
     best
 }
+/// Decompressed size from the zstd frame header. Never truncates: a missing or implausible
+/// header is an error, and the output buffer is sized to exactly the declared content size.
+fn zstd_frame_size(data: &[u8]) -> Result<usize> {
+    match zstd::zstd_safe::get_frame_content_size(data) {
+        Ok(Some(n)) => usize::try_from(n).map_err(|_| anyhow!("zstd frame size {} too large", n)),
+        Ok(None) => Err(anyhow!("zstd frame has no content size; refusing to guess")),
+        Err(_) => Err(anyhow!("not a zstd frame")),
+    }
+}
 pub fn decompress_bytes_zstd(data: &[u8]) -> Result<Vec<u8>> {
-    Ok(zstd::bulk::decompress(data, 32*1024*1024)?)
+    let n = zstd_frame_size(data)?;
+    let out = zstd::bulk::decompress(data, n)?;
+    if out.len() != n { return Err(anyhow!("zstd short read: {} of {}", out.len(), n)); }
+    Ok(out)
 }
 static VM_DICT_GLOBAL: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
 fn vm_dict_global() -> &'static Mutex<Option<Vec<u8>>> {
@@ -524,8 +589,11 @@ pub fn vm_dict_load_global(conn: &Connection) {
     }
 }
 pub fn decompress_bytes_zstd_with_dict(data: &[u8], dict: &[u8]) -> Result<Vec<u8>> {
+    let n = zstd_frame_size(data)?;
     let mut dec = zstd::bulk::Decompressor::with_dictionary(dict).map_err(|e| anyhow!("{}", e))?;
-    Ok(dec.decompress(data, 32*1024*1024).map_err(|e| anyhow!("{}", e))?)
+    let out = dec.decompress(data, n).map_err(|e| anyhow!("{}", e))?;
+    if out.len() != n { return Err(anyhow!("zstd+dict short read: {} of {}", out.len(), n)); }
+    Ok(out)
 }
 pub fn decompress_bytes_raw(data: &[u8], compressed: i64) -> Result<Vec<u8>> {
     if compressed == 3 {
@@ -564,9 +632,9 @@ pub fn decompress_bytes_cached(hash: &str, data: &[u8], compressed: i64) -> Arc<
     raw
 }
 
-/// Ensure a blob row exists for `hash` (refcnt starts at 0; triggers count references).
-fn blob_ensure(conn: &Connection, hash: &str, data: &[u8]) -> Result<i64> {
-    if let Some(flag) = conn.prepare_cached("SELECT compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![hash], |r| r.get::<_,i64>(0)).optional()? {
+/// Ensure a blob row exists for `key` (refcnt starts at 0; triggers count references).
+fn blob_ensure(conn: &Connection, key: &BlobKey, data: &[u8]) -> Result<i64> {
+    if let Some(flag) = conn.prepare_cached("SELECT compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![key.as_slice()], |r| r.get::<_,i64>(0)).optional()? {
         return Ok(flag);
     }
     let (body, flag) = match compress_bytes_with_conn(conn, data) {
@@ -574,8 +642,8 @@ fn blob_ensure(conn: &Connection, hash: &str, data: &[u8]) -> Result<i64> {
         None => (data.to_vec(), 0),
     };
     conn.prepare_cached("INSERT INTO vm_blobs(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,?3,?4,0)")?.execute(
-        params![hash, body, flag, data.len() as i64])?;
-    let cache_p = cache_path_for_hash(hash);
+        params![key.as_slice(), body, flag, data.len() as i64])?;
+    let cache_p = cache_path_for_hash(&key_hex(key));
     if !cache_p.exists() {
         if let Some(par)=cache_p.parent(){ let _ = std::fs::create_dir_all(par); }
         let _ = std::fs::write(&cache_p, data);
@@ -585,13 +653,13 @@ fn blob_ensure(conn: &Connection, hash: &str, data: &[u8]) -> Result<i64> {
 
 /// Upsert a regular-file row. Hash-change refcounting is done by vm_fs_hash_upd.
 fn fs_put_file(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, data: &[u8]) -> Result<()> {
-    let hash = fx_hash_u64(data);
+    let hash = blob_key(data);
     let flag = blob_ensure(conn, &hash, data)?;
     conn.execute(
         "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,NULL,?6,NULL)
          ON CONFLICT(path) DO UPDATE SET kind='file', mode=excluded.mode, mtime=excluded.mtime, size=excluded.size,
             hash=excluded.hash, content=NULL, compressed=excluded.compressed, link_target=NULL",
-        params![vm_p, mode, mtime, data.len() as i64, hash, flag])?;
+        params![vm_p, mode, mtime, data.len() as i64, hash.as_slice(), flag])?;
     Ok(())
 }
 
@@ -695,11 +763,11 @@ pub fn vm_ls(conn: &Connection, vm_path: &str) -> Result<Vec<(String,String,i64,
     let p = normalize_vm_path(vm_path);
     let cnt: i64 = conn.prepare_cached("SELECT count(*) FROM vm_fs WHERE path=?1")?.query_row( params![p], |r| r.get(0))?;
     if cnt>0 {
-        let row: (String,String,i64,i64,String) = conn.prepare_cached("SELECT path,kind,mode,size,coalesce(hash,'') FROM vm_fs WHERE path=?1")?.query_row( params![p], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?, r.get::<_,String>(4)?)))?;
+        let row: (String,String,i64,i64,String) = conn.prepare_cached("SELECT path,kind,mode,size,COALESCE(NULLIF(lower(hex(hash)),''),'') FROM vm_fs WHERE path=?1")?.query_row( params![p], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?, r.get::<_,String>(4)?)))?;
         return Ok(vec![row]);
     }
     let like = if p == "/" { "/%".to_string() } else { format!("{}/%", p) };
-    let mut st = conn.prepare("SELECT path,kind,mode,size,coalesce(hash,'') FROM vm_fs WHERE path LIKE ?1 AND path != ?2 ORDER BY path")?;
+    let mut st = conn.prepare("SELECT path,kind,mode,size,COALESCE(NULLIF(lower(hex(hash)),''),'') FROM vm_fs WHERE path LIKE ?1 AND path != ?2 ORDER BY path")?;
     let rows = st.query_map(params![like, p], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?, r.get::<_,String>(4)?)))?;
     let mut out = Vec::new();
     for r in rows { out.push(r?); }
@@ -717,7 +785,7 @@ pub fn vm_cat(conn: &Connection, vm_path: &str) -> Result<Vec<u8>> {
 }
 pub fn vm_stat(conn: &Connection, vm_path: &str) -> Result<(String,String,i64,i64,i64,String)> {
     let p = normalize_vm_path(vm_path);
-    let row: Option<(String,String,i64,i64,i64,Option<String>,Option<Vec<u8>>,Option<String>)> = conn.prepare_cached("SELECT path,kind,mode,size,mtime,link_target,content,hash FROM vm_fs WHERE path=?1")?.query_row( params![p], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).optional()?;
+    let row: Option<(String,String,i64,i64,i64,Option<String>,Option<Vec<u8>>,Option<String>)> = conn.prepare_cached("SELECT path,kind,mode,size,mtime,link_target,content,NULLIF(lower(hex(hash)),'') FROM vm_fs WHERE path=?1")?.query_row( params![p], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).optional()?;
     let (path,kind,mode,size,mtime,link,content,hash_opt) = match row { Some(x)=>x, None=> return Err(anyhow!("not found: {}", p)) };
     if kind == "symlink" {
         let target = link.clone().unwrap_or_default();
@@ -738,17 +806,18 @@ pub fn vm_resolve(conn: &Connection, vm_path: &str) -> Result<(String, String, O
     let mut visited = std::collections::HashSet::new();
     for _ in 0..40 {
         if !visited.insert(cur.clone()) { return Err(anyhow!("symlink loop at {}", cur)); }
-        let row: Option<(String, Option<Vec<u8>>, Option<String>, i64, Option<String>, Option<i64>)> = conn.prepare_cached("SELECT kind, content, link_target, mode, hash, compressed FROM vm_fs WHERE path=?1")?.query_row( params![cur], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).optional()?;
+        let row: Option<(String, Option<Vec<u8>>, Option<String>, i64, Option<Vec<u8>>, Option<i64>)> = conn.prepare_cached("SELECT kind, content, link_target, mode, hash, compressed FROM vm_fs WHERE path=?1")?.query_row( params![cur], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).optional()?;
         let (kind, content_opt, link, mode, hash_opt, compressed) = match row { Some(x)=>x, None=> return Err(anyhow!("not found in VM: {}", cur)) };
         if kind != "symlink" {
             let cflag = compressed.unwrap_or(0);
             let content: Option<Vec<u8>> = match (hash_opt, content_opt) {
                 // content-addressed: key cache by stored hash, decompress only on miss
                 (Some(h), inline) => {
+                    let hk = key_hex(&h.as_slice().try_into().map_err(|_| anyhow!("corrupt hash in {}", cur))?);
                     let blob: Option<(Vec<u8>, i64)> = conn.prepare_cached("SELECT content, compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![h], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
                     match (blob, inline) {
-                        (Some((b,c)), _) => Some(decompress_bytes_cached(&h, &b, c).to_vec()),
-                        (None, Some(b)) => Some(decompress_bytes_cached(&h, &b, cflag).to_vec()),
+                        (Some((b,c)), _) => Some(decompress_bytes_cached(&hk, &b, c).to_vec()),
+                        (None, Some(b)) => Some(decompress_bytes_cached(&hk, &b, cflag).to_vec()),
                         (None, None) => None,
                     }
                 },
@@ -871,7 +940,8 @@ fn load_task_bytes<T: TaskLike>(db_path: Option<&str>, t: &T) -> Option<Vec<u8>>
         if slot.is_none() { *slot = Connection::open(path).ok(); }
         let c = slot.as_ref()?;
         if let Some(h) = t.hash_ref() {
-            let row: Option<(Vec<u8>, i64)> = c.query_row("SELECT content, compressed FROM vm_blobs WHERE hash=?1", params![h], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok()?;
+            let key = hex_to_key(h)?;
+            let row: Option<(Vec<u8>, i64)> = c.query_row("SELECT content, compressed FROM vm_blobs WHERE hash=?1", params![key.as_slice()], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok()?;
             if let Some((b, comp)) = row { return Some(decompress_bytes_cached(h, &b, comp).to_vec()); }
         }
         let inline: Option<(Option<Vec<u8>>, Option<i64>)> = c.query_row("SELECT content, compressed FROM vm_fs WHERE path=?1", params![t.path_ref()], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok()?;
@@ -903,13 +973,13 @@ pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
         #[cfg(unix)] { let _ = std::os::unix::fs::symlink(&target, &host); }
     }
     // Metadata only: blobs are loaded per file inside the worker, so memory stays O(one file).
-    struct Task { path: String, mode: i64, hash: Option<String>, size: i64, mtime: i64 }
+    struct Task { path: String, mode: i64, hash: Option<String>, size: i64, mtime: i64 }  // hash: hex text
     impl TaskLike for Task {
         fn hash_ref(&self) -> Option<&str> { self.hash.as_deref() }
         fn path_ref(&self) -> &str { &self.path }
     }
     let tasks: Vec<Task> = {
-        let mut st = conn.prepare("SELECT path, mode, hash, size, mtime FROM vm_fs WHERE kind='file'")?;
+        let mut st = conn.prepare("SELECT path, mode, NULLIF(lower(hex(hash)),''), size, mtime FROM vm_fs WHERE kind='file'")?;
         let rows = st.query_map([], |r| Ok(Task{ path: r.get(0)?, mode: r.get(1)?, hash: r.get(2)?, size: r.get(3)?, mtime: r.get(4)? }))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
@@ -984,7 +1054,7 @@ pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,u
     let mut db_map: HashMap<String, (String, Option<String>, Option<String>, i64, i64)> = HashMap::new();
     {
         // hash+size for quick compare without fetching blob
-        let mut st = conn.prepare("SELECT path, kind, hash, link_target, mode, size FROM vm_fs")?;
+        let mut st = conn.prepare("SELECT path, kind, NULLIF(lower(hex(hash)),''), link_target, mode, size FROM vm_fs")?;
         for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<String>>(2)?, r.get::<_,Option<String>>(3)?, r.get::<_,i64>(4)?, r.get::<_,i64>(5)?)))? {
             let (p,kind,hash,link,mode,size)=r?;
             db_map.insert(p, (kind, hash, link, mode, size));
@@ -1090,8 +1160,8 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
         let cflag = comp.unwrap_or(0);
         let raw = decompress_bytes_raw(&data, cflag).unwrap_or(data.clone());
         before += data.len() as i64;
-        let hash = fx_hash_u64(&raw);
-        let sz_before: Option<i64> = conn.prepare_cached("SELECT length(content) FROM vm_blobs WHERE hash=?1")?.query_row( params![hash], |r| r.get(0)).optional()?;
+        let hash = blob_key(&raw);
+        let sz_before: Option<i64> = conn.prepare_cached("SELECT length(content) FROM vm_blobs WHERE hash=?1")?.query_row( params![hash.as_slice()], |r| r.get(0)).optional()?;
         match sz_before {
             Some(sz) => after += sz,
             None => {
@@ -1102,15 +1172,15 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
         }
         // move inline content onto the blob: hash column now references it, content becomes NULL.
         // The UPDATE trigger adds the reference (old hash was NULL for legacy rows).
-        let blob_flag: i64 = conn.prepare_cached("SELECT compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![hash.clone()], |r| r.get(0)).unwrap_or(2);
-        conn.prepare_cached("UPDATE vm_fs SET hash=?2, content=NULL, compressed=?3, size=?4 WHERE path=?1")?.execute( params![path, hash, blob_flag, raw.len() as i64])?;
+        let blob_flag: i64 = conn.prepare_cached("SELECT compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![hash.as_slice()], |r| r.get(0)).unwrap_or(2);
+        conn.prepare_cached("UPDATE vm_fs SET hash=?2, content=NULL, compressed=?3, size=?4 WHERE path=?1")?.execute( params![path, hash.as_slice(), blob_flag, raw.len() as i64])?;
         n+=1;
     }
     // also recompress blobs that are gz
-    let mut gz_blobs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut gz_blobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     {
         let mut st = conn.prepare("SELECT hash, content FROM vm_blobs WHERE compressed=1")?;
-        for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,Vec<u8>>(1)?)))? { if let Ok(x)=r { gz_blobs.push(x); } }
+        for r in st.query_map([], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,Vec<u8>>(1)?)))? { if let Ok(x)=r { gz_blobs.push(x); } }
     }
     for (hash, gz) in gz_blobs {
         let raw = decompress_bytes_raw(&gz, 1).unwrap_or(gz.clone());

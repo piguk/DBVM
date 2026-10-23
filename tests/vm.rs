@@ -210,20 +210,41 @@ fn counters_match_raw_aggregates_through_mutations() {
 }
 
 #[test]
-fn v2_database_upgrades_to_counters() {
-    let (_g, db) = tmpdb("v2");
+fn legacy_v3_database_migrates_to_blob_keys() {
+    // Build a genuine schema-3 database by hand: TEXT blob keys (legacy FxHash-style 16 chars),
+    // counter triggers present, user_version=3. Then open with current code.
+    let (_g, db) = tmpdb("legacy");
+    let raw_a: Vec<u8> = b"hello legacy world, this is file A with some padding padding padding".to_vec();
+    let raw_b: Vec<u8> = vec![7u8; 3000];
     {
-        let c = open(&db);
-        vm::vm_add_bytes(&c, "/x", &vec![4u8; 2000], 0o644, 1).unwrap();
-        // simulate a schema-2 database: drop counter triggers and meta rows
-        c.execute_batch("DROP TRIGGER vm_cnt_fs_ins; DROP TRIGGER vm_cnt_fs_del; DROP TRIGGER vm_cnt_fs_upd;
-            DROP TRIGGER vm_cnt_blob_ins; DROP TRIGGER vm_cnt_blob_del; DROP TRIGGER vm_cnt_blob_upd;
-            DELETE FROM vm_meta WHERE key LIKE 'count_%' OR key IN ('logical_bytes','blob_bytes');
-            PRAGMA user_version=2;").unwrap();
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(&vm::vm_schema_sql().replace("PRAGMA user_version = 4;", "PRAGMA user_version = 3;")).ok();
+        // rebuild vm_blobs with the legacy TEXT key layout
+        c.execute_batch("DROP TABLE vm_blobs; DROP INDEX IF EXISTS idx_vm_blobs_refcnt;
+            CREATE TABLE vm_blobs(hash TEXT PRIMARY KEY, content BLOB NOT NULL, compressed INTEGER NOT NULL DEFAULT 0,
+              raw_size INTEGER NOT NULL, refcnt INTEGER NOT NULL DEFAULT 1);
+            DROP TRIGGER IF EXISTS vm_fs_hash_ins; DROP TRIGGER IF EXISTS vm_fs_hash_del; DROP TRIGGER IF EXISTS vm_fs_hash_upd;
+            DROP TRIGGER IF EXISTS vm_cnt_blob_ins; DROP TRIGGER IF EXISTS vm_cnt_blob_del; DROP TRIGGER IF EXISTS vm_cnt_blob_upd;
+            PRAGMA user_version=3;").unwrap();
+        let ka = "aaaaaaaaaaaaaaaa"; let kb = "bbbbbbbbbbbbbbbb";
+        c.execute("INSERT INTO vm_blobs(hash,content,compressed,raw_size,refcnt) VALUES (?1,?2,0,?3,1)", rusqlite::params![ka, raw_a, raw_a.len() as i64]).unwrap();
+        c.execute("INSERT INTO vm_blobs(hash,content,compressed,raw_size,refcnt) VALUES (?1,?2,0,?3,1)", rusqlite::params![kb, raw_b, raw_b.len() as i64]).unwrap();
+        c.execute("INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,compressed) VALUES ('/a','file',420,1,?1,?2,0)", rusqlite::params![raw_a.len() as i64, ka]).unwrap();
+        c.execute("INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,compressed) VALUES ('/b','file',420,1,?1,?2,0)", rusqlite::params![raw_b.len() as i64, kb]).unwrap();
+        c.execute("INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,compressed) VALUES ('/c','file',420,1,?1,?2,0)", rusqlite::params![raw_b.len() as i64, kb]).unwrap();
     }
     let c = vm::vm_open(db.to_str().unwrap()).unwrap();
     let ver: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     assert_eq!(ver, vm::VM_USER_VERSION as i64);
+    // keys are now 32-byte sha256 of content
+    let k: Vec<u8> = c.query_row("SELECT hash FROM vm_blobs WHERE raw_size=?1", rusqlite::params![raw_a.len() as i64], |r| r.get(0)).unwrap();
+    assert_eq!(k.len(), 32);
+    assert_eq!(k.as_slice(), vm::blob_key(&raw_a).as_slice());
+    // content still reads back exactly, and the shared blob is refcounted twice
+    assert_eq!(vm::vm_cat(&c, "/a").unwrap(), raw_a);
+    assert_eq!(vm::vm_cat(&c, "/c").unwrap(), raw_b);
+    let rc: i64 = c.query_row("SELECT refcnt FROM vm_blobs WHERE raw_size=?1", rusqlite::params![raw_b.len() as i64], |r| r.get(0)).unwrap();
+    assert_eq!(rc, 2);
     let rep = vm::vm_verify(&c, true).unwrap();
     assert!(rep.contains("deep=ok"), "{}", rep);
 }
