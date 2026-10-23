@@ -46,7 +46,7 @@ enum Cmd {
     VmMemClear{ db: String },
     VmSnapshotFile{ db: String, name: String },
     VmRestoreFile{ db: String, name: String },
-    VmSync{ db: String, host_root: String },
+    VmSync{ db: String, host_root: String, #[arg(long, help="re-read every file and compare content, not just metadata")] full: bool },
     VmGc{ db: String },
     VmCompressInfo{ db: String },
     VmRecompress{ db: String },
@@ -401,7 +401,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::VmMemClear{db} => { let c=selfdb::vm::vm_open(&db)?; selfdb::vm::vm_mem_clear(&c)?; println!("mem clear -> {}", db); },
         Cmd::VmSnapshotFile{db, name} => { let c=selfdb::vm::vm_open(&db)?; let p=selfdb::vm::vm_snapshot_file(&c, &db, &name)?; println!("snapshot-file {} -> {}", db, p); },
         Cmd::VmRestoreFile{db, name} => { selfdb::vm::vm_restore_file(&db, &name)?; println!("restore-file {} @ {}", name, db); },
-        Cmd::VmSync{db, host_root} => { let c=selfdb::vm::vm_open(&db)?; let (cr,up,del)=selfdb::vm::vm_sync_from_host(&c, std::path::Path::new(&host_root))?; let _ = selfdb::vm::vm_apply_pragmas(&c); println!("sync {} <- {}: +{} ~{} -{} (WAL+NORMAL+mmap)", db, host_root, cr, up, del); },
+        Cmd::VmSync{db, host_root, full} => { let c=selfdb::vm::vm_open(&db)?; let rep = if full { selfdb::vm::vm_sync_full(&c, std::path::Path::new(&host_root))? } else { selfdb::vm::vm_sync_report(&c, std::path::Path::new(&host_root))? }; let (cr,up,del)=(rep.created, rep.updated, rep.deleted); let _ = selfdb::vm::vm_apply_pragmas(&c); println!("sync {} <- {}: +{} ~{} -{} (WAL+NORMAL+mmap)", db, host_root, cr, up, del); },
         Cmd::VmGc{db} => { let c=selfdb::vm::vm_open(&db)?; let (before,saved)=selfdb::vm::vm_gc(&c)?; println!("gc {}: pages {} -> saved {} bytes", db, before, saved); },
         Cmd::VmCompressInfo{db} => {
             let c=selfdb::vm::vm_open(&db)?;

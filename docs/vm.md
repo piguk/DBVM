@@ -59,6 +59,24 @@ self vm-compress-info /tmp/alpine.vm.db
 self vm-cache-info; self vm-cache-prune --max 500M
 ```
 
+## 同步与校验
+
+```sh
+self vm-sync /tmp/vm.db /path/to/tree          # 增量：只比较元数据（size、秒、ns、mode），未变文件不读内容
+self vm-sync /tmp/vm.db /path/to/tree --full   # 全量：逐文件读内容并比对整文件 sha256，代价约为增量的 7 倍
+self vm-verify /tmp/vm.db --deep               # 对账计数器、引用计数、分块完整性
+```
+
+- 增量同步依赖纳秒 mtime（schema v7）。升级前已存在且未再修改的行没有纳秒戳，只能靠秒级判断；`--full` 可以发现它们的陈旧内容。
+- 文件在读取期间被修改时，该行不记录纳秒戳，下次同步会重读。
+
+## 缓存上限
+
+- 内容缓存与 bundle 缓存的上限默认为 2 GiB，由 `SELF_VM_CACHE_MAX` 设定（如 `512M`、`2G`，或纯字节数）。非法值会给出警告并使用默认值。
+- 内容缓存在每次导入结束后淘汰（按最近使用时间，即 mtime）。
+- bundle 缓存在每次启动后淘汰；正在运行的程序所用的条目持有共享锁，不会被淘汰。
+- 淘汰只影响速度：缓存的每个文件都可以从数据库重建。
+
 缓存目录 `cache_dir()`：`$SELF_VM_CACHE` → `$XDG_CACHE_HOME/self-vm` → `~/.cache/self-vm` → `$TMPDIR/self-vm-cache`。解压结果按 hash 存于 `<cache>/<aa>/<hash>`，物化时优先硬链。
 
 ## 内存镜像

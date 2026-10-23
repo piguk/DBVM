@@ -871,6 +871,11 @@ fn write_file_checked<R: Read>(conn: &Connection, host: &Path, vm_p: &str, mode:
     Ok(n)
 }
 
+/// Test helper: write content directly, as an older writer would have.
+pub fn fs_put_file_stream_pub(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, data: &[u8]) -> Result<u64> {
+    fs_put_file_stream(conn, vm_p, mode, mtime, &mut std::io::Cursor::new(data.to_vec()))
+}
+
 /// Public for tests: see `write_file_checked`.
 pub fn write_file_checked_pub<R: Read>(conn: &Connection, host: &Path, vm_p: &str, mode: i64, mtime: i64, src: &mut R) -> Result<u64> {
     write_file_checked(conn, host, vm_p, mode, mtime, src)
@@ -1594,6 +1599,17 @@ pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,u
 }
 
 pub fn vm_sync_report(conn: &Connection, host_root: &Path) -> Result<SyncReport> {
+    sync_report_impl(conn, host_root, false)
+}
+
+/// Full verification: like `vm_sync_report`, but a regular file is compared by content (the
+/// stored whole-file sha256 against the host bytes), not by metadata. This catches rows that
+/// metadata cannot prove current, such as rows written before schema v7.
+pub fn vm_sync_full(conn: &Connection, host_root: &Path) -> Result<SyncReport> {
+    sync_report_impl(conn, host_root, true)
+}
+
+fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool) -> Result<SyncReport> {
     use std::collections::{HashMap, HashSet};
     #[cfg(unix)] use std::os::unix::fs::PermissionsExt;
 
@@ -1655,7 +1671,18 @@ pub fn vm_sync_report(conn: &Connection, host_root: &Path) -> Result<SyncReport>
                     }
                 }
                 (Some(p), "file") if p.kind == "file" => {
-                    if p.size == md.len() as i64 && p.mtime == mtime && p.mode == mode && ns_matches(p.mtime_ns, ns_before) {
+                    let metadata_current = p.size == md.len() as i64 && p.mtime == mtime && p.mode == mode && ns_matches(p.mtime_ns, ns_before);
+                    let content_current = if verify_content && metadata_current {
+                        // compare against the stored whole-file hash; a mismatch means stale content
+                        let stored: Option<Vec<u8>> = conn.prepare_cached("SELECT hash FROM vm_fs WHERE path=?1")?.query_row(params![vm_p], |r| r.get(0)).optional()?.flatten();
+                        let mut f = std::fs::File::open(e.path())?;
+                        let mut hasher = sha2::Sha256::new();
+                        std::io::copy(&mut f, &mut hasher)?;
+                        use sha2::Digest;
+                        let host_hash: [u8; 32] = hasher.finalize().into();
+                        stored.as_deref() == Some(&host_hash[..])
+                    } else { metadata_current };
+                    if content_current && (!verify_content || metadata_current) {
                         Ok(None)
                     } else {
                         // a write during the read leaves ns unknown (0), so the next sync re-reads

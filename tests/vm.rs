@@ -817,3 +817,32 @@ fn write_during_read_leaves_ns_unknown() {
     let ns: i64 = c.query_row("SELECT mtime_ns FROM vm_fs WHERE path='/big'", [], |r| r.get(0)).unwrap();
     assert_eq!(ns, 0, "a file that changed during the read must not carry a trusted ns stamp");
 }
+
+#[test]
+fn full_verify_catches_stale_rows_that_metadata_check_misses() {
+    // Simulates a row from before schema v7: no ns stamp, and the stored content is stale while
+    // size, second and mode still match the host. Normal sync trusts the metadata and misses it;
+    // a full verify re-reads and rewrites it.
+    let (_g, db) = tmpdb("full-verify");
+    let host = _g.path().join("root");
+    std::fs::create_dir_all(&host).unwrap();
+    let f = host.join("cfg");
+    std::fs::write(&f, b"BBBB").unwrap();
+    let c = open(&db);
+    vm::vm_sync_from_host(&c, &host).unwrap();
+    // Corrupt the stored row into a stale, metadata-identical version: same mode and same mtime
+    // as the host, but different content and no ns stamp. Capture the host's real mtime/mode first.
+    let hmd = std::fs::symlink_metadata(&f).unwrap();
+    let hmode = std::os::unix::fs::PermissionsExt::mode(&hmd.permissions()) as i64;
+    let hsec = hmd.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    vm::fs_put_file_stream_pub(&c, "/cfg", hmode, hsec, b"AAAA").unwrap();
+    c.execute("UPDATE vm_fs SET mtime_ns=0 WHERE path='/cfg'", []).unwrap();
+    let meta_only = vm::vm_sync_report(&c, &host).unwrap();
+    assert_eq!(meta_only.updated, 0, "metadata-only sync misses the stale content");
+    assert_eq!(vm::vm_cat(&c, "/cfg").unwrap(), b"AAAA");
+    let row: (i64, i64, i64, i64) = c.query_row("SELECT size, mtime, mtime_ns, mode FROM vm_fs WHERE path='/cfg'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+    assert_eq!((row.0, row.1, row.2, row.3), (4, hsec, 0, hmode), "precondition: size, second, mode match host; ns unknown");
+    let full = vm::vm_sync_full(&c, &host).unwrap();
+    assert_eq!(full.updated, 1, "full verify must rewrite the stale row");
+    assert_eq!(vm::vm_cat(&c, "/cfg").unwrap(), b"BBBB");
+}
