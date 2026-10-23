@@ -56,6 +56,12 @@ enum Cmd {
     VmTrainDict{ db: String, #[arg(long, default_value="16384")] max_size: usize },
     VmDictInfo{ db: String },
     VmDiff{ db: String, a: String, b: String },
+    /// content snapshot of the whole tree (metadata + chunk references, no blob copies)
+    VmSnap{ db: String, name: String, #[arg(long, default_value="")] note: String },
+    /// replace the live tree with a content snapshot
+    VmRollback{ db: String, name: String },
+    /// per-path diff between the live tree and a content snapshot
+    VmSnapDiff{ db: String, name: String },
     VmMount{ db: String, mountpoint: String, #[arg(long)] allow_other: bool },
     VmMemTrace{ db: String, prog: String, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String> },
     VmDiskInit{ db: String, #[arg(long, default_value="20G")] size: String },
@@ -457,6 +463,25 @@ fn main() -> anyhow::Result<()> {
                 println!("dict id={} bytes={} samples={} created_at={} blocks_using={}", id, len, samples, ts, blobs);
             }
             if !any { println!("no dictionary trained"); }
+        },
+        Cmd::VmSnap{db, name, note} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            let t=std::time::Instant::now();
+            let id=selfdb::vm::snapshot_create(&c, &name, &note)?;
+            println!("snap {} (id {}) in {} ms", name, id, t.elapsed().as_millis());
+        },
+        Cmd::VmRollback{db, name} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            selfdb::vm::snapshot_restore(&c, &name)?;
+            println!("rolled back to {}", name);
+        },
+        Cmd::VmSnapDiff{db, name} => {
+            let c=selfdb::vm::vm_open(&db)?;
+            let d=selfdb::vm::snapshot_diff_live(&c, &name)?;
+            for p in &d.created { println!("A {}", p); }
+            for p in &d.modified { println!("M {}", p); }
+            for p in &d.deleted { println!("D {}", p); }
+            println!("created={} modified={} deleted={}", d.created.len(), d.modified.len(), d.deleted.len());
         },
         Cmd::VmDiff{db, a, b} => {
             let c=selfdb::vm::vm_open(&db)?;

@@ -223,6 +223,7 @@ fn legacy_v3_database_migrates_to_blob_keys() {
         // remove every v5 trigger/table first: a trigger that names vm_blobs would error on use
         c.execute_batch("DROP TRIGGER IF EXISTS vm_fc_ins; DROP TRIGGER IF EXISTS vm_fc_del; DROP TRIGGER IF EXISTS vm_fc_upd;
             DROP TRIGGER IF EXISTS vm_fs_del_chunks; DROP TABLE IF EXISTS vm_file_chunks;
+            DROP TRIGGER IF EXISTS vm_snc_ins; DROP TRIGGER IF EXISTS vm_snc_del; DROP TABLE IF EXISTS vm_snapshot_chunks; DROP TABLE IF EXISTS vm_snapshot_fs;
             DROP TABLE vm_blobs; DROP INDEX IF EXISTS idx_vm_blobs_refcnt;
             CREATE TABLE vm_blobs(hash TEXT PRIMARY KEY, content BLOB NOT NULL, compressed INTEGER NOT NULL DEFAULT 0,
               raw_size INTEGER NOT NULL, refcnt INTEGER NOT NULL DEFAULT 1);
@@ -715,9 +716,11 @@ fn needed_sonames_resolve_inside_vm() {
     }
 }
 
+/// Secondary indexes on the bulk-load tables (what `with_bulk_indexes_dropped` manages).
 fn index_names(c: &rusqlite::Connection) -> Vec<String> {
-    c.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_vm%' ORDER BY name").unwrap()
-        .query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+    let sql = format!("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND tbl_name IN ({}) ORDER BY name",
+        vm::BULK_TABLES.iter().map(|t| format!("'{}'", t)).collect::<Vec<_>>().join(","));
+    c.prepare(&sql).unwrap().query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
 }
 
 #[test]

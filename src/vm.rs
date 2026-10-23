@@ -14,13 +14,16 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///   3 = triggers maintain vm_meta counters (blob_bytes/file_count/logical_bytes)
 ///   4 = blob keys are raw 32-byte SHA-256 BLOBs (UNIQUE); vm_blobs keeps a rowid so large
 ///       content is not stored inside a key B-tree (WITHOUT ROWID measured no smaller)
+///   8 = content snapshots: vm_snapshot_fs / vm_snapshot_chunks hold a copy of the file tree's
+///       metadata and chunk references (never blob bytes). Keys carry no row ids, so a snapshot
+///       is portable to another database under an ATTACH prefix (Base/Delta design).
 ///   7 = vm_fs.mtime_ns: host nanosecond mtime used only to detect changes during sync (0 = unknown)
 ///   6 = zstd dictionaries are append-only rows in vm_dicts; every flag-3 blob records its
 ///       dictionary in vm_blobs.dict_id. Retraining no longer makes older blocks unreadable.
 ///   5 = file content is split into CHUNK_SIZE chunks listed in vm_file_chunks; a file's
 ///       refcount on vm_blobs comes from its chunk rows. vm_fs.hash = whole-file sha256
 ///       (informational, no refcounting). Legacy single-blob files keep working via vm_fs.hash.
-pub const VM_USER_VERSION: u32 = 7;
+pub const VM_USER_VERSION: u32 = 8;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -107,6 +110,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
                 4 => migrate_4_to_5(conn)?,
                 5 => migrate_5_to_6(conn)?,
                 6 => migrate_6_to_7(conn)?,
+                7 => migrate_7_to_8(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -266,6 +270,42 @@ END;
 
 /// Refcounting for blobs. Chunk rows own references; deleting a file's rows releases them.
 /// (Verified: nested trigger DELETEs on other tables fire; same-table recursion is not needed.)
+const VM_SNAPSHOT_SQL: &str = "
+CREATE TABLE IF NOT EXISTS vm_snapshot_fs(
+    snap_id INTEGER NOT NULL REFERENCES vm_snapshots(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    mode INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL DEFAULT 0,
+    size INTEGER NOT NULL,
+    link_target TEXT,
+    hash BLOB,
+    PRIMARY KEY(snap_id, path)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS vm_snapshot_chunks(
+    snap_id INTEGER NOT NULL REFERENCES vm_snapshots(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    hash BLOB NOT NULL,
+    PRIMARY KEY(snap_id, path, idx)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_vm_snapshot_chunks_hash ON vm_snapshot_chunks(hash);
+CREATE TRIGGER IF NOT EXISTS vm_snc_ins AFTER INSERT ON vm_snapshot_chunks
+BEGIN UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=NEW.hash; END;
+CREATE TRIGGER IF NOT EXISTS vm_snc_del AFTER DELETE ON vm_snapshot_chunks
+BEGIN
+  UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=OLD.hash;
+  DELETE FROM vm_blobs WHERE hash=OLD.hash AND refcnt<=0;
+END;
+";
+
+/// 7 -> 8: content snapshot tables. Only metadata and references are copied; no blob bytes.
+fn migrate_7_to_8(conn: &Connection) -> Result<()> {
+    conn.execute_batch(VM_SNAPSHOT_SQL)?;
+    Ok(())
+}
+
 const VM_TRIGGERS_SQL: &str = "
 CREATE TRIGGER IF NOT EXISTS vm_fc_ins AFTER INSERT ON vm_file_chunks
 BEGIN UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=NEW.hash; END;
@@ -437,7 +477,8 @@ CREATE TABLE IF NOT EXISTS vm_disk_blocks(
 {triggers}
 {counters}
 {counter_triggers}
-"#, app=VM_APP_ID, ver=VM_USER_VERSION, triggers=VM_TRIGGERS_SQL, counters=VM_COUNTERS_INIT_SQL, counter_triggers=VM_COUNTER_TRIGGERS_SQL)
+{snapshot}
+"#, app=VM_APP_ID, ver=VM_USER_VERSION, triggers=VM_TRIGGERS_SQL, counters=VM_COUNTERS_INIT_SQL, counter_triggers=VM_COUNTER_TRIGGERS_SQL, snapshot=VM_SNAPSHOT_SQL)
 }
 
 pub fn init_vm_db_with_opts(path: &str, overwrite: bool, vm_only: bool) -> Result<Connection> {
@@ -1251,8 +1292,13 @@ pub fn vm_pack_host_dir(conn: &Connection, host_dir: &str, vm_prefix: &str) -> R
 /// Secondary indexes on the tables a bulk load writes. Dropping them for the load and rebuilding
 /// afterwards is much cheaper than maintaining them row by row. Definitions are read from
 /// sqlite_master, so the rebuilt indexes are exactly the schema's, not a second copy.
+/// Tables whose secondary indexes are dropped during a bulk load. Single definition, so the
+/// helper and anything that checks it cannot disagree.
+pub const BULK_TABLES: &[&str] = &["vm_fs", "vm_blobs", "vm_file_chunks"];
+const BULK_TABLE_LIST_SQL: &str = "'vm_fs','vm_blobs','vm_file_chunks'";
+
 fn bulk_index_defs(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut st = conn.prepare("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND tbl_name IN ('vm_fs','vm_blobs','vm_file_chunks') ORDER BY name")?;
+    let mut st = conn.prepare(&format!("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND tbl_name IN ({}) ORDER BY name", BULK_TABLE_LIST_SQL))?;
     let rows = st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
@@ -1984,6 +2030,99 @@ pub fn vm_diff(conn: &Connection, snap_a: &str, snap_b: &str) -> Result<String> 
     }
     Ok(out)
 }
+/// Differences between a snapshot and the live tree, by path.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SnapDiff { pub created: Vec<String>, pub modified: Vec<String>, pub deleted: Vec<String> }
+
+fn snapshot_id(conn: &Connection, name: &str) -> Result<i64> {
+    conn.prepare_cached("SELECT id FROM vm_snapshots WHERE name=?1")?
+        .query_row(params![name], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| anyhow!("no such snapshot: {}", name))
+}
+
+/// Capture the whole live tree as a named content snapshot. Copies metadata and chunk
+/// references only, so no blob is duplicated. One transaction: all or nothing.
+pub fn snapshot_create(conn: &Connection, name: &str, note: &str) -> Result<i64> {
+    conn.execute_batch("SAVEPOINT snap_create;")?;
+    let res: Result<i64> = (|| {
+        conn.prepare_cached("INSERT INTO vm_snapshots(name, page_count, page_size, bytes, note) VALUES (?1, 0, 0, 0, ?2)")?
+            .execute(params![name, note])?;
+        let id = conn.last_insert_rowid();
+        conn.prepare_cached(
+            "INSERT INTO vm_snapshot_fs(snap_id, path, kind, mode, mtime, mtime_ns, size, link_target, hash)
+             SELECT ?1, path, kind, mode, mtime, mtime_ns, size, link_target, hash FROM vm_fs")?
+            .execute(params![id])?;
+        conn.prepare_cached("INSERT INTO vm_snapshot_chunks(snap_id, path, idx, hash)
+             SELECT ?1, path, idx, hash FROM vm_file_chunks")?
+            .execute(params![id])?;
+        conn.prepare_cached("INSERT INTO vm_log(op, path, detail) VALUES ('snapshot', ?1, 'content')")?
+            .execute(params![name])?;
+        Ok(id)
+    })();
+    match res {
+        Ok(id) => { conn.execute_batch("RELEASE snap_create;")?; Ok(id) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK TO snap_create; RELEASE snap_create;"); Err(e) }
+    }
+}
+
+/// Replace the live tree with a snapshot's tree. The snapshot keeps its chunk references
+/// while the live tree is cleared, so no blob it needs is freed mid-restore.
+pub fn snapshot_restore(conn: &Connection, name: &str) -> Result<()> {
+    let id = snapshot_id(conn, name)?;
+    conn.execute_batch("SAVEPOINT snap_restore;")?;
+    let res: Result<()> = (|| {
+        // remove the live chunk references first (triggers release their blobs' refcounts),
+        // then the rows; the snapshot's own references keep every needed blob alive
+        conn.execute_batch("DELETE FROM vm_file_chunks;")?;
+        conn.execute_batch("DELETE FROM vm_fs;")?;
+        conn.prepare_cached(
+            "INSERT INTO vm_fs(path, kind, mode, mtime, mtime_ns, size, link_target, hash, content, compressed)
+             SELECT path, kind, mode, mtime, mtime_ns, size, link_target, hash, NULL, 0
+             FROM vm_snapshot_fs WHERE snap_id=?1 ORDER BY length(path), path")?
+            .execute(params![id])?;
+        conn.prepare_cached("INSERT INTO vm_file_chunks(path, idx, hash)
+             SELECT path, idx, hash FROM vm_snapshot_chunks WHERE snap_id=?1")?
+            .execute(params![id])?;
+        conn.prepare_cached("INSERT INTO vm_log(op, path, detail) VALUES ('restore', ?1, 'content')")?
+            .execute(params![name])?;
+        Ok(())
+    })();
+    match res {
+        Ok(()) => { conn.execute_batch("RELEASE snap_restore;")?; Ok(()) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK TO snap_restore; RELEASE snap_restore;"); Err(e) }
+    }
+}
+
+/// Compare the live tree with a snapshot. A path counts as modified when its kind, content hash,
+/// mode, or link target differs; deleted paths exist only in the snapshot.
+pub fn snapshot_diff_live(conn: &Connection, name: &str) -> Result<SnapDiff> {
+    let id = snapshot_id(conn, name)?;
+    let mut d = SnapDiff::default();
+    {
+        let mut st = conn.prepare_cached(
+            "SELECT cur.path,
+                    CASE WHEN old.path IS NULL THEN 1 ELSE 0 END AS is_new,
+                    CASE WHEN old.path IS NOT NULL AND (old.kind IS NOT cur.kind OR old.hash IS NOT cur.hash
+                         OR old.mode IS NOT cur.mode OR old.link_target IS NOT cur.link_target) THEN 1 ELSE 0 END AS is_mod
+             FROM vm_fs cur LEFT JOIN vm_snapshot_fs old ON old.snap_id = ?1 AND old.path = cur.path
+             WHERE old.path IS NULL OR old.kind IS NOT cur.kind OR old.hash IS NOT cur.hash
+                   OR old.mode IS NOT cur.mode OR old.link_target IS NOT cur.link_target
+             ORDER BY cur.path")?;
+        for r in st.query_map(params![id], |r| Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?)))? {
+            let (p, is_new, is_mod) = r?;
+            if is_new == 1 { d.created.push(p) } else if is_mod == 1 { d.modified.push(p) }
+        }
+    }
+    {
+        let mut st = conn.prepare_cached(
+            "SELECT old.path FROM vm_snapshot_fs old
+             WHERE old.snap_id = ?1 AND NOT EXISTS (SELECT 1 FROM vm_fs cur WHERE cur.path = old.path) ORDER BY old.path")?;
+        for r in st.query_map(params![id], |r| r.get::<_,String>(0))? { d.deleted.push(r?); }
+    }
+    Ok(d)
+}
+
 pub fn vm_checkpoint(conn: &Connection, name: &str, note: &str) -> Result<()> {
     let page_size: i64 = conn.prepare_cached("PRAGMA page_size")?.query_row( [], |r| r.get(0))?;
     let page_count: i64 = conn.prepare_cached("PRAGMA page_count")?.query_row( [], |r| r.get(0))?;
@@ -2142,12 +2281,19 @@ pub fn vm_verify(conn: &Connection, deep: bool) -> Result<String> {
         if real_files != files { drift.push(format!("files {}!={}", files, real_files)); }
         if real_bytes != bytes { drift.push(format!("logical {}!={}", bytes, real_bytes)); }
         if real_blob != vm_counter(conn, "blob_bytes")? { drift.push(format!("blob_bytes {}!={}", vm_counter(conn, "blob_bytes")?, real_blob)); }
-        // refcnt must equal the number of chunk rows referencing each blob
-        let bad_rc: i64 = conn.prepare_cached("SELECT count(*) FROM vm_blobs b WHERE b.refcnt != (SELECT count(*) FROM vm_file_chunks c WHERE c.hash=b.hash)")?.query_row( [], |r| r.get(0))?;
+        // refcnt must equal live chunk references plus snapshot chunk references (schema v8)
+        let bad_rc: i64 = conn.prepare_cached(
+            "SELECT count(*) FROM vm_blobs b WHERE b.refcnt != (
+               (SELECT count(*) FROM vm_file_chunks c WHERE c.hash=b.hash) +
+               (SELECT count(*) FROM vm_snapshot_chunks s WHERE s.hash=b.hash))")?.query_row( [], |r| r.get(0))?;
         if bad_rc > 0 { drift.push(format!("{} blobs with bad refcnt", bad_rc)); }
-        // every chunk must point at an existing blob
+        // every chunk, live or in a snapshot, must point at an existing blob
         let orphan: i64 = conn.prepare_cached("SELECT count(*) FROM vm_file_chunks c WHERE NOT EXISTS (SELECT 1 FROM vm_blobs b WHERE b.hash=c.hash)")?.query_row( [], |r| r.get(0))?;
-        if orphan > 0 { drift.push(format!("{} chunks reference missing blobs", orphan)); }
+        let orphan_s: i64 = conn.prepare_cached("SELECT count(*) FROM vm_snapshot_chunks c WHERE NOT EXISTS (SELECT 1 FROM vm_blobs b WHERE b.hash=c.hash)")?.query_row( [], |r| r.get(0))?;
+        if orphan + orphan_s > 0 { drift.push(format!("{} chunks reference missing blobs", orphan + orphan_s)); }
+        // a snapshot's chunk list must be contiguous per file, like the live list
+        let snap_gaps: i64 = conn.prepare_cached("SELECT count(*) FROM (SELECT snap_id, path, count(*) AS n, max(idx) AS mx FROM vm_snapshot_chunks GROUP BY snap_id, path) WHERE mx + 1 != n")?.query_row( [], |r| r.get(0))?;
+        if snap_gaps > 0 { drift.push(format!("{} snapshot files with chunk index gaps", snap_gaps)); }
         // chunks must form a contiguous 0..n sequence per file
         let gaps: i64 = conn.prepare_cached("SELECT count(*) FROM (SELECT path, count(*) AS n, max(idx) AS mx FROM vm_file_chunks GROUP BY path) WHERE mx + 1 != n")?.query_row( [], |r| r.get(0))?;
         if gaps > 0 { drift.push(format!("{} files with chunk index gaps", gaps)); }
