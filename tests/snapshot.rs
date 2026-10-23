@@ -179,3 +179,42 @@ fn snapshot_deletion_keeps_the_restore_source_of_other_snapshots() {
     assert_eq!(vm::vm_cat(&c, "/f").unwrap(), vec![5u8; 90_000]);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn rewriting_a_file_is_atomic_to_other_connections() {
+    // A file rewrite is several statements (drop old chunk rows, insert new ones, update the
+    // file row). Another connection must never observe the file with its chunks partly removed:
+    // it sees either the old content or the new content, never an empty or mixed file.
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let (d, db) = tmpdb("atomic");
+    let writer = open(&db);
+    let old = vec![b'a'; 150_000];
+    let new = vec![b'b'; 150_000];
+    vm::vm_add_bytes(&writer, "/f", &old, 0o644, 1).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_db = db.clone();
+    let stop2 = stop.clone();
+    let reader = std::thread::spawn(move || {
+        let r = vm::vm_open(reader_db.to_str().unwrap()).unwrap();
+        let mut bad = Vec::new();
+        let mut reads = 0usize;
+        while !stop2.load(Ordering::SeqCst) {
+            if let Ok(bytes) = vm::vm_cat(&r, "/f") {
+                reads += 1;
+                if bytes.is_empty() || !bytes.iter().all(|&x| x == bytes[0]) || (bytes[0] != b'a' && bytes[0] != b'b') {
+                    bad.push(bytes.len());
+                }
+            }
+        }
+        (reads, bad)
+    });
+    for round in 0..80 {
+        let v = if round % 2 == 0 { &new } else { &old };
+        vm::vm_add_bytes(&writer, "/f", v, 0o644, round).unwrap();
+    }
+    stop.store(true, Ordering::SeqCst);
+    let (reads, bad) = reader.join().unwrap();
+    assert!(reads > 0, "reader must run during rewrites");
+    assert!(bad.is_empty(), "reader saw {} partial file(s) out of {} reads, lengths {:?}", bad.len(), reads, &bad[..bad.len().min(5)]);
+    let _ = std::fs::remove_dir_all(&d);
+}

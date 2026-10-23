@@ -951,14 +951,24 @@ pub fn write_file_checked_pub<R: Read>(conn: &Connection, host: &Path, vm_p: &st
 
 /// Upsert a regular-file row. vm_fs.hash is the whole-file sha256 (sync/stat only).
 fn fs_put_file(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, data: &[u8]) -> Result<()> {
-    chunks_replace(conn, vm_p, data)?;
-    let file_hash = blob_key(data);
-    conn.prepare_cached(
-        "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,NULL,0,NULL)
-         ON CONFLICT(path) DO UPDATE SET kind='file', mode=excluded.mode, mtime=excluded.mtime, size=excluded.size,
-            hash=excluded.hash, content=NULL, compressed=0, link_target=NULL")?
-        .execute(params![vm_p, mode, mtime, data.len() as i64, file_hash.as_slice()])?;
-    Ok(())
+    // One savepoint: the chunk rows are replaced and the file row updated as a single unit, so
+    // another connection sees the old file or the new one, never a file with its chunks removed.
+    // Nests inside a caller's transaction; commits on its own when called alone.
+    conn.execute_batch("SAVEPOINT fs_put;")?;
+    let res: Result<()> = (|| {
+        chunks_replace(conn, vm_p, data)?;
+        let file_hash = blob_key(data);
+        conn.prepare_cached(
+            "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,NULL,0,NULL)
+             ON CONFLICT(path) DO UPDATE SET kind='file', mode=excluded.mode, mtime=excluded.mtime, size=excluded.size,
+                hash=excluded.hash, content=NULL, compressed=0, link_target=NULL")?
+            .execute(params![vm_p, mode, mtime, data.len() as i64, file_hash.as_slice()])?;
+        Ok(())
+    })();
+    match res {
+        Ok(()) => { conn.execute_batch("RELEASE fs_put;")?; Ok(()) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK TO fs_put; RELEASE fs_put;"); Err(e) }
+    }
 }
 
 /// Upsert a non-file row (dir/symlink). Any previous hash is released by the UPDATE trigger.
