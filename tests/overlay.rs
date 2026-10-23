@@ -215,3 +215,95 @@ fn mkdir_then_list_shows_empty_directory() {
     assert!(ov.list("/work/empty").unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn list_matches_per_entry_resolution_on_a_mixed_tree() {
+    // Every child that list() returns must resolve, and every resolvable direct child must be
+    // returned. This pins the merged listing so an optimised list cannot change its result.
+    let (d, base, delta) = setup_tree("listeq");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    // mixed state: a Delta override, a Delta addition, a whiteout, and a nested addition
+    ov.write("/work/src/a.rs", b"override", 0o644, 2).unwrap();
+    ov.write("/work/src/extra.rs", b"e", 0o644, 2).unwrap();
+    ov.remove("/work/link").unwrap();
+    ov.mkdir("/work/src/newdir").unwrap();
+    ov.write("/work/src/newdir/inner", b"i", 0o644, 2).unwrap();
+    let listed = ov.list("/work/src").unwrap();
+    // reference answer: every direct child of /work/src that locate() resolves
+    let mut want: Vec<String> = Vec::new();
+    for cand in ["/work/src/a.rs", "/work/src/deep", "/work/src/extra.rs", "/work/src/newdir"] {
+        if ov.locate(cand).unwrap() != Layer::Missing {
+            want.push(cand.rsplit('/').next().unwrap().to_string());
+        }
+    }
+    want.sort();
+    assert_eq!(listed, want);
+    assert!(!listed.contains(&"inner".to_string()), "grandchildren are not direct children");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn delta_directory_over_base_file_is_not_readable_as_a_file() {
+    // Base has /data/item as a file; Delta replaces it with a directory. The Delta entry wins,
+    // so reading /data/item as a file must fail, not fall through to the base file.
+    let d = std::env::temp_dir().join(format!("overlay-typeover-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let base = d.join("base.db");
+    let b = vm::init_vm_db_with_opts(base.to_str().unwrap(), true, true).unwrap();
+    vm::vm_add_bytes(&b, "/data/item", b"base file", 0o644, 1).unwrap();
+    drop(b);
+    let ov = vm::Overlay::open(&d.join("delta.db"), &base).unwrap();
+    assert_eq!(ov.read("/data/item").unwrap(), b"base file");
+    ov.remove("/data/item").unwrap();
+    ov.mkdir("/data/item").unwrap();
+    assert!(ov.read("/data/item").is_err(), "a Delta directory shadows the base file");
+    assert_eq!(ov.locate("/data/item").unwrap(), Layer::Delta);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn whiteout_matches_exact_ancestors_only() {
+    // a whiteout hides its path and descendants; it must not hide an unrelated sibling that
+    // merely shares a prefix (/work/src vs /work/srcx)
+    let d = std::env::temp_dir().join(format!("overlay-prefix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let base = d.join("base.db");
+    let b = vm::init_vm_db_with_opts(base.to_str().unwrap(), true, true).unwrap();
+    vm::vm_add_bytes(&b, "/work/src/a", b"a", 0o644, 1).unwrap();
+    vm::vm_add_bytes(&b, "/work/srcx/b", b"b", 0o644, 1).unwrap();
+    vm::vm_add_bytes(&b, "/top", b"t", 0o644, 1).unwrap();
+    drop(b);
+    let ov = vm::Overlay::open(&d.join("delta.db"), &base).unwrap();
+    ov.remove("/work/src").unwrap();
+    assert_eq!(ov.locate("/work/src/a").unwrap(), Layer::Missing, "descendant of removed dir hidden");
+    assert_eq!(ov.read("/work/srcx/b").unwrap(), b"b", "sibling sharing a text prefix is not hidden");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn read_and_locate_agree_on_every_state() {
+    // read() and locate() are computed by different code paths now; they must agree on the
+    // layer for each state of a path (base, delta over base, whited out, recreated, missing).
+    let (d, base, delta) = setup_tree("agree");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    let check = |ov: &vm::Overlay, p: &str| {
+        let loc = ov.locate(p).unwrap();
+        let r = ov.read(p);
+        match loc {
+            Layer::Missing => assert!(r.is_err(), "{} missing but read succeeded", p),
+            _ => assert!(r.is_ok(), "{} located {:?} but read failed: {:?}", p, loc, r.err()),
+        }
+    };
+    check(&ov, "/work/src/a.rs");                 // base
+    ov.write("/work/src/a.rs", b"o", 0o644, 2).unwrap();
+    check(&ov, "/work/src/a.rs");                 // delta over base
+    ov.remove("/work/src/a.rs").unwrap();
+    check(&ov, "/work/src/a.rs");                 // whited out
+    ov.write("/work/src/a.rs", b"r", 0o644, 3).unwrap();
+    check(&ov, "/work/src/a.rs");                 // recreated
+    ov.remove("/work/src").unwrap();
+    check(&ov, "/work/src/deep/b.rs");            // under a removed dir
+    let _ = std::fs::remove_dir_all(&d);
+}

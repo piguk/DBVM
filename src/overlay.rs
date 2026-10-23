@@ -62,11 +62,26 @@ impl Overlay {
     /// Read a regular file through the overlay.
     pub fn read(&self, vm_path: &str) -> Result<Vec<u8>> {
         let p = normalize_vm_path(vm_path);
-        match self.locate(&p)? {
-            Layer::Delta => self.read_from("main", &p),
-            Layer::Base => self.read_from("base", &p),
-            Layer::Missing => Err(anyhow!("not found in overlay: {}", p)),
+        match self.lookup_file(&p)? {
+            Some(schema) => self.read_from(schema, &p),
+            None => Err(anyhow!("not found in overlay: {}", p)),
         }
+    }
+
+    /// Which schema holds a regular file the overlay exposes at `p`, or None.
+    ///
+    /// Two primary-key probes, Delta then Base. A Delta entry is never hidden (writes clear the
+    /// whiteouts that could hide it), so it needs no whiteout check. A Base entry is checked
+    /// against whiteouts only after it has matched.
+    fn lookup_file(&self, p: &str) -> Result<Option<&'static str>> {
+        if let Some(kind) = self.kind_in("main", p)? {
+            return Ok(if kind == "file" { Some("main") } else { None });
+        }
+        if let Some(kind) = self.kind_in("base", p)? {
+            if kind != "file" || self.whited_out(p)? { return Ok(None); }
+            return Ok(Some("base"));
+        }
+        Ok(None)
     }
 
     /// Write a regular file. Always goes to Delta; clears any whiteout for the path.
@@ -129,8 +144,12 @@ impl Overlay {
         target.ok_or_else(|| anyhow!("not a symlink: {}", p))
     }
 
-    /// Names of the direct children of a directory, merged across layers. A Delta entry hides
-    /// the Base entry with the same path; whiteouts hide Base entries; Delta entries are added.
+    /// Names of the direct children of a directory, merged across layers.
+    ///
+    /// Three queries, not one per entry: Delta names, Base names, and the whiteouts that can hide
+    /// a Base name. A whiteout on the directory or any ancestor hides every Base child; a whiteout
+    /// on a child path hides that child. Delta names are never hidden by whiteouts (a write clears
+    /// them), so a name present in Delta always appears.
     pub fn list(&self, vm_path: &str) -> Result<Vec<String>> {
         let p = normalize_vm_path(vm_path);
         if self.kind_in_overlay(&p)?.as_deref() != Some("dir") {
@@ -138,20 +157,62 @@ impl Overlay {
         }
         let prefix = if p == "/" { "/".to_string() } else { format!("{}/", p) };
         let like = format!("{}%", prefix);
-        let mut seen = std::collections::BTreeSet::new();
-        for schema in ["main", "base"] {
-            let sql = format!("SELECT path FROM {}.vm_fs WHERE path LIKE ?1", schema);
-            let mut st = self.conn.prepare(&sql)?;
+        let direct = |path: &str| -> Option<String> {
+            let rest = path.get(prefix.len()..)?;
+            if rest.is_empty() || rest.contains('/') { None } else { Some(rest.to_string()) }
+        };
+
+        let mut delta_names = std::collections::BTreeSet::new();
+        {
+            let mut st = self.conn.prepare("SELECT path FROM main.vm_fs WHERE path LIKE ?1")?;
             for r in st.query_map(params![like], |r| r.get::<_, String>(0))? {
-                let child = r?;
-                let rest = &child[prefix.len()..];
-                if rest.is_empty() || rest.contains('/') { continue; }
-                let full = format!("{}{}", prefix, rest);
-                if self.locate(&full)? == Layer::Missing { continue; }
-                seen.insert(rest.to_string());
+                if let Some(n) = direct(&r?) { delta_names.insert(n); }
             }
         }
-        Ok(seen.into_iter().collect())
+        let mut base_names = std::collections::BTreeSet::new();
+        {
+            let mut st = self.conn.prepare("SELECT path FROM base.vm_fs WHERE path LIKE ?1")?;
+            for r in st.query_map(params![like], |r| r.get::<_, String>(0))? {
+                if let Some(n) = direct(&r?) { base_names.insert(n); }
+            }
+        }
+        // whiteouts that can affect this directory's Base children: on p, on an ancestor, or below p
+        let mut ancestors = vec![p.clone()];
+        {
+            let mut cur = p.clone();
+            while let Some(i) = cur.rfind('/') {
+                if i == 0 { ancestors.push("/".to_string()); break; }
+                cur.truncate(i);
+                ancestors.push(cur.clone());
+            }
+        }
+        let mut hide_all = false;
+        let mut hidden_children = std::collections::BTreeSet::new();
+        {
+            let mut st = self.conn.prepare("SELECT path FROM main.vm_whiteouts WHERE path = ?1 OR path LIKE ?2")?;
+            for r in st.query_map(params![p, like], |r| r.get::<_, String>(0))? {
+                let w = r?;
+                if ancestors.iter().any(|a| a == &w) { hide_all = true; }
+                if let Some(n) = direct(&w) { hidden_children.insert(n); }
+            }
+        }
+        // ancestors of p can be whited out too: check them directly
+        for a in &ancestors[1..] {
+            if self.whited_out_exact(a)? { hide_all = true; }
+        }
+        if hide_all {
+            return Ok(delta_names.into_iter().collect());
+        }
+        let mut out = delta_names;
+        for n in base_names {
+            if !hidden_children.contains(&n) { out.insert(n); }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// True if exactly this path has a whiteout (no ancestor walk).
+    fn whited_out_exact(&self, p: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT 1 FROM main.vm_whiteouts WHERE path=?1", params![p], |_| Ok(())).optional()?.is_some())
     }
 
     /// Kind of a path as seen through the overlay (Delta first), or None if missing.
@@ -185,16 +246,18 @@ impl Overlay {
 
     /// True if `p` or any ancestor of it is whited out.
     fn whited_out(&self, p: &str) -> Result<bool> {
+        // p and each of its ancestors, in one statement: a whiteout on any of them hides p
+        let mut paths = vec![p.to_string()];
         let mut cur = p.to_string();
-        loop {
-            if self.conn.query_row("SELECT 1 FROM main.vm_whiteouts WHERE path=?1", params![cur], |_| Ok(())).optional()?.is_some() {
-                return Ok(true);
-            }
-            match cur.rfind('/') {
-                Some(0) | None => return Ok(false),
-                Some(i) => cur.truncate(i),
-            }
+        while let Some(i) = cur.rfind('/') {
+            if i == 0 { paths.push("/".to_string()); break; }
+            cur.truncate(i);
+            paths.push(cur.clone());
         }
+        let sql = format!("SELECT 1 FROM main.vm_whiteouts WHERE path IN ({}) LIMIT 1",
+            vec!["?"; paths.len()].join(","));
+        let params_vec: Vec<&dyn rusqlite::ToSql> = paths.iter().map(|x| x as &dyn rusqlite::ToSql).collect();
+        Ok(self.conn.query_row(&sql, params_vec.as_slice(), |_| Ok(())).optional()?.is_some())
     }
 
     /// Make `p` visible for writing. If an ancestor of `p` is whited out, that whiteout is what
