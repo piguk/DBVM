@@ -366,6 +366,8 @@ pub fn vm_counter(conn: &Connection, key: &str) -> Result<i64> {
     Ok(v.and_then(|x| x.parse().ok()).unwrap_or(0))
 }
 
+pub use crate::overlay::Overlay;
+
 pub fn vm_open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     let _ = vm_apply_pragmas(&conn);
@@ -606,10 +608,19 @@ pub fn vm_set_dict(conn: &Connection, dict: &[u8], samples: usize) -> Result<i64
     Ok(conn.last_insert_rowid())
 }
 /// Dictionary bytes for a given id. Cached per (database path, id): rows are immutable.
+/// Dictionary `id` of the main database (the common case).
 fn dict_by_id(conn: &Connection, id: i64) -> Result<Arc<Vec<u8>>> {
-    let key = (conn.path().unwrap_or("").to_string(), id);
+    dict_by_id_in(conn, "main", id)
+}
+
+/// Dictionary `id` as stored in attached schema `schema` (`main`, or e.g. `base`). Dictionary ids
+/// are per database, so the cache key is the schema's file path plus the id, never the id alone.
+fn dict_by_id_in(conn: &Connection, schema: &str, id: i64) -> Result<Arc<Vec<u8>>> {
+    let file = schema_file(conn, schema)?;
+    let key = (file, id);
     if let Some(d) = dict_cache().lock().unwrap().get(&key) { return Ok(d.clone()); }
-    let bytes: Vec<u8> = conn.prepare_cached("SELECT dict FROM vm_dicts WHERE id=?1")?
+    let sql = format!("SELECT dict FROM {}.vm_dicts WHERE id=?1", schema);
+    let bytes: Vec<u8> = conn.prepare(&sql)?
         .query_row(params![id], |r| r.get(0))
         .optional()?
         .ok_or_else(|| anyhow!("missing dictionary {} (block written with it cannot be read)", id))?;
@@ -623,6 +634,22 @@ fn dict_cache() -> &'static Mutex<LruCache<(String, i64), Arc<Vec<u8>>>> {
 }
 /// Decode one stored block. The only decode entry point: flag 3 uses the dictionary the block
 /// was written with (dict_id), never a process-global one.
+/// File path of an attached schema (`main` included), used as the identity of its dictionaries.
+fn schema_file(conn: &Connection, schema: &str) -> Result<String> {
+    let sql = "SELECT file FROM pragma_database_list WHERE name=?1";
+    let f: Option<String> = conn.query_row(sql, params![schema], |r| r.get(0)).optional()?;
+    f.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("schema {} has no file", schema))
+}
+
+/// Decode a block that lives in attached schema `schema`, using that schema's dictionary.
+pub fn decode_block_in(conn: &Connection, schema: &str, body: &[u8], flag: i64, dict_id: i64) -> Result<Vec<u8>> {
+    if flag == 3 {
+        let d = dict_by_id_in(conn, schema, dict_id)?;
+        return decompress_bytes_zstd_with_dict(body, &d);
+    }
+    decompress_bytes_raw(body, flag)
+}
+
 pub fn decode_block(conn: &Connection, body: &[u8], flag: i64, dict_id: i64) -> Result<Vec<u8>> {
     if flag == 3 {
         let d = dict_by_id(conn, dict_id)?;
