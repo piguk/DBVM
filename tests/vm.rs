@@ -759,3 +759,61 @@ fn bulk_index_definitions_are_unchanged() {
     vm::with_bulk_indexes_dropped(&c, || Ok(())).unwrap();
     assert_eq!(defs(&c), before);
 }
+
+#[test]
+fn sync_detects_same_size_edit_within_one_second() {
+    // Two writes of equal length inside the same second. A real edit moves the nanosecond mtime
+    // but not necessarily the second. The old check (size + second mtime) misses it; the ns check
+    // catches it. Pin only the SECOND so the nanoseconds reflect the second write.
+    let (_g, db) = tmpdb("mtime-same-sec");
+    let host = _g.path().join("root");
+    std::fs::create_dir_all(&host).unwrap();
+    let f = host.join("cfg");
+    std::fs::write(&f, b"AAAA").unwrap();
+    let c = open(&db);
+    vm::vm_sync_from_host(&c, &host).unwrap();
+    let t1 = std::fs::metadata(&f).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap();
+    std::fs::write(&f, b"BBBB").unwrap();
+    let t2 = std::fs::metadata(&f).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap();
+    // only meaningful if the two writes landed in the same second with different nanoseconds
+    if t1.as_secs() != t2.as_secs() || t1.subsec_nanos() == t2.subsec_nanos() {
+        eprintln!("skip: writes not in the same second with distinct ns on this filesystem");
+        return;
+    }
+    let pinned = std::time::UNIX_EPOCH + std::time::Duration::new(t2.as_secs(), 0);
+    let times = std::fs::FileTimes::new().set_modified(pinned);
+    std::fs::File::options().write(true).open(&f).unwrap().set_times(times).unwrap();
+    // whole-second pin: same second as before, but the nanoseconds now differ from the stored ones
+    vm::vm_sync_from_host(&c, &host).unwrap();
+    assert_eq!(vm::vm_cat(&c, "/cfg").unwrap(), b"BBBB", "same-size same-second edit must be picked up");
+}
+
+#[test]
+fn write_during_read_leaves_ns_unknown() {
+    // A reader that rewrites the host file in the middle of the read. The ns stamp must not be
+    // recorded as the post-write value, or the next sync would trust content that is partly old.
+    use std::io::Read;
+    let (_g, db) = tmpdb("race-read");
+    let host = _g.path().join("root");
+    std::fs::create_dir_all(&host).unwrap();
+    let f = host.join("big");
+    std::fs::write(&f, vec![b'a'; 3 * 65536]).unwrap();
+    struct Mutator<'a> { inner: std::fs::File, path: &'a std::path::Path, done: bool, n: usize }
+    impl Read for Mutator<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if !self.done && self.n >= 65536 {
+                // concurrent writer changes the file after the first chunk has been read
+                std::fs::write(self.path, vec![b'b'; 3 * 65536])?;
+                self.done = true;
+            }
+            let k = self.inner.read(out)?;
+            self.n += k;
+            Ok(k)
+        }
+    }
+    let c = open(&db);
+    let mut m = Mutator { inner: std::fs::File::open(&f).unwrap(), path: &f, done: false, n: 0 };
+    vm::write_file_checked_pub(&c, &f, "/big", 0o644, 1, &mut m).unwrap();
+    let ns: i64 = c.query_row("SELECT mtime_ns FROM vm_fs WHERE path='/big'", [], |r| r.get(0)).unwrap();
+    assert_eq!(ns, 0, "a file that changed during the read must not carry a trusted ns stamp");
+}

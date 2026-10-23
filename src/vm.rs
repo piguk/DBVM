@@ -14,12 +14,13 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///   3 = triggers maintain vm_meta counters (blob_bytes/file_count/logical_bytes)
 ///   4 = blob keys are raw 32-byte SHA-256 BLOBs (UNIQUE); vm_blobs keeps a rowid so large
 ///       content is not stored inside a key B-tree (WITHOUT ROWID measured no smaller)
+///   7 = vm_fs.mtime_ns: host nanosecond mtime used only to detect changes during sync (0 = unknown)
 ///   6 = zstd dictionaries are append-only rows in vm_dicts; every flag-3 blob records its
 ///       dictionary in vm_blobs.dict_id. Retraining no longer makes older blocks unreadable.
 ///   5 = file content is split into CHUNK_SIZE chunks listed in vm_file_chunks; a file's
 ///       refcount on vm_blobs comes from its chunk rows. vm_fs.hash = whole-file sha256
 ///       (informational, no refcounting). Legacy single-blob files keep working via vm_fs.hash.
-pub const VM_USER_VERSION: u32 = 6;
+pub const VM_USER_VERSION: u32 = 7;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -105,6 +106,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
                 3 => migrate_3_to_4(conn)?,
                 4 => migrate_4_to_5(conn)?,
                 5 => migrate_5_to_6(conn)?,
+                6 => migrate_6_to_7(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -202,6 +204,16 @@ fn migrate_4_to_5(conn: &Connection) -> Result<()> {
         DELETE FROM vm_blobs WHERE refcnt = 0;
     ")?;
     conn.execute_batch(VM_TRIGGERS_SQL)?;
+    Ok(())
+}
+
+/// 6 -> 7: add the change-detection nanosecond column. Existing rows get 0 (unknown), so they
+/// fall back to the second-granularity comparison until they are next written.
+fn migrate_6_to_7(conn: &Connection) -> Result<()> {
+    let has: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info('vm_fs') WHERE name='mtime_ns'", [], |r| r.get(0))?;
+    if has == 0 {
+        conn.execute_batch("ALTER TABLE vm_fs ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT 0;")?;
+    }
     Ok(())
 }
 
@@ -363,6 +375,7 @@ CREATE TABLE IF NOT EXISTS vm_fs(
   uid INTEGER NOT NULL DEFAULT 0,
   gid INTEGER NOT NULL DEFAULT 0,
   mtime INTEGER NOT NULL DEFAULT 0,
+  mtime_ns INTEGER NOT NULL DEFAULT 0,
   size INTEGER NOT NULL DEFAULT 0,
   link_target TEXT,
   content BLOB,
@@ -782,6 +795,11 @@ fn chunks_replace(conn: &Connection, vm_p: &str, data: &[u8]) -> Result<()> {
 /// SAVEPOINT so a read or write error leaves the previous version of the file intact.
 /// Returns the file size written.
 pub fn fs_put_file_stream<R: Read>(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, src: &mut R) -> Result<u64> {
+    fs_put_file_stream_ns(conn, vm_p, mode, mtime, 0, src)
+}
+
+/// As `fs_put_file_stream`, also recording the host's nanosecond mtime (0 = unknown).
+pub fn fs_put_file_stream_ns<R: Read>(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, mtime_ns: i64, src: &mut R) -> Result<u64> {
     use sha2::{Digest, Sha256};
     conn.execute_batch("SAVEPOINT put_stream;")?;
     let res: Result<u64> = (|| {
@@ -811,16 +829,51 @@ pub fn fs_put_file_stream<R: Read>(conn: &Connection, vm_p: &str, mode: i64, mti
         }
         let file_hash: [u8; 32] = whole.finalize().into();
         conn.prepare_cached(
-            "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,NULL,0,NULL)
-             ON CONFLICT(path) DO UPDATE SET kind='file', mode=excluded.mode, mtime=excluded.mtime, size=excluded.size,
+            "INSERT INTO vm_fs(path,kind,mode,mtime,mtime_ns,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,?6,NULL,0,NULL)
+             ON CONFLICT(path) DO UPDATE SET kind='file', mode=excluded.mode, mtime=excluded.mtime, mtime_ns=excluded.mtime_ns, size=excluded.size,
                 hash=excluded.hash, content=NULL, compressed=0, link_target=NULL")?
-            .execute(params![vm_p, mode, mtime, total as i64, file_hash.as_slice()])?;
+            .execute(params![vm_p, mode, mtime, mtime_ns, total as i64, file_hash.as_slice()])?;
         Ok(total)
     })();
     match res {
         Ok(n) => { conn.execute_batch("RELEASE put_stream;")?; Ok(n) }
         Err(e) => { let _ = conn.execute_batch("ROLLBACK TO put_stream; RELEASE put_stream;"); Err(e) }
     }
+}
+
+/// Nanosecond mtime of a host path, 0 if unavailable.
+fn host_mtime_ns(path: &Path) -> i64 {
+    std::fs::symlink_metadata(path).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Two nanosecond stamps agree for change detection only when both are known. Unknown (0) on
+/// either side means "cannot tell from ns", so the comparison falls back to the second-granularity
+/// check that already passed.
+fn ns_matches(stored: i64, host: i64) -> bool {
+    stored == 0 || host == 0 || stored == host
+}
+
+/// Write a host file's content and record its nanosecond mtime, but only if the file did not
+/// change while it was being read. The stamp is taken before the read and again after; if they
+/// differ, the content may be a mix of old and new, so the row keeps ns = 0 and the next sync
+/// re-reads it. Recording the pre-read stamp alone would let a concurrent write go unnoticed.
+fn write_file_checked<R: Read>(conn: &Connection, host: &Path, vm_p: &str, mode: i64, mtime: i64, src: &mut R) -> Result<u64> {
+    let before = host_mtime_ns(host);
+    let n = fs_put_file_stream_ns(conn, vm_p, mode, mtime, before, src)?;
+    let after = host_mtime_ns(host);
+    if before != after || before == 0 {
+        conn.prepare_cached("UPDATE vm_fs SET mtime_ns=0 WHERE path=?1")?.execute(params![vm_p])?;
+    }
+    Ok(n)
+}
+
+/// Public for tests: see `write_file_checked`.
+pub fn write_file_checked_pub<R: Read>(conn: &Connection, host: &Path, vm_p: &str, mode: i64, mtime: i64, src: &mut R) -> Result<u64> {
+    write_file_checked(conn, host, vm_p, mode, mtime, src)
 }
 
 /// Upsert a regular-file row. vm_fs.hash is the whole-file sha256 (sync/stat only).
@@ -1243,8 +1296,39 @@ pub fn with_bulk_indexes_dropped<T>(conn: &Connection, load: impl FnOnce() -> Re
 /// SQLite writes stay serial in walk order inside short transactions. The dictionary is read
 /// once per run, so every file is encoded exactly as the serial path would encode it.
 /// Output matches `vm_pack_host_dir` (verified by a test); only wall time differs.
+/// Default content-cache limit: 2 GiB. Chosen as a size that keeps materialize fast for typical
+/// trees without letting the cache grow unbounded; override with SELF_VM_CACHE_MAX.
+pub const DEFAULT_CACHE_MAX: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Parse a size like "512M", "2G", "1048576". None if malformed.
+pub fn parse_size_bytes(s: &str) -> Option<u64> {
+    let t = s.trim().to_ascii_lowercase();
+    let (num, mul) = match t.chars().last()? {
+        'k' => (&t[..t.len()-1], 1024u64),
+        'm' => (&t[..t.len()-1], 1024 * 1024),
+        'g' => (&t[..t.len()-1], 1024 * 1024 * 1024),
+        c if c.is_ascii_digit() => (t.as_str(), 1),
+        _ => return None,
+    };
+    num.parse::<u64>().ok()?.checked_mul(mul)
+}
+
+/// Effective content-cache limit: SELF_VM_CACHE_MAX if set and valid, else the default.
+/// A set-but-invalid value is an error on stderr, not a silent fallback.
+pub fn cache_limit_from_env() -> u64 {
+    match std::env::var("SELF_VM_CACHE_MAX") {
+        Ok(v) => match parse_size_bytes(&v) {
+            Some(n) => n,
+            None => { eprintln!("warning: SELF_VM_CACHE_MAX={:?} is not a size; using default", v); DEFAULT_CACHE_MAX }
+        },
+        Err(_) => DEFAULT_CACHE_MAX,
+    }
+}
+
 pub fn vm_pack_host_dir_parallel(conn: &Connection, host_dir: &str, vm_prefix: &str) -> Result<usize> {
     let n = vm_pack_host_dir_parallel_inner(conn, host_dir, vm_prefix)?;
+    // bound the content cache once per import (a full scan, so not per file)
+    let _ = enforce_cache_limit(&cache_dir(), cache_limit_from_env());
     // a bulk load changes the data distribution the planner relies on; refresh statistics
     // (cheap: a few ms on a 30k-file tree). Failure here is harmless, so it is not an error.
     let _ = conn.execute_batch("PRAGMA optimize;");
@@ -1414,6 +1498,11 @@ fn prune_scratch(conn: &Connection, dest: &Path) -> Result<usize> {
 }
 
 pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
+    vm_materialize_tree_with_cache(conn, dest, &cache_dir())
+}
+
+/// Materialize with an explicit content-cache root (tests and callers that manage their own cache).
+pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root: &Path) -> Result<usize> {
     use rayon::prelude::*;
     std::fs::create_dir_all(dest)?;
     if dest.exists() { prune_scratch(conn, dest)?; }
@@ -1461,7 +1550,7 @@ pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
         let Some(data) = load_task_bytes(db_path.as_deref(), t) else { return; };
         if let Some(par)=host.parent(){ let _ = std::fs::create_dir_all(par); }
         let key = t.hash.clone().unwrap_or_else(|| fx_hash_u64(&data));
-        let cache_p = cache_path_for_hash(&key);
+        let cache_p = cache_root.join(&key[0..2.min(key.len())]).join(&key);
         let done = cache_p.exists() && try_hardlink_or_copy(&cache_p, &host).is_ok();
         if !done {
             let _ = std::fs::write(&host, &data);
@@ -1509,11 +1598,11 @@ pub fn vm_sync_report(conn: &Connection, host_root: &Path) -> Result<SyncReport>
     #[cfg(unix)] use std::os::unix::fs::PermissionsExt;
 
     // 1) DB side: metadata only (no content, no hash).
-    struct Row { kind: String, mode: i64, mtime: i64, size: i64, link: Option<String> }
+    struct Row { kind: String, mode: i64, mtime: i64, mtime_ns: i64, size: i64, link: Option<String> }
     let mut db: HashMap<String, Row> = HashMap::new();
     {
-        let mut st = conn.prepare("SELECT path, kind, mode, mtime, size, link_target FROM vm_fs")?;
-        for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, Row { kind: r.get(1)?, mode: r.get(2)?, mtime: r.get(3)?, size: r.get(4)?, link: r.get(5)? })))? {
+        let mut st = conn.prepare("SELECT path, kind, mode, mtime, size, link_target, mtime_ns FROM vm_fs")?;
+        for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, Row { kind: r.get(1)?, mode: r.get(2)?, mtime: r.get(3)?, size: r.get(4)?, link: r.get(5)?, mtime_ns: r.get(6)? })))? {
             let (p, row) = r?;
             db.insert(p, row);
         }
@@ -1533,6 +1622,7 @@ pub fn vm_sync_report(conn: &Connection, host_root: &Path) -> Result<SyncReport>
         #[cfg(unix)] let mode = md.permissions().mode() as i64;
         #[cfg(not(unix))] let mode = 420i64;
         let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(now);
+        let ns_before = host_mtime_ns(e.path());
         seen.insert(vm_p.clone());
         let ft = md.file_type();
         let host_kind = if ft.is_symlink() { "symlink" } else if md.is_dir() { "dir" } else if md.is_file() { "file" } else { continue };
@@ -1548,7 +1638,7 @@ pub fn vm_sync_report(conn: &Connection, host_root: &Path) -> Result<SyncReport>
                 }
                 (None, _) => {
                     let mut f = std::fs::File::open(e.path())?;
-                    fs_put_file_stream(conn, &vm_p, mode, mtime, &mut f)?;
+                    write_file_checked(conn, e.path(), &vm_p, mode, mtime, &mut f)?;
                     Ok(Some(false))
                 }
                 (Some(p), "dir") if p.kind == "dir" => {
@@ -1565,9 +1655,12 @@ pub fn vm_sync_report(conn: &Connection, host_root: &Path) -> Result<SyncReport>
                     }
                 }
                 (Some(p), "file") if p.kind == "file" => {
-                    if p.size == md.len() as i64 && p.mtime == mtime && p.mode == mode { Ok(None) } else {
+                    if p.size == md.len() as i64 && p.mtime == mtime && p.mode == mode && ns_matches(p.mtime_ns, ns_before) {
+                        Ok(None)
+                    } else {
+                        // a write during the read leaves ns unknown (0), so the next sync re-reads
                         let mut f = std::fs::File::open(e.path())?;
-                        fs_put_file_stream(conn, &vm_p, mode, mtime, &mut f)?;
+                        write_file_checked(conn, e.path(), &vm_p, mode, mtime, &mut f)?;
                         Ok(Some(true))
                     }
                 }
@@ -1576,7 +1669,7 @@ pub fn vm_sync_report(conn: &Connection, host_root: &Path) -> Result<SyncReport>
                     match host_kind {
                         "dir" => fs_put_node(conn, &vm_p, "dir", mode, now, None)?,
                         "symlink" => { let t = std::fs::read_link(e.path())?; fs_put_node(conn, &vm_p, "symlink", mode, now, Some(&t.to_string_lossy()))? }
-                        _ => { let mut f = std::fs::File::open(e.path())?; fs_put_file_stream(conn, &vm_p, mode, mtime, &mut f)?; }
+                        _ => { let mut f = std::fs::File::open(e.path())?; write_file_checked(conn, e.path(), &vm_p, mode, mtime, &mut f)?; }
                     }
                     Ok(Some(true))
                 }
@@ -1770,6 +1863,32 @@ pub fn vm_cache_info() -> (PathBuf, usize, u64) {
     }
     (dir, count, bytes)
 }
+/// Evict least-recently-used content-cache files under `root` until its total size is at most
+/// `max_bytes`. Returns (files removed, bytes freed). Every cache file is rebuildable from the
+/// database, so eviction only costs time on the next materialize, never data.
+///
+/// Recency is file mtime, which the cache refreshes on each write. This is a full scan, so it
+/// is meant to run once per import, not per file.
+pub fn enforce_cache_limit(root: &Path, max_bytes: u64) -> Result<(usize, u64)> {
+    if !root.exists() { return Ok((0, 0)); }
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    for e in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if e.file_type().is_file() {
+            let md = match e.metadata() { Ok(m) => m, Err(_) => continue };
+            files.push((e.path().to_path_buf(), md.len(), md.modified().unwrap_or(std::time::UNIX_EPOCH)));
+        }
+    }
+    let mut total: u64 = files.iter().map(|(_, b, _)| *b).sum();
+    if total <= max_bytes { return Ok((0, 0)); }
+    files.sort_by_key(|(_, _, t)| *t);
+    let (mut removed, mut freed) = (0usize, 0u64);
+    for (p, b, _) in files {
+        if total <= max_bytes { break; }
+        if std::fs::remove_file(&p).is_ok() { total -= b; freed += b; removed += 1; }
+    }
+    Ok((removed, freed))
+}
+
 pub fn vm_cache_prune(max_bytes: u64) -> Result<(usize, u64)> {
     let dir = cache_dir();
     if !dir.exists() { return Ok((0,0)); }

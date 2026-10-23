@@ -74,7 +74,7 @@ fn dump_to_fd(db: &Connection, fd: i32) -> anyhow::Result<()> {
 /// Library bytes live in a shared, content-addressed cache (`cache_dir()/bundle/<sha256>`), so
 /// a repeat launch writes nothing. The per-run directory holds only links to those cache files
 /// plus soname aliases, and is the only thing removed afterwards.
-fn extract_bundle(db: &Connection) -> Option<PathBuf> {
+fn extract_bundle(db: &Connection) -> Option<(PathBuf, Vec<selfdb::bundle_cache::Hold>)> {
     use sha2::{Digest, Sha256};
     let cache = selfdb::vm::cache_dir().join("bundle");
     let _ = std::fs::create_dir_all(&cache);
@@ -94,6 +94,7 @@ fn extract_bundle(db: &Connection) -> Option<PathBuf> {
     if list.is_empty(){ return None; }
     let mut dir_created: Option<PathBuf> = None;
     let mut written = 0usize;
+    let mut holds: Vec<selfdb::bundle_cache::Hold> = Vec::new();
     for (sn_opt, path, hash_opt) in list {
         let use_name: String = sn_opt.as_ref().filter(|s| !s.is_empty()).cloned()
             .unwrap_or_else(|| Path::new(&path).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or("lib.so".to_string()));
@@ -133,7 +134,11 @@ fn extract_bundle(db: &Connection) -> Option<PathBuf> {
         };
         let out = dir.join(&use_name);
         if std::fs::symlink_metadata(&out).is_ok() { continue; }
-        if std::os::unix::fs::symlink(&entry, &out).is_ok() { written += 1; }
+        if std::os::unix::fs::symlink(&entry, &out).is_ok() {
+            written += 1;
+            // keep the entry alive (not evictable) until the guest exits
+            if let Ok(h) = selfdb::bundle_cache::hold(&entry) { holds.push(h); }
+        }
         let base = Path::new(&path).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
         if base != use_name && !base.is_empty() {
             let alt = dir.join(&base);
@@ -142,7 +147,9 @@ fn extract_bundle(db: &Connection) -> Option<PathBuf> {
     }
     let d = dir_created?;
     if written == 0 { let _ = std::fs::remove_dir_all(&d); return None; }
-    Some(d)
+    // bound the shared cache. The entries this launch uses are already held, so they survive.
+    let _ = selfdb::bundle_cache::enforce_bundle_limit(&cache, selfdb::vm::cache_limit_from_env());
+    Some((d, holds))
 }
 fn build_argv(guest: &[String]) -> (Vec<CString>, Vec<*const libc::c_char>) {
     let cstrs: Vec<CString>=guest.iter().map(|s| CString::new(s.as_bytes()).unwrap()).collect();
@@ -196,7 +203,9 @@ fn build_env(bundle_dir: Option<&PathBuf>) -> (Vec<CString>, Vec<*const libc::c_
     }
 }
 fn run_via_memfd(db: Connection, guest: Vec<String>) -> ! {
-    let bundle_dir = extract_bundle(&db);
+    let extracted = extract_bundle(&db);
+    // the holds must live until the guest exits, so keep them in scope through waitpid
+    let (bundle_dir, _holds) = match extracted { Some((d, h)) => (Some(d), h), None => (None, Vec::new()) };
     let mut fd: i32;
     unsafe { fd = libc::syscall(libc::SYS_memfd_create as libc::c_long, CString::new("self-elf").unwrap().as_ptr(), MFD_CLOEXEC as libc::c_long) as i32; }
     if fd<0 {

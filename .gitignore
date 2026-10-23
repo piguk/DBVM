@@ -6,3 +6,4 @@
 *.so.*
 /.workflow/
 *.snap.*
+/examples/greet/app
