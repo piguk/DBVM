@@ -14,7 +14,10 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///   3 = triggers maintain vm_meta counters (blob_bytes/file_count/logical_bytes)
 ///   4 = blob keys are raw 32-byte SHA-256 BLOBs (UNIQUE); vm_blobs keeps a rowid so large
 ///       content is not stored inside a key B-tree (WITHOUT ROWID measured no smaller)
-pub const VM_USER_VERSION: u32 = 4;
+///   5 = file content is split into CHUNK_SIZE chunks listed in vm_file_chunks; a file's
+///       refcount on vm_blobs comes from its chunk rows. vm_fs.hash = whole-file sha256
+///       (informational, no refcounting). Legacy single-blob files keep working via vm_fs.hash.
+pub const VM_USER_VERSION: u32 = 5;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -98,6 +101,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
                 1 => migrate_1_to_2(conn)?,
                 2 => migrate_2_to_3(conn)?,
                 3 => migrate_3_to_4(conn)?,
+                4 => migrate_4_to_5(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -118,7 +122,7 @@ fn migrate_1_to_2(conn: &Connection) -> Result<()> {
     conn.execute_batch("UPDATE vm_blobs SET refcnt=0;
         UPDATE vm_blobs SET refcnt=(SELECT count(*) FROM vm_fs f WHERE f.hash=vm_blobs.hash);
         DELETE FROM vm_blobs WHERE refcnt=0;")?;
-    conn.execute_batch(VM_TRIGGERS_SQL)?;
+    conn.execute_batch(TRIGGERS_V2_SQL)?;
     Ok(())
 }
 
@@ -168,9 +172,33 @@ fn migrate_3_to_4(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_vm_blobs_refcnt ON vm_blobs(refcnt);
         CREATE INDEX IF NOT EXISTS idx_vm_fs_hash ON vm_fs(hash);
     ")?;
-    conn.execute_batch(VM_TRIGGERS_SQL)?;
+    // schema 4 has no vm_file_chunks yet and no refcount triggers: 4->5 installs them.
     conn.execute_batch(VM_COUNTER_TRIGGERS_SQL)?;
     conn.execute_batch(VM_COUNTERS_INIT_SQL)?;
+    Ok(())
+}
+
+/// 4 -> 5: add vm_file_chunks; existing single-blob files become one-row chunk lists
+/// (chunk = whole file). Keeping one chunk per file preserves bytes exactly; re-chunking
+/// at CHUNK_SIZE is a separate, optional rewrite (see vm-rechunk).
+fn migrate_4_to_5(conn: &Connection) -> Result<()> {
+    conn.execute_batch("
+        DROP TRIGGER IF EXISTS vm_fs_hash_ins; DROP TRIGGER IF EXISTS vm_fs_hash_del; DROP TRIGGER IF EXISTS vm_fs_hash_upd;
+        CREATE TABLE IF NOT EXISTS vm_file_chunks(
+            path TEXT NOT NULL,
+            idx INTEGER NOT NULL,
+            hash BLOB NOT NULL,
+            PRIMARY KEY(path, idx)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_vm_file_chunks_hash ON vm_file_chunks(hash);
+        -- every regular file currently referenced by vm_fs.hash becomes a single chunk
+        INSERT INTO vm_file_chunks(path, idx, hash)
+          SELECT path, 0, hash FROM vm_fs WHERE kind='file' AND hash IS NOT NULL;
+        -- recount from chunk rows (old vm_fs-driven counts are discarded)
+        UPDATE vm_blobs SET refcnt = (SELECT count(*) FROM vm_file_chunks c WHERE c.hash = vm_blobs.hash);
+        DELETE FROM vm_blobs WHERE refcnt = 0;
+    ")?;
+    conn.execute_batch(VM_TRIGGERS_SQL)?;
     Ok(())
 }
 
@@ -181,7 +209,8 @@ fn migrate_2_to_3(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-const VM_TRIGGERS_SQL: &str = "
+/// Schema-2 refcount triggers (vm_fs.hash drives refcnt). Frozen for historical migrations.
+const TRIGGERS_V2_SQL: &str = "
 CREATE TRIGGER IF NOT EXISTS vm_fs_hash_ins AFTER INSERT ON vm_fs WHEN NEW.hash IS NOT NULL
 BEGIN UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=NEW.hash; END;
 CREATE TRIGGER IF NOT EXISTS vm_fs_hash_del AFTER DELETE ON vm_fs WHEN OLD.hash IS NOT NULL
@@ -195,6 +224,26 @@ BEGIN
   DELETE FROM vm_blobs WHERE hash=OLD.hash AND refcnt<=0 AND OLD.hash IS NOT NULL;
   UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=NEW.hash AND NEW.hash IS NOT NULL;
 END;
+";
+
+/// Refcounting for blobs. Chunk rows own references; deleting a file's rows releases them.
+/// (Verified: nested trigger DELETEs on other tables fire; same-table recursion is not needed.)
+const VM_TRIGGERS_SQL: &str = "
+CREATE TRIGGER IF NOT EXISTS vm_fc_ins AFTER INSERT ON vm_file_chunks
+BEGIN UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=NEW.hash; END;
+CREATE TRIGGER IF NOT EXISTS vm_fc_del AFTER DELETE ON vm_file_chunks
+BEGIN
+  UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=OLD.hash;
+  DELETE FROM vm_blobs WHERE hash=OLD.hash AND refcnt<=0;
+END;
+CREATE TRIGGER IF NOT EXISTS vm_fc_upd AFTER UPDATE OF hash ON vm_file_chunks WHEN OLD.hash IS NOT NEW.hash
+BEGIN
+  UPDATE vm_blobs SET refcnt=refcnt-1 WHERE hash=OLD.hash;
+  DELETE FROM vm_blobs WHERE hash=OLD.hash AND refcnt<=0;
+  UPDATE vm_blobs SET refcnt=refcnt+1 WHERE hash=NEW.hash;
+END;
+CREATE TRIGGER IF NOT EXISTS vm_fs_del_chunks AFTER DELETE ON vm_fs
+BEGIN DELETE FROM vm_file_chunks WHERE path=OLD.path; END;
 ";
 
 /// Counter maintenance. Values are TEXT in vm_meta; updated with CAST arithmetic.
@@ -297,6 +346,13 @@ CREATE TABLE IF NOT EXISTS vm_fs(
 );
 CREATE INDEX IF NOT EXISTS idx_vm_fs_path ON vm_fs(path);
 CREATE INDEX IF NOT EXISTS idx_vm_fs_hash ON vm_fs(hash);
+CREATE TABLE IF NOT EXISTS vm_file_chunks(
+  path TEXT NOT NULL,
+  idx INTEGER NOT NULL,
+  hash BLOB NOT NULL,
+  PRIMARY KEY(path, idx)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_vm_file_chunks_hash ON vm_file_chunks(hash);
 CREATE TABLE IF NOT EXISTS vm_mem(
   id INTEGER PRIMARY KEY,
   addr INTEGER NOT NULL,
@@ -651,20 +707,35 @@ fn blob_ensure(conn: &Connection, key: &BlobKey, data: &[u8]) -> Result<i64> {
     Ok(flag)
 }
 
-/// Upsert a regular-file row. Hash-change refcounting is done by vm_fs_hash_upd.
+/// Store file content as CHUNK_SIZE chunks. Replaces any previous chunk list for `vm_p`;
+/// the vm_fc_del trigger releases the old references. Empty file = zero chunks.
+fn chunks_replace(conn: &Connection, vm_p: &str, data: &[u8]) -> Result<()> {
+    conn.prepare_cached("DELETE FROM vm_file_chunks WHERE path=?1")?.execute(params![vm_p])?;
+    for (i, piece) in data.chunks(CHUNK_SIZE).enumerate() {
+        let key = blob_key(piece);
+        blob_ensure(conn, &key, piece)?;
+        conn.prepare_cached("INSERT INTO vm_file_chunks(path, idx, hash) VALUES (?1,?2,?3)")?
+            .execute(params![vm_p, i as i64, key.as_slice()])?;
+    }
+    Ok(())
+}
+
+/// Upsert a regular-file row. vm_fs.hash is the whole-file sha256 (sync/stat only).
 fn fs_put_file(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, data: &[u8]) -> Result<()> {
-    let hash = blob_key(data);
-    let flag = blob_ensure(conn, &hash, data)?;
-    conn.execute(
-        "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,NULL,?6,NULL)
+    chunks_replace(conn, vm_p, data)?;
+    let file_hash = blob_key(data);
+    conn.prepare_cached(
+        "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,'file',?2,?3,?4,?5,NULL,0,NULL)
          ON CONFLICT(path) DO UPDATE SET kind='file', mode=excluded.mode, mtime=excluded.mtime, size=excluded.size,
-            hash=excluded.hash, content=NULL, compressed=excluded.compressed, link_target=NULL",
-        params![vm_p, mode, mtime, data.len() as i64, hash.as_slice(), flag])?;
+            hash=excluded.hash, content=NULL, compressed=0, link_target=NULL")?
+        .execute(params![vm_p, mode, mtime, data.len() as i64, file_hash.as_slice()])?;
     Ok(())
 }
 
 /// Upsert a non-file row (dir/symlink). Any previous hash is released by the UPDATE trigger.
 fn fs_put_node(conn: &Connection, vm_p: &str, kind: &str, mode: i64, mtime: i64, link: Option<&str>) -> Result<()> {
+    // a file replaced by a dir/symlink must release its chunk references
+    conn.prepare_cached("DELETE FROM vm_file_chunks WHERE path=?1")?.execute(params![vm_p])?;
     conn.execute(
         "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,?2,?3,?4,0,NULL,NULL,0,?5)
          ON CONFLICT(path) DO UPDATE SET kind=excluded.kind, mode=excluded.mode, mtime=excluded.mtime, size=0,
@@ -781,17 +852,67 @@ pub fn vm_ls(conn: &Connection, vm_path: &str) -> Result<Vec<(String,String,i64,
 /// Chunk size for file content. Each chunk is an independent blob (compressed, deduplicated).
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
-/// Unified file-range reader. Every content read goes through here so the storage layout
-/// (single blob today, chunks after schema v5) is decided in one place.
-/// Returns bytes in [off, off+len) clamped to the file size.
+/// Unified file-range reader. Every content read goes through here.
+/// Only the chunks overlapping [off, off+len) are fetched and verified.
+/// Returns bytes clamped to the file size.
 pub fn read_range(conn: &Connection, vm_path: &str, off: u64, len: usize) -> Result<Vec<u8>> {
-    let (real, kind, content, _link, _mode) = vm_resolve(conn, vm_path)?;
+    let real = resolve_path(conn, vm_path)?;
+    let (kind, size, hash): (String, i64, Option<Vec<u8>>) = conn
+        .prepare_cached("SELECT kind, size, hash FROM vm_fs WHERE path=?1")?
+        .query_row(params![real], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?
+        .ok_or_else(|| anyhow!("not found in VM: {}", real))?;
     if kind == "dir" { return Err(anyhow!("is a directory: {}", vm_path)); }
-    let data = content.ok_or_else(|| anyhow!("no content for {} (resolved {})", vm_path, real))?;
-    let start = (off as usize).min(data.len());
-    let end = start.saturating_add(len).min(data.len());
-    Ok(data[start..end].to_vec())
+    if kind != "file" { return Err(anyhow!("not a regular file: {}", vm_path)); }
+    // a regular file without a whole-file hash is a corrupt row (same rule as vm_resolve)
+    if hash.is_none() { return Err(anyhow!("corrupt row for {}: file without content", real)); }
+    let size = size as u64;
+    let start = off.min(size);
+    let end = start.saturating_add(len as u64).min(size);
+    if start == end { return Ok(Vec::new()); }
+    let first = (start / CHUNK_SIZE as u64) as i64;
+    let last = ((end - 1) / CHUNK_SIZE as u64) as i64;
+    let mut st = conn.prepare_cached(
+        "SELECT c.idx, b.content, b.compressed, c.hash FROM vm_file_chunks c JOIN vm_blobs b ON b.hash=c.hash
+         WHERE c.path=?1 AND c.idx BETWEEN ?2 AND ?3 ORDER BY c.idx")?;
+    let rows = st.query_map(params![real, first, last], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?)))?;
+    let mut out: Vec<u8> = Vec::with_capacity((end - start) as usize);
+    let mut got_last = false;
+    for row in rows {
+        let (idx, body, comp, key) = row?;
+        let piece = decompress_bytes_raw(&body, comp).map_err(|e| anyhow!("{}: chunk {} undecodable: {}", real, idx, e))?;
+        if blob_key(&piece).as_slice() != key.as_slice() { return Err(anyhow!("{}: chunk {} hash mismatch", real, idx)); }
+        // slice this chunk to the requested window
+        let chunk_base = idx as u64 * CHUNK_SIZE as u64;
+        let from = start.saturating_sub(chunk_base).min(piece.len() as u64) as usize;
+        let to = end.saturating_sub(chunk_base).min(piece.len() as u64) as usize;
+        if from < to { out.extend_from_slice(&piece[from..to]); }
+        if idx == last { got_last = true; }
+    }
+    if !got_last { return Err(anyhow!("{}: missing chunk {} for requested range", real, last)); }
+    Ok(out)
 }
+
+/// Follow symlinks and return the real path. Does not load any content.
+pub fn resolve_path(conn: &Connection, vm_path: &str) -> Result<String> {
+    let mut cur = normalize_vm_path(vm_path);
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..40 {
+        if !visited.insert(cur.clone()) { return Err(anyhow!("symlink loop at {}", cur)); }
+        let row: Option<(String, Option<String>)> = conn.prepare_cached("SELECT kind, link_target FROM vm_fs WHERE path=?1")?
+            .query_row(params![cur], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let (kind, link) = row.ok_or_else(|| anyhow!("not found in VM: {}", cur))?;
+        if kind != "symlink" { return Ok(cur); }
+        let target = link.unwrap_or_default();
+        let next = if target.starts_with('/') { normalize_vm_path(&target) } else {
+            let dir = Path::new(&cur).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or("/".to_string());
+            if dir == "/" { format!("/{}", target) } else { format!("{}/{}", dir, target) }
+        };
+        cur = normalize_vm_path(&next);
+    }
+    Err(anyhow!("too many symlink levels: {}", vm_path))
+}
+
 pub fn vm_cat(conn: &Connection, vm_path: &str) -> Result<Vec<u8>> {
     let (real, kind, content, _link, _mode) = vm_resolve(conn, vm_path)?;
     if kind == "dir" { return Err(anyhow!("is a directory: {}", vm_path)); }
@@ -815,34 +936,48 @@ pub fn vm_stat(conn: &Connection, vm_path: &str) -> Result<(String,String,i64,i6
     });
     Ok((path,kind,mode,size,mtime,hash))
 }
+/// Assemble a regular file's bytes from its chunk list. Chunks are verified against their
+/// key (sha256) so a corrupt or mis-keyed chunk is an error, never silently wrong data.
+pub fn file_bytes(conn: &Connection, path: &str) -> Result<Vec<u8>> {
+    let mut st = conn.prepare_cached("SELECT c.idx, b.content, b.compressed, c.hash FROM vm_file_chunks c JOIN vm_blobs b ON b.hash=c.hash WHERE c.path=?1 ORDER BY c.idx")?;
+    let rows = st.query_map(params![path], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?)))?;
+    let mut out = Vec::new();
+    let mut expect = 0i64;
+    for row in rows {
+        let (idx, body, comp, key) = row?;
+        if idx != expect { return Err(anyhow!("{}: chunk index gap at {}", path, expect)); }
+        expect += 1;
+        let piece = decompress_bytes_raw(&body, comp).map_err(|e| anyhow!("{}: chunk {} undecodable: {}", path, idx, e))?;
+        if blob_key(&piece).as_slice() != key.as_slice() { return Err(anyhow!("{}: chunk {} hash mismatch", path, idx)); }
+        out.extend_from_slice(&piece);
+    }
+    Ok(out)
+}
+
+/// Resolve a path (following symlinks) to (real path, kind, content, link target, mode).
+/// Regular-file content comes from vm_file_chunks only; a file with a hash but no chunks is
+/// an error (the v4->v5 migration gives every such file a chunk row).
 pub fn vm_resolve(conn: &Connection, vm_path: &str) -> Result<(String, String, Option<Vec<u8>>, Option<String>, i64)> {
     let mut cur = normalize_vm_path(vm_path);
     let mut visited = std::collections::HashSet::new();
     for _ in 0..40 {
         if !visited.insert(cur.clone()) { return Err(anyhow!("symlink loop at {}", cur)); }
-        let row: Option<(String, Option<Vec<u8>>, Option<String>, i64, Option<Vec<u8>>, Option<i64>)> = conn.prepare_cached("SELECT kind, content, link_target, mode, hash, compressed FROM vm_fs WHERE path=?1")?.query_row( params![cur], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).optional()?;
-        let (kind, content_opt, link, mode, hash_opt, compressed) = match row { Some(x)=>x, None=> return Err(anyhow!("not found in VM: {}", cur)) };
+        let row: Option<(String, Option<String>, i64, Option<Vec<u8>>, Option<Vec<u8>>, i64)> = conn.prepare_cached("SELECT kind, link_target, mode, hash, content, compressed FROM vm_fs WHERE path=?1")?
+            .query_row(params![cur], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_,Option<i64>>(5)?.unwrap_or(0)))).optional()?;
+        let (kind, link, mode, hash, inline, comp) = match row { Some(x)=>x, None=> return Err(anyhow!("not found in VM: {}", cur)) };
         if kind != "symlink" {
-            let cflag = compressed.unwrap_or(0);
-            let content: Option<Vec<u8>> = match (hash_opt, content_opt) {
-                // content-addressed: key cache by stored hash, decompress only on miss
-                (Some(h), inline) => {
-                    let hk = key_hex(&h.as_slice().try_into().map_err(|_| anyhow!("corrupt hash in {}", cur))?);
-                    let blob: Option<(Vec<u8>, i64)> = conn.prepare_cached("SELECT content, compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![h], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-                    match (blob, inline) {
-                        (Some((b,c)), _) => Some(decompress_bytes_cached(&hk, &b, c).to_vec()),
-                        (None, Some(b)) => Some(decompress_bytes_cached(&hk, &b, cflag).to_vec()),
-                        (None, None) => None,
-                    }
-                },
-                // legacy rows: inline content, no hash column -> key by decompressed hash
-                (None, Some(b)) if !b.is_empty() => {
-                    let raw = decompress_bytes_raw(&b, cflag).unwrap_or_else(|_| b.clone());
-                    Some(raw)
-                },
-                _ => None,
+            if kind == "dir" { return Ok((cur, kind, None, link, mode)); }
+            let content = if hash.is_some() {
+                file_bytes(conn, &cur)?
+            } else if let Some(b) = inline {
+                // legacy inline row (pre-blob); never produced by current code
+                decompress_bytes_raw(&b, comp).unwrap_or(b)
+            } else {
+                // a regular file must have either a hash (chunked) or legacy inline bytes.
+                // Neither means the row is corrupt: fail instead of returning an empty file.
+                return Err(anyhow!("corrupt row for {}: file without content", cur));
             };
-            return Ok((cur, kind, content, link, mode));
+            return Ok((cur, kind, Some(content), link, mode));
         }
         let target = link.clone().unwrap_or_default();
         let next = if target.starts_with('/') { normalize_vm_path(&target) }
@@ -946,27 +1081,22 @@ thread_local! {
     static WORKER_CONN: std::cell::RefCell<Option<Connection>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Load one file's decompressed bytes inside a worker. Falls back to legacy inline content.
+/// Load one file's bytes inside a worker through the chunk reader. A read failure is
+/// reported on stderr and the file is skipped, never written as empty.
 fn load_task_bytes<T: TaskLike>(db_path: Option<&str>, t: &T) -> Option<Vec<u8>> {
     let path = db_path?;
     WORKER_CONN.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() { *slot = Connection::open(path).ok(); }
         let c = slot.as_ref()?;
-        if let Some(h) = t.hash_ref() {
-            let key = hex_to_key(h)?;
-            let row: Option<(Vec<u8>, i64)> = c.query_row("SELECT content, compressed FROM vm_blobs WHERE hash=?1", params![key.as_slice()], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok()?;
-            if let Some((b, comp)) = row { return Some(decompress_bytes_cached(h, &b, comp).to_vec()); }
-        }
-        let inline: Option<(Option<Vec<u8>>, Option<i64>)> = c.query_row("SELECT content, compressed FROM vm_fs WHERE path=?1", params![t.path_ref()], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok()?;
-        match inline {
-            Some((Some(b), comp)) => Some(decompress_bytes_raw(&b, comp.unwrap_or(0)).unwrap_or(b)),
-            _ => None,
+        match file_bytes(c, t.path_ref()) {
+            Ok(b) => Some(b),
+            Err(e) => { eprintln!("materialize {}: {}", t.path_ref(), e); None }
         }
     })
 }
 
-trait TaskLike { fn hash_ref(&self) -> Option<&str>; fn path_ref(&self) -> &str; }
+trait TaskLike { fn path_ref(&self) -> &str; }
 
 pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
     use rayon::prelude::*;
@@ -989,7 +1119,6 @@ pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
     // Metadata only: blobs are loaded per file inside the worker, so memory stays O(one file).
     struct Task { path: String, mode: i64, hash: Option<String>, size: i64, mtime: i64 }  // hash: hex text
     impl TaskLike for Task {
-        fn hash_ref(&self) -> Option<&str> { self.hash.as_deref() }
         fn path_ref(&self) -> &str { &self.path }
     }
     let tasks: Vec<Task> = {
@@ -1507,10 +1636,18 @@ pub fn vm_verify(conn: &Connection, deep: bool) -> Result<String> {
         if real_files != files { drift.push(format!("files {}!={}", files, real_files)); }
         if real_bytes != bytes { drift.push(format!("logical {}!={}", bytes, real_bytes)); }
         if real_blob != vm_counter(conn, "blob_bytes")? { drift.push(format!("blob_bytes {}!={}", vm_counter(conn, "blob_bytes")?, real_blob)); }
-        let bad_rc: i64 = conn.prepare_cached("SELECT count(*) FROM vm_blobs b WHERE b.refcnt != (SELECT count(*) FROM vm_fs f WHERE f.hash=b.hash)")?.query_row( [], |r| r.get(0))?;
+        // refcnt must equal the number of chunk rows referencing each blob
+        let bad_rc: i64 = conn.prepare_cached("SELECT count(*) FROM vm_blobs b WHERE b.refcnt != (SELECT count(*) FROM vm_file_chunks c WHERE c.hash=b.hash)")?.query_row( [], |r| r.get(0))?;
         if bad_rc > 0 { drift.push(format!("{} blobs with bad refcnt", bad_rc)); }
-        let orphan: i64 = conn.prepare_cached("SELECT count(*) FROM vm_fs f WHERE f.hash IS NOT NULL AND NOT EXISTS (SELECT 1 FROM vm_blobs b WHERE b.hash=f.hash)")?.query_row( [], |r| r.get(0))?;
-        if orphan > 0 { drift.push(format!("{} files reference missing blobs", orphan)); }
+        // every chunk must point at an existing blob
+        let orphan: i64 = conn.prepare_cached("SELECT count(*) FROM vm_file_chunks c WHERE NOT EXISTS (SELECT 1 FROM vm_blobs b WHERE b.hash=c.hash)")?.query_row( [], |r| r.get(0))?;
+        if orphan > 0 { drift.push(format!("{} chunks reference missing blobs", orphan)); }
+        // chunks must form a contiguous 0..n sequence per file
+        let gaps: i64 = conn.prepare_cached("SELECT count(*) FROM (SELECT path, count(*) AS n, max(idx) AS mx FROM vm_file_chunks GROUP BY path) WHERE mx + 1 != n")?.query_row( [], |r| r.get(0))?;
+        if gaps > 0 { drift.push(format!("{} files with chunk index gaps", gaps)); }
+        // every regular file with bytes must have chunks (size>0 => at least one chunk)
+        let no_chunks: i64 = conn.prepare_cached("SELECT count(*) FROM vm_fs f WHERE f.kind='file' AND f.size>0 AND NOT EXISTS (SELECT 1 FROM vm_file_chunks c WHERE c.path=f.path)")?.query_row( [], |r| r.get(0))?;
+        if no_chunks > 0 { drift.push(format!("{} non-empty files without chunks", no_chunks)); }
         out.push_str(if drift.is_empty() { " deep=ok" } else { " deep=DRIFT" });
         for d in drift { out.push_str(&format!("\n  {}", d)); }
     }

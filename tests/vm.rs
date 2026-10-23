@@ -220,7 +220,10 @@ fn legacy_v3_database_migrates_to_blob_keys() {
         let c = rusqlite::Connection::open(&db).unwrap();
         c.execute_batch(&vm::vm_schema_sql().replace("PRAGMA user_version = 4;", "PRAGMA user_version = 3;")).ok();
         // rebuild vm_blobs with the legacy TEXT key layout
-        c.execute_batch("DROP TABLE vm_blobs; DROP INDEX IF EXISTS idx_vm_blobs_refcnt;
+        // remove every v5 trigger/table first: a trigger that names vm_blobs would error on use
+        c.execute_batch("DROP TRIGGER IF EXISTS vm_fc_ins; DROP TRIGGER IF EXISTS vm_fc_del; DROP TRIGGER IF EXISTS vm_fc_upd;
+            DROP TRIGGER IF EXISTS vm_fs_del_chunks; DROP TABLE IF EXISTS vm_file_chunks;
+            DROP TABLE vm_blobs; DROP INDEX IF EXISTS idx_vm_blobs_refcnt;
             CREATE TABLE vm_blobs(hash TEXT PRIMARY KEY, content BLOB NOT NULL, compressed INTEGER NOT NULL DEFAULT 0,
               raw_size INTEGER NOT NULL, refcnt INTEGER NOT NULL DEFAULT 1);
             DROP TRIGGER IF EXISTS vm_fs_hash_ins; DROP TRIGGER IF EXISTS vm_fs_hash_del; DROP TRIGGER IF EXISTS vm_fs_hash_upd;
@@ -247,4 +250,62 @@ fn legacy_v3_database_migrates_to_blob_keys() {
     assert_eq!(rc, 2);
     let rep = vm::vm_verify(&c, true).unwrap();
     assert!(rep.contains("deep=ok"), "{}", rep);
+}
+
+#[test]
+fn chunk_boundaries_roundtrip_and_range_read() {
+    use vm::CHUNK_SIZE;
+    let (_g, db) = tmpdb("chunks");
+    let c = open(&db);
+    let sizes = [0usize, 1, CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1, 3 * CHUNK_SIZE + 17];
+    for (i, &n) in sizes.iter().enumerate() {
+        let data: Vec<u8> = (0..n).map(|k| ((k * 31 + i) % 251) as u8).collect();
+        let p = format!("/sz/{}", n);
+        vm::vm_add_bytes(&c, &p, &data, 0o644, 1).unwrap();
+        assert_eq!(vm::vm_cat(&c, &p).unwrap(), data, "size {}", n);
+        // a window straddling the first chunk boundary
+        if n > CHUNK_SIZE {
+            let off = CHUNK_SIZE - 10;
+            let got = vm::read_range(&c, &p, off as u64, 40).unwrap();
+            assert_eq!(got, data[off..(off + 40).min(n)].to_vec(), "window at size {}", n);
+        }
+    }
+    let rep = vm::vm_verify(&c, true).unwrap();
+    assert!(rep.contains("deep=ok"), "{}", rep);
+}
+
+#[test]
+fn identical_chunks_are_stored_once() {
+    use vm::CHUNK_SIZE;
+    let (_g, db) = tmpdb("chunk-dedup");
+    let c = open(&db);
+    // two files sharing their first chunk, differing in the second
+    let mut a = vec![5u8; CHUNK_SIZE];
+    a.extend(vec![6u8; 100]);
+    let mut b = vec![5u8; CHUNK_SIZE];
+    b.extend(vec![7u8; 100]);
+    vm::vm_add_bytes(&c, "/a", &a, 0o644, 1).unwrap();
+    vm::vm_add_bytes(&c, "/b", &b, 0o644, 1).unwrap();
+    let blobs: i64 = c.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap();
+    assert_eq!(blobs, 3, "shared 64K chunk + two distinct tails");
+    let shared: i64 = c.query_row("SELECT refcnt FROM vm_blobs WHERE raw_size=?1", rusqlite::params![CHUNK_SIZE as i64], |r| r.get(0)).unwrap();
+    assert_eq!(shared, 2);
+    assert_eq!(vm::vm_cat(&c, "/a").unwrap(), a);
+    assert_eq!(vm::vm_cat(&c, "/b").unwrap(), b);
+}
+
+#[test]
+fn overwrite_and_delete_release_chunk_references() {
+    use vm::CHUNK_SIZE;
+    let (_g, db) = tmpdb("chunk-release");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/f", &vec![1u8; 2 * CHUNK_SIZE + 5], 0o644, 1).unwrap();
+    vm::vm_add_bytes(&c, "/f", &vec![2u8; 10], 0o644, 2).unwrap();
+    let n: i64 = c.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1, "old chunks must be released on overwrite");
+    c.execute("DELETE FROM vm_fs WHERE path='/f'", []).unwrap();
+    let n: i64 = c.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0, "no orphan chunks after delete");
+    let rows: i64 = c.query_row("SELECT count(*) FROM vm_file_chunks", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 0);
 }
