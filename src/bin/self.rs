@@ -64,13 +64,15 @@ enum Cmd {
     VmSnapDiff{ db: String, name: String },
     /// delete a content snapshot; blobs no other holder uses are released
     VmSnapDelete{ db: String, name: String },
-    /// Run one command in a sandbox against the VM; record output, changes, and optionally roll back.
+    /// Put node and the pi coding agent into a VM, so `pi` can run inside it.
+    VmProvisionAgent{ db: String, #[arg(long)] node: Option<String>, #[arg(long)] pi: Option<String> },
     /// Merge a package VM database (a tool and its libraries) into a target, in one transaction.
     VmInject{ target: String, package: String },
     /// Write policies enforced by the database: list, add, or remove a rule.
     VmPolicy{ db: String, #[command(subcommand)] action: PolicyAction },
     /// List recorded agent steps (oldest first); --json prints one JSON array.
     AgentLog{ db: String, #[arg(long, help="print a JSON array instead of a table")] json: bool, #[arg(long, help="only the most recent N steps")] last: Option<usize> },
+    /// Run one command in a sandbox against the VM; record output, changes, and optionally roll back.
     VmStep{ db: String, #[arg(long, default_value_t=60, help="kill the step after N seconds")] timeout: u64, #[arg(long, help="restore the pre-step snapshot if the step fails or times out")] rollback_on_fail: bool, #[arg(long, default_value_t=selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES, help="keep at most N bytes of each of stdout/stderr")] max_output: usize, #[arg(trailing_var_arg=true, allow_hyphen_values=true, required=true)] argv: Vec<String> },
     /// keep the newest N content snapshots, delete the rest (reports each removed name)
     VmRetain{ db: String, keep: usize },
@@ -487,6 +489,19 @@ fn main() -> anyhow::Result<()> {
             selfdb::vm::snapshot_restore(&c, &name)?;
             println!("rolled back to {}", name);
         },
+        Cmd::VmProvisionAgent{db, node, pi} => {
+            let node = node.map(std::path::PathBuf::from).unwrap_or_else(|| {
+                let out = std::process::Command::new("sh").args(["-c", "readlink -f \"$(command -v node)\" && true"]).output().ok();
+                let s = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                std::path::PathBuf::from(s)
+            });
+            let pi = pi.map(std::path::PathBuf::from).unwrap_or_else(default_pi_dir);
+            if node.as_os_str().is_empty() || !node.exists() { eprintln!("node not found; pass --node <path>"); std::process::exit(2); }
+            if !pi.exists() { eprintln!("pi not found at {}; pass --pi <dir>", pi.display()); std::process::exit(2); }
+            let r = selfdb::agent::provision_agent(std::path::Path::new(&db), &node, &pi)?;
+            println!("provisioned {}: node {} ({} objects), pi at /opt/pi ({} files)", db, r.node, r.objects, r.files);
+            println!("run it with: vm-agent {} -- \"<task>\"", db);
+        }
         Cmd::VmInject{target, package} => {
             let c = selfdb::vm::vm_open(&target)?;
             let r = selfdb::inject::inject(&c, std::path::Path::new(&package))?;
@@ -800,4 +815,15 @@ enum PolicyAction {
     AddMaxSize { bytes: u64 },
     /// Remove a rule by id (see list).
     Remove { id: i64 },
+}
+
+/// The pi package directory: alongside the node binary when installed globally, else the npm default.
+fn default_pi_dir() -> std::path::PathBuf {
+    let candidates = [
+        "/home/linuxbrew/.linuxbrew/lib/node_modules/@earendil-works/pi-coding-agent",
+        "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent",
+        "/usr/lib/node_modules/@earendil-works/pi-coding-agent",
+    ];
+    for c in candidates { let p = std::path::PathBuf::from(c); if p.exists() { return p; } }
+    std::path::PathBuf::from(candidates[0])
 }

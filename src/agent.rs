@@ -258,3 +258,32 @@ impl StepLock {
         Ok(StepLock { _file: f })
     }
 }
+
+/// Provision a VM with node and the pi coding agent, so `pi` runs inside the VM.
+///
+/// What it does, all in the target database:
+/// - imports node's own library closure (the binary plus its shared libraries), so the VM has a
+///   runtime that needs nothing from the host;
+/// - packs the pi package tree at `/opt/pi`, minus the prebuilt native modules for other platforms
+///   (win32, darwin) and source maps, which the VM never loads;
+/// - records `/usr/bin/node` and `/usr/bin/pi` as symlinks to those files, so a command line inside
+///   the VM can name them without knowing where Homebrew put them.
+///
+/// The node path is kept as imported (its canonical location) because its shared libraries refer to
+/// each other by absolute path. The well-known names are symlinks on top of that.
+pub fn provision_agent(db: &Path, node: &Path, pi_dir: &Path) -> Result<ProvisionReport> {
+    let conn = vm::vm_open(db.to_str().ok_or_else(|| anyhow!("non-utf8 db path"))?)?;
+    let node_s = node.to_str().ok_or_else(|| anyhow!("non-utf8 node path"))?;
+    let pi_s = pi_dir.to_str().ok_or_else(|| anyhow!("non-utf8 pi path"))?;
+    let objects = vm::vm_import_closure(&conn, node_s, "/")?;
+    let files = vm::vm_pack_host_dir_parallel(&conn, pi_s, "/opt/pi")?;
+    // the names a command line inside the VM uses
+    let node_real = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
+    vm::vm_add_symlink(&conn, "/usr/bin/node", &node_real.to_string_lossy())?;
+    vm::vm_add_symlink(&conn, "/usr/bin/pi", "/opt/pi/dist/bundle/cli.js")?;
+    Ok(ProvisionReport { objects, files, node: node_real.to_string_lossy().to_string() })
+}
+
+/// What `provision_agent` put in the database.
+#[derive(Debug)]
+pub struct ProvisionReport { pub objects: usize, pub files: usize, pub node: String }
