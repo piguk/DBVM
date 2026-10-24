@@ -320,23 +320,42 @@ impl Overlay {
     /// Assemble a file's bytes from one schema's chunk list. Every chunk is verified against its
     /// key, so a corrupt block is an error rather than wrong data.
     fn read_from(&self, schema: &str, p: &str) -> Result<Vec<u8>> {
-        let kind: String = self.conn.query_row(&format!("SELECT kind FROM {}.vm_fs WHERE path=?1", schema), params![p], |r| r.get(0))?;
-        if kind != "file" { return Err(anyhow!("not a regular file: {}", p)); }
+        // One statement reads the file's kind and size together with its chunks, so all of them come
+        // from the same snapshot. Separate statements could straddle a concurrent rewrite and mix a
+        // new size with old chunks. The LEFT JOIN returns one row even for an empty file (idx NULL).
         let sql = format!(
-            "SELECT c.idx, b.content, b.compressed, b.dict_id, c.hash FROM {s}.vm_file_chunks c
-             JOIN {s}.vm_blobs b ON b.hash=c.hash WHERE c.path=?1 ORDER BY c.idx", s = schema);
+            "SELECT f.kind, f.size, c.idx, b.content, b.compressed, b.dict_id, c.hash
+             FROM {s}.vm_fs f
+             LEFT JOIN {s}.vm_file_chunks c ON c.path = f.path
+             LEFT JOIN {s}.vm_blobs b ON b.hash = c.hash
+             WHERE f.path = ?1 ORDER BY c.idx", s = schema);
         let mut st = self.conn.prepare(&sql)?;
-        let rows = st.query_map(params![p], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, Vec<u8>>(4)?)))?;
+        let rows = st.query_map(params![p], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?, r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<i64>>(5)?, r.get::<_, Option<Vec<u8>>>(6)?)))?;
         let mut out = Vec::new();
         let mut expect = 0i64;
+        let mut meta: Option<(String, i64)> = None;
         for row in rows {
-            let (idx, body, comp, dict_id, key) = row?;
+            let (kind, size, idx, body, comp, dict_id, key) = row?;
+            meta.get_or_insert((kind, size));
+            let Some(idx) = idx else { continue };  // empty file: a row with no chunks
             if idx != expect { return Err(anyhow!("{}: chunk index gap at {}", p, expect)); }
             expect += 1;
+            let (Some(body), Some(comp), Some(dict_id), Some(key)) = (body, comp, dict_id, key) else {
+                return Err(anyhow!("{}: chunk {} has no block", p, idx));
+            };
             // a block's dictionary lives in the same schema as the block (ids are per database)
             let piece = decode_block_in(&self.conn, schema, &body, comp, dict_id)?;
             if blob_key(&piece).as_slice() != key.as_slice() { return Err(anyhow!("{}: chunk {} hash mismatch", p, idx)); }
             out.extend_from_slice(&piece);
+        }
+        // No row at all: the path was removed between the lookup and this read.
+        let Some((kind, size)) = meta else { return Err(anyhow!("not found in overlay: {}", p)); };
+        if kind != "file" { return Err(anyhow!("not a regular file: {}", p)); }
+        if out.len() as i64 != size {
+            return Err(anyhow!("{}: read {} bytes, file size is {} (inconsistent chunk list)", p, out.len(), size));
         }
         Ok(out)
     }

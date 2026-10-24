@@ -239,3 +239,92 @@ fn overlay_recreate_then_write_shows_only_new_children() {
     assert!(!ov.exists("/d/y").unwrap(), "Base y stays hidden");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+static DIST_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DIST_NF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DIST_OTHER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `read` runs a lookup and then a chunk read, each its own statement. While another writer flips
+/// the path between a file and a directory (and removes it), a read must return the whole file or
+/// one of the expected errors. A database error, a panic, or content from a half-applied change
+/// is a failure.
+#[test]
+fn overlay_read_is_consistent_while_path_changes_kind() {
+    let d = std::env::temp_dir().join(format!("rc-kind-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let base = d.join("base.db");
+    let b = vm::init_vm_db_with_opts(base.to_str().unwrap(), true, true).unwrap();
+    vm::vm_add_bytes(&b, "/f", &vec![b'a'; SIZE], 0o644, 1).unwrap();
+    drop(b);
+    let delta = d.join("delta.db");
+    drop(vm::Overlay::open(&delta, &base).unwrap());
+    let (b2, d2) = (base.clone(), delta.clone());
+    let (reads, bad) = run_reader_against_writer(
+        move |stop| {
+            let ov = vm::Overlay::open(&d2, &b2).unwrap();
+            let (mut n, mut bad) = (0usize, Vec::new());
+            while !stop.load(Ordering::SeqCst) {
+                n += 1;
+                let res = ov.read("/f");
+                match &res { Ok(_) => DIST_OK.fetch_add(1, Ordering::SeqCst), Err(e) if e.to_string().contains("not found") => DIST_NF.fetch_add(1, Ordering::SeqCst), Err(_) => DIST_OTHER.fetch_add(1, Ordering::SeqCst) };
+                match res {
+                    Ok(bytes) if bytes.len() == SIZE && bytes.iter().all(|&x| x == b'a' || x == b'b' || x == b'c') => {
+                        // a whole file: uniform, one of the fills the writer uses
+                        if !bytes.iter().all(|&x| x == bytes[0]) { bad.push("mixed fill".to_string()); }
+                    }
+                    Ok(bytes) => bad.push(format!("len={} (not a whole file)", bytes.len())),
+                    Err(e) => {
+                        // A read may fail while the path changes, but only with one of the explicit
+                        // outcomes below. Any other error is a bug.
+                        let s = e.to_string();
+                        let legal = s.contains("not found in overlay")
+                            || s.contains("not a regular file")
+                            || s.contains("changed during read");
+                        if !legal { bad.push(format!("unexpected error: {}", s)); }
+                    }
+                }
+            }
+            (n, bad)
+        },
+        || {
+            let ov = vm::Overlay::open(&delta, &base).unwrap();
+            for round in 0..300u32 {
+                match round % 3 {
+                    0 => { ov.write("/f", &vec![b'b'; SIZE], 0o644, round as i64).unwrap(); }
+                    1 => { ov.remove("/f").unwrap(); ov.mkdir("/f").unwrap(); }
+                    _ => { ov.remove("/f").unwrap(); ov.write("/f", &vec![b'c'; SIZE], 0o644, round as i64).unwrap(); }
+                }
+            }
+        },
+    );
+    eprintln!("overlay kind-change reads: {} total, {} bad; ok={} not_found={} other_err={}", reads, bad.len(),
+        DIST_OK.load(Ordering::SeqCst), DIST_NF.load(Ordering::SeqCst), DIST_OTHER.load(Ordering::SeqCst));
+    assert!(reads > 0);
+    assert!(bad.is_empty(), "read returned an inconsistent result {} times, e.g. {:?}", bad.len(), bad.iter().take(3).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Deterministic: a file whose recorded size disagrees with its chunk list (a torn or corrupt row)
+/// must fail the read. Returning the chunks' bytes as if they were the whole file is the bug.
+#[test]
+fn overlay_read_rejects_size_that_disagrees_with_chunks() {
+    let d = std::env::temp_dir().join(format!("rc-size-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let base = d.join("base.db");
+    let b = vm::init_vm_db_with_opts(base.to_str().unwrap(), true, true).unwrap();
+    vm::vm_add_bytes(&b, "/f", &vec![b'a'; SIZE], 0o644, 1).unwrap();
+    drop(b);
+    let delta = d.join("delta.db");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    ov.write("/f", &vec![b'q'; 5000], 0o644, 2).unwrap();
+    assert_eq!(ov.read("/f").unwrap().len(), 5000, "precondition: whole read");
+    {
+        let c = rusqlite::Connection::open(&delta).unwrap();
+        c.execute("UPDATE vm_fs SET size=99999 WHERE path='/f'", []).unwrap();
+    }
+    let err = ov.read("/f").expect_err("a size/chunk mismatch must be an error, not data");
+    assert!(err.to_string().contains("inconsistent chunk list"), "unexpected error: {}", err);
+    let _ = std::fs::remove_dir_all(&d);
+}
