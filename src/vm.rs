@@ -25,7 +25,7 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///   5 = file content is split into CHUNK_SIZE chunks listed in vm_file_chunks; a file's
 ///       refcount on vm_blobs comes from its chunk rows. vm_fs.hash = whole-file sha256
 ///       (informational, no refcounting). Legacy single-blob files keep working via vm_fs.hash.
-pub const VM_USER_VERSION: u32 = 9;
+pub const VM_USER_VERSION: u32 = 10;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -114,6 +114,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
                 6 => migrate_6_to_7(conn)?,
                 7 => migrate_7_to_8(conn)?,
                 8 => migrate_8_to_9(conn)?,
+                9 => migrate_9_to_10(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -326,6 +327,20 @@ CREATE TABLE IF NOT EXISTS agent_steps(
 /// 8 -> 9: agent step log.
 fn migrate_8_to_9(conn: &Connection) -> Result<()> {
     conn.execute_batch(VM_AGENT_SQL)?;
+    Ok(())
+}
+
+/// 9 -> 10: agent_steps gains the output-truncation flags. A v9 database created by the first
+/// agent-step build lacks them; add each column only if it is missing, so a fresh v9 table is fine.
+fn migrate_9_to_10(conn: &Connection) -> Result<()> {
+    let cols: Vec<String> = conn.prepare("PRAGMA table_info(agent_steps)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for col in ["stdout_truncated", "stderr_truncated"] {
+        if !cols.iter().any(|c| c == col) {
+            conn.execute_batch(&format!("ALTER TABLE agent_steps ADD COLUMN {} INTEGER NOT NULL DEFAULT 0;", col))?;
+        }
+    }
     Ok(())
 }
 

@@ -894,3 +894,33 @@ fn noop_round_trip_keeps_alias_links_and_real_files() {
     assert_eq!((rep.created, rep.updated, rep.deleted), (0, 0, 0), "no-op round trip must change nothing");
     assert_eq!(snap(&c), before, "DB rows must be identical after the round trip");
 }
+
+#[test]
+fn v9_agent_steps_gains_truncation_columns_and_keeps_rows() {
+    // A database written by the first agent-step build: agent_steps has no truncation columns and
+    // user_version is 9. Opening it must add both columns, keep the existing row, and let a new step
+    // record its truncation flags.
+    let (_g, db) = tmpdb("v9-agent");
+    {
+        let c = open(&db);
+        c.execute_batch("DROP TABLE agent_steps;
+            CREATE TABLE agent_steps(step_id INTEGER PRIMARY KEY, cmd TEXT NOT NULL, exit_code INTEGER,
+              timed_out INTEGER NOT NULL DEFAULT 0, rolled_back INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL,
+              stdout BLOB, stderr BLOB, snap_before TEXT NOT NULL, snap_after TEXT, fs_diff_json TEXT NOT NULL,
+              created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
+            INSERT INTO agent_steps(cmd, exit_code, duration_ms, stdout, stderr, snap_before, fs_diff_json)
+              VALUES ('old-step', 0, 5, x'6f6c64', x'', 'step-before-1', '{}');
+            PRAGMA user_version=9;").unwrap();
+    }
+    let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+    let ver: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(ver, vm::VM_USER_VERSION as i64);
+    let cols: Vec<String> = c.prepare("PRAGMA table_info(agent_steps)").unwrap()
+        .query_map([], |r| r.get::<_, String>(1)).unwrap().map(|x| x.unwrap()).collect();
+    assert!(cols.iter().any(|x| x == "stdout_truncated") && cols.iter().any(|x| x == "stderr_truncated"));
+    let (cmd, st): (String, i64) = c.query_row("SELECT cmd, stdout_truncated FROM agent_steps WHERE cmd='old-step'", [],
+        |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((cmd.as_str(), st), ("old-step", 0), "old row kept, flag defaults to 0");
+    c.execute("INSERT INTO agent_steps(cmd, exit_code, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, fs_diff_json)
+        VALUES ('new', 0, 1, x'', x'', 1, 0, 'b', '{}')", []).unwrap();
+}
