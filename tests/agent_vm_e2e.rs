@@ -64,3 +64,45 @@ fn the_agent_runs_a_task_in_the_vm_and_the_run_can_be_rolled_back() {
     assert!(v.contains("deep=ok"), "deep verify after rollback: {}", v);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// One assistant message carrying four write calls: all four must land, none overwriting another.
+/// The prompt asks for them in one message; the session transcript is then checked to confirm the model
+/// really did issue them together, so this covers the parallel path instead of four sequential steps.
+#[test]
+#[ignore]
+fn parallel_tool_calls_in_one_message_all_land() {
+    if !bwrap_ok() { eprintln!("skip: bwrap not available"); return; }
+    let Some((node, pi)) = node_and_pi() else { eprintln!("skip: node or pi missing"); return; };
+    let base = std::env::var("PIMM_BASE_URL").unwrap_or_default();
+    if base.is_empty() || std::env::var("PIMM_API_KEY").unwrap_or_default().is_empty() {
+        eprintln!("skip: PIMM_BASE_URL / PIMM_API_KEY not set"); return;
+    }
+    let d = std::env::temp_dir().join(format!("vmpar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let db = d.join("v.db");
+    drop(vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap());
+    agent::provision_agent(&db, &node, &pi).unwrap();
+
+    let opts = agent::AgentOptions {
+        rollback_on_fail: false, timeout_secs: 300, max_output_bytes: 1 << 20,
+        model_base: base, key_env: "PIMM_API_KEY".into(), model: "gpt-6.1-sol".into(),
+        forward_port: 18081,
+        task: "Create these four files, each with its own write tool call, issuing all four calls in ONE \
+               message: /work/q1.txt=ONE /work/q2.txt=TWO /work/q3.txt=THREE /work/q4.txt=FOUR. Reply DONE.".into(),
+    };
+    let r = agent::run_agent(&db, &opts).expect("the task must run");
+    assert_eq!(r.exit_code, 0, "the agent must finish: {}", String::from_utf8_lossy(&r.stderr));
+
+    let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+    for (i, want) in [(1, "ONE"), (2, "TWO"), (3, "THREE"), (4, "FOUR")] {
+        let got = vm::vm_cat(&c, &format!("/work/q{}.txt", i)).unwrap_or_default();
+        assert_eq!(got, want.as_bytes(), "/work/q{}.txt must hold {} (none overwritten by a sibling)", i, want);
+    }
+    // the four writes appear as four separate created paths in the change list
+    let created: Vec<&String> = r.changes.created.iter().filter(|p| p.starts_with("/work/q")).collect();
+    assert_eq!(created.len(), 4, "all four files are reported: {:?}", r.changes.created);
+    let v = vm::vm_verify(&c, true).unwrap();
+    assert!(v.contains("deep=ok"), "deep verify: {}", v);
+    let _ = std::fs::remove_dir_all(&d);
+}
