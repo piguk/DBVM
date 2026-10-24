@@ -65,6 +65,10 @@ enum Cmd {
     /// delete a content snapshot; blobs no other holder uses are released
     VmSnapDelete{ db: String, name: String },
     /// Run one command in a sandbox against the VM; record output, changes, and optionally roll back.
+    /// Merge a package VM database (a tool and its libraries) into a target, in one transaction.
+    VmInject{ target: String, package: String },
+    /// Write policies enforced by the database: list, add, or remove a rule.
+    VmPolicy{ db: String, #[command(subcommand)] action: PolicyAction },
     /// List recorded agent steps (oldest first); --json prints one JSON array.
     AgentLog{ db: String, #[arg(long, help="print a JSON array instead of a table")] json: bool, #[arg(long, help="only the most recent N steps")] last: Option<usize> },
     VmStep{ db: String, #[arg(long, default_value_t=60, help="kill the step after N seconds")] timeout: u64, #[arg(long, help="restore the pre-step snapshot if the step fails or times out")] rollback_on_fail: bool, #[arg(long, default_value_t=selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES, help="keep at most N bytes of each of stdout/stderr")] max_output: usize, #[arg(trailing_var_arg=true, allow_hyphen_values=true, required=true)] argv: Vec<String> },
@@ -483,6 +487,40 @@ fn main() -> anyhow::Result<()> {
             selfdb::vm::snapshot_restore(&c, &name)?;
             println!("rolled back to {}", name);
         },
+        Cmd::VmInject{target, package} => {
+            let c = selfdb::vm::vm_open(&target)?;
+            let r = selfdb::inject::inject(&c, std::path::Path::new(&package))?;
+            println!("injected {} into {}: {} paths ({} replaced), {} blobs, {} dictionaries",
+                package, target, r.paths, r.replaced, r.blobs_added, r.dicts_added);
+        }
+        Cmd::VmPolicy{db, action} => {
+            use selfdb::policy::{self, Rule};
+            let c = selfdb::vm::vm_open(&db)?;
+            match action {
+                PolicyAction::List => {
+                    let rules = policy::list(&c)?;
+                    if rules.is_empty() { println!("no policies"); }
+                    for p in rules {
+                        match p.rule {
+                            Rule::ReadonlyPrefix(x) => println!("{:>4}  readonly_prefix  {}", p.id, x),
+                            Rule::MaxFileSize(n) => println!("{:>4}  max_file_size    {} bytes", p.id, n),
+                        }
+                    }
+                }
+                PolicyAction::AddReadonly { prefix } => {
+                    let id = policy::add(&c, &Rule::ReadonlyPrefix(prefix.clone()))?;
+                    println!("policy {}: readonly {}", id, selfdb::vm::normalize_vm_path(&prefix));
+                }
+                PolicyAction::AddMaxSize { bytes } => {
+                    let id = policy::add(&c, &Rule::MaxFileSize(bytes))?;
+                    println!("policy {}: max_file_size {} bytes", id, bytes);
+                }
+                PolicyAction::Remove { id } => {
+                    if policy::remove(&c, id)? { println!("removed policy {}", id); }
+                    else { eprintln!("no policy {}", id); std::process::exit(1); }
+                }
+            }
+        }
         Cmd::AgentLog{db, json, last} => {
             let rows = selfdb::agent::list_steps(std::path::Path::new(&db), last)?;
             if json {
@@ -751,3 +789,15 @@ fn selfdb_scan(db: &str, dir: &str) -> anyhow::Result<()> {
 fn selfdb_userland(out: &str, dirs: Vec<String>) -> anyhow::Result<()> { if Path::new(out).exists(){ std::fs::remove_file(out)?; } let conn=Connection::open(out)?; conn.execute_batch(r#"CREATE TABLE IF NOT EXISTS objects(id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, soname TEXT, kind TEXT, is_root INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS needs(object_id INTEGER NOT NULL REFERENCES objects(id), ord INTEGER NOT NULL, soname TEXT NOT NULL, resolved_path TEXT REFERENCES objects(path));"#)?; drop(conn); for d in dirs { if !Path::new(&d).is_dir(){ eprintln!("skip not a dir: {}", d); continue; } selfdb_scan(out, &d)?; } let conn=Connection::open(out)?; let nobjs: i64=conn.query_row("SELECT count(*) FROM objects", [], |r| r.get(0))?; let nneeds: i64=conn.query_row("SELECT count(*) FROM needs", [], |r| r.get(0))?; println!("userland -> {}: objects={} needs={}", out, nobjs, nneeds); Ok(()) }
 fn bundle_list(path: &str, filter: &str) -> anyhow::Result<()> { let db=open_db(path); let has: i64=db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='bundle_objects'", [], |r| r.get(0))?; if has==0 { println!("{}: no bundle_objects (build with --bundle)", path); return Ok(()); } let mut q=String::from("SELECT id, path, soname, kind, is_root, size FROM bundle_objects"); if !filter.is_empty(){ q.push_str(" WHERE soname LIKE ?1 OR path LIKE ?1"); } q.push_str(" ORDER BY id"); let mut st=db.prepare(&q)?; let like=format!("%{}%", filter); let mut rows: Vec<(i64,String,Option<String>,String,i64,i64)> = Vec::new(); if filter.is_empty(){ for r in st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))? { rows.push(r?); } } else { for r in st.query_map([like.clone()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))? { rows.push(r?); } } for (id, p, soname, kind, is_root, size) in &rows { let label=soname.clone().unwrap_or_else(|| Path::new(p).file_name().unwrap().to_string_lossy().to_string()); println!("[{}] {:28} {:4} {:8}  {}{}", id, label, kind, size, p, if *is_root==1 {" root"} else {""}); } let n: i64=db.query_row("SELECT count(*) FROM bundle_objects", [], |r| r.get(0))?; let e: i64=db.query_row("SELECT count(*) FROM bundle_needs", [], |r| r.get(0))?; println!("bundle: {} objects, {} edges", n, e); Ok(()) }
 fn bundle_info(path: &str) -> anyhow::Result<()> { let db=open_db(path); let has: i64=db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='bundle_objects'", [], |r| r.get(0))?; if has==0 { println!("{}: no bundle_objects", path); return Ok(()); } let (cnt,sum): (i64, Option<i64>) = db.query_row("SELECT count(*), sum(size) FROM bundle_objects", [], |r| Ok((r.get(0)?, r.get(1)?)))?; let needs: i64=db.query_row("SELECT count(*) FROM bundle_needs", [], |r| r.get(0))?; let sz=std::fs::metadata(path).map(|m| m.len()).unwrap_or(0); println!("{}: bundle_objects={} bytes={} needs={} self_size={}", path, cnt, sum.unwrap_or(0), needs, sz); Ok(()) }
+
+#[derive(clap::Subcommand, Debug)]
+enum PolicyAction {
+    /// List the rules in force.
+    List,
+    /// Refuse writes under a path (content and metadata, including raw SQL).
+    AddReadonly { prefix: String },
+    /// Refuse writes of regular files larger than N bytes.
+    AddMaxSize { bytes: u64 },
+    /// Remove a rule by id (see list).
+    Remove { id: i64 },
+}

@@ -25,7 +25,7 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///   5 = file content is split into CHUNK_SIZE chunks listed in vm_file_chunks; a file's
 ///       refcount on vm_blobs comes from its chunk rows. vm_fs.hash = whole-file sha256
 ///       (informational, no refcounting). Legacy single-blob files keep working via vm_fs.hash.
-pub const VM_USER_VERSION: u32 = 10;
+pub const VM_USER_VERSION: u32 = 11;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -69,6 +69,10 @@ pub fn decompress_cache() -> &'static Mutex<LruCache<String, Arc<Vec<u8>>>> {
 }
 
 pub fn vm_apply_pragmas(conn: &Connection) -> Result<()> {
+    // Every VM connection must know the policy bypass function: the policy triggers call it, and a
+    // trigger whose function is missing fails with "no such function" instead of the policy's refusal.
+    // The flag is dropped here; a caller that needs a bypass registers its own (see policy::register).
+    let _ = crate::policy::register(conn);
     let _ = conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
@@ -115,6 +119,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
                 7 => migrate_7_to_8(conn)?,
                 8 => migrate_8_to_9(conn)?,
                 9 => migrate_9_to_10(conn)?,
+                10 => migrate_10_to_11(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -328,6 +333,11 @@ CREATE TABLE IF NOT EXISTS agent_steps(
 fn migrate_8_to_9(conn: &Connection) -> Result<()> {
     conn.execute_batch(VM_AGENT_SQL)?;
     Ok(())
+}
+
+/// 10 -> 11: the policy table and its triggers (see policy.rs). Empty until a rule is added.
+fn migrate_10_to_11(conn: &Connection) -> Result<()> {
+    crate::policy::ensure_schema(conn)
 }
 
 /// 9 -> 10: agent_steps gains the output-truncation flags. A v9 database created by the first
@@ -2371,6 +2381,11 @@ pub fn snapshot_create(conn: &Connection, name: &str, note: &str) -> Result<i64>
 /// Replace the live tree with a snapshot's tree. The snapshot keeps its chunk references
 /// while the live tree is cleared, so no blob it needs is freed mid-restore.
 pub fn snapshot_restore(conn: &Connection, name: &str) -> Result<()> {
+    // A rollback must be able to undo damage to protected paths, so it runs under the policy bypass.
+    // The guard lives for the whole restore; an early error leaves the bypass on the connection only
+    // until the guard drops, and the savepoint rollback below restores the rows.
+    let bypass = crate::policy::register(conn)?;
+    let _guard = bypass.enter();
     let id = snapshot_id(conn, name)?;
     conn.execute_batch("SAVEPOINT snap_restore;")?;
     let res: Result<()> = (|| {

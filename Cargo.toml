@@ -22,7 +22,7 @@ name = "selfdb"
 path = "src/lib.rs"
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 clap = { version = "4.5", features = ["derive"] }
 goblin = "0.9"
 anyhow = "1.0"
