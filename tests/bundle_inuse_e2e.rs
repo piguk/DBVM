@@ -1,5 +1,5 @@
 //! End-to-end: a running launch's cache entry cannot be evicted out from under it.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn bin(name: &str) -> PathBuf {
