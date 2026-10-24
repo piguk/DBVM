@@ -160,3 +160,108 @@ fn base_rewrites_never_show_a_torn_file_to_a_reader() {
     assert_eq!(torn, 0, "a base reader saw a mixed file ({} of {})", torn, reads);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Child role for the same-file test: rewrite one shared path `count` times, with a value that
+/// names this writer and the round, so the parent can tell whose write survived.
+fn child_same_file() {
+    let base = PathBuf::from(std::env::var("OV_BASE").unwrap());
+    let delta = PathBuf::from(std::env::var("OV_DELTA").unwrap());
+    let tag = std::env::var("OV_TAG").unwrap();
+    let count: usize = std::env::var("OV_COUNT").unwrap().parse().unwrap();
+    let report = PathBuf::from(std::env::var("OV_REPORT").unwrap());
+    let mut out = std::fs::File::create(&report).unwrap();
+    use std::io::Write;
+    let ov = vm::Overlay::open(&delta, &base).expect("open overlay");
+    for i in 0..count {
+        let val = format!("{}-{:04}", tag, i);
+        // a full-size value so a torn write would be visible as a short or mixed read
+        let mut data = val.as_bytes().to_vec();
+        data.resize(40_000, b'.');
+        match ov.write("/shared", &data, 0o644, i as i64) {
+            Ok(()) => writeln!(out, "OK {}", val).unwrap(),
+            Err(e) => writeln!(out, "ERR {} {}", val, e.to_string().replace('\n', " ")).unwrap(),
+        }
+    }
+    out.flush().unwrap();
+}
+
+#[test]
+fn child_same_file_entry() {
+    if std::env::var(ENV_ROLE).ok().as_deref() == Some("same") { child_same_file(); }
+}
+
+fn spawn_same(base: &Path, delta: &Path, tag: &str, count: usize, report: &Path) -> std::process::Child {
+    Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "child_same_file_entry", "--test-threads=1"])
+        .env(ENV_ROLE, "same")
+        .env("OV_BASE", base).env("OV_DELTA", delta)
+        .env("OV_TAG", tag).env("OV_COUNT", count.to_string())
+        .env("OV_REPORT", report)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn().unwrap()
+}
+
+#[test]
+fn processes_rewriting_one_file_leave_one_whole_acknowledged_value() {
+    let (d, base, delta) = make("same");
+    let procs = 4usize;
+    let per = 30usize;
+    let reports: Vec<PathBuf> = (0..procs).map(|t| d.join(format!("rep{}.txt", t))).collect();
+    let children: Vec<_> = (0..procs)
+        .map(|t| spawn_same(&base, &delta, &format!("p{}", t), per, &reports[t]))
+        .collect();
+    for (t, child) in children.into_iter().enumerate() {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "child {} failed: {}", t, String::from_utf8_lossy(&out.stderr));
+    }
+    let mut acked: Vec<String> = Vec::new();
+    let mut errors = 0usize;
+    for rep in &reports {
+        for line in std::fs::read_to_string(rep).unwrap().lines() {
+            if let Some(v) = line.strip_prefix("OK ") { acked.push(v.to_string()); }
+            else if line.starts_with("ERR ") { errors += 1; }
+        }
+    }
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    let got = ov.read("/shared").unwrap();
+    // whole: exactly the 40 000 bytes one writer produced, value prefix then '.' padding
+    assert_eq!(got.len(), 40_000, "final value must be a whole write, not short or mixed");
+    let head: String = got.iter().take_while(|&&b| b != b'.').map(|&b| b as char).collect();
+    assert!(got[head.len()..].iter().all(|&b| b == b'.'), "value is mixed across writers");
+    // the surviving value is one a writer acknowledged
+    assert!(acked.iter().any(|v| v == &head), "final value {:?} was never acknowledged", head);
+    let c = vm::vm_open(delta.to_str().unwrap()).unwrap();
+    let rep = vm::vm_verify(&c, true).unwrap();
+    assert!(rep.contains("deep=ok"), "delta inconsistent: {}", rep);
+    eprintln!("same-file writers: {} acknowledged, {} errors; survivor {}", acked.len(), errors, head);
+    assert_eq!(acked.len() + errors, procs * per, "every attempt is accounted for");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_write_blocked_past_busy_timeout_is_reported_and_not_applied() {
+    // The parent holds the delta's write lock in an open transaction. A child write must wait out
+    // the busy timeout (5 s) and then fail with an error, never succeed silently. The failed value
+    // must not appear in the delta, and the earlier value must survive unchanged.
+    let (d, base, delta) = make("blocked");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    ov.write("/shared", b"before", 0o644, 1).unwrap();
+    drop(ov);
+    let holder = vm::vm_open(delta.to_str().unwrap()).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let report = d.join("blocked-rep.txt");
+    let t0 = std::time::Instant::now();
+    let child = spawn_same(&base, &delta, "blk", 1, &report);
+    let out = child.wait_with_output().unwrap();
+    let waited = t0.elapsed();
+    holder.execute_batch("ROLLBACK;").unwrap();
+    assert!(out.status.success(), "child process itself must not crash: {}", String::from_utf8_lossy(&out.stderr));
+    let text = std::fs::read_to_string(&report).unwrap();
+    assert!(text.lines().any(|l| l.starts_with("ERR ")), "blocked write must be reported as an error: {:?}", text);
+    assert!(!text.lines().any(|l| l.starts_with("OK ")), "blocked write must not be acknowledged");
+    assert!(waited.as_millis() >= 4_000, "the child must have waited for the busy timeout, waited {:?}", waited);
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    assert_eq!(ov.read("/shared").unwrap(), b"before", "the failed write must not change the value");
+    let _ = std::fs::remove_dir_all(&d);
+}
