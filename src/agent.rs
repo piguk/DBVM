@@ -4,8 +4,9 @@
 //! under bwrap with that directory as its root -> sync the directory back -> diff against the
 //! snapshot -> record the step -> restore the snapshot if the step failed and rollback was asked.
 //!
-//! Isolation is bwrap's: a new PID namespace, /dev and /proc, and the materialized tree as root.
-//! The network is not isolated. A step is refused (not run unisolated) if bwrap is missing.
+//! Isolation is bwrap's: a new PID namespace, a new network namespace (only a down loopback, so no
+//! outbound or inbound traffic, no host or tailnet services), /dev and /proc, and the materialized
+//! tree as root. A step is refused (not run unisolated) if bwrap is missing.
 
 use anyhow::{anyhow, Result};
 use rusqlite::params;
@@ -126,6 +127,7 @@ fn run_in(root: &Path, argv: &[String], timeout_secs: u64, max_output: usize) ->
         .arg("--dev").arg("/dev")
         .arg("--proc").arg("/proc")
         .arg("--unshare-pid")
+        .arg("--unshare-net")
         .arg("--die-with-parent")
         .arg("--chdir").arg("/");
     for a in argv { cmd.arg(a); }

@@ -121,3 +121,20 @@ fn output_under_the_cap_is_kept_whole_and_not_flagged() {
     assert!(!r.stdout_truncated && !r.stderr_truncated);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn step_runs_in_its_own_network_namespace() {
+    if !step_available() { eprintln!("skip: bwrap not available"); return; }
+    let (d, db) = make("netns");
+    // /proc/net/dev lists the interfaces of the current network namespace. A step must see only
+    // loopback, not the host's interfaces (the host has at least one non-loopback NIC here).
+    let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(),
+        "while read l; do echo \"IF:$l\"; done < /proc/net/dev".into()],
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+    assert_eq!(r.exit_code, 0);
+    let out = String::from_utf8_lossy(&r.stdout);
+    let ifaces: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("IF:"))
+        .filter_map(|l| l.split(':').next()).map(|s| s.trim()).filter(|s| !s.is_empty() && !s.starts_with("Inter") && !s.starts_with("face")).collect();
+    assert_eq!(ifaces, vec!["lo"], "step must see only loopback: {:?}", ifaces);
+    let _ = std::fs::remove_dir_all(&d);
+}
