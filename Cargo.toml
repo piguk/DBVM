@@ -51,3 +51,5 @@ panic = "abort"
 
 [dev-dependencies]
 serde_json = "1"
+# the mount tests name fuser::BackgroundSession (the mount handle)
+fuser = { version = "0.14", default-features = false }
