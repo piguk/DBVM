@@ -218,3 +218,50 @@ fn rewriting_a_file_is_atomic_to_other_connections() {
     assert!(bad.is_empty(), "reader saw {} partial file(s) out of {} reads, lengths {:?}", bad.len(), reads, &bad[..bad.len().min(5)]);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn replacing_a_file_with_a_directory_is_atomic_to_other_connections() {
+    // fs_put_node deletes a file's chunk rows and then updates its row. Another connection must
+    // never see a regular file with no content: it sees the file, or the directory, never both
+    // halves.
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let (d, db) = tmpdb("node-atomic");
+    let writer = open(&db);
+    let file = vec![b'x'; 150_000];
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_db = db.clone();
+    let stop2 = stop.clone();
+    let reader = std::thread::spawn(move || {
+        let r = vm::vm_open(reader_db.to_str().unwrap()).unwrap();
+        let mut broken = 0usize;
+        let mut reads = 0usize;
+        while !stop2.load(Ordering::SeqCst) {
+            // a regular file row whose content cannot be read is the partial state
+            // one read transaction: the kind check and the content read see the same snapshot
+            let _ = r.execute_batch("BEGIN;");
+            let kind: Option<String> = r.query_row("SELECT kind FROM vm_fs WHERE path='/n'", [], |x| x.get(0)).ok();
+            if kind.as_deref() == Some("file") {
+                reads += 1;
+                match vm::vm_cat(&r, "/n") {
+                    Ok(b) if b.len() == 150_000 => {}
+                    Ok(b) => { broken += 1; eprintln!("SHORT {}", b.len()); }
+                    Err(e) => { broken += 1; eprintln!("ERRK {}", e); }
+                }
+            }
+            let _ = r.execute_batch("COMMIT;");
+        }
+        (reads, broken)
+    });
+    for round in 0..120 {
+        if round % 2 == 0 {
+            vm::vm_add_bytes(&writer, "/n", &file, 0o644, round).unwrap();
+        } else {
+            vm::vm_add_dir(&writer, "/n", 0o755, round).unwrap();
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let (reads, broken) = reader.join().unwrap();
+    eprintln!("node replacement: {} file reads, {} broken", reads, broken);
+    assert_eq!(broken, 0, "a file row without readable content was visible ({} of {})", broken, reads);
+    let _ = std::fs::remove_dir_all(&d);
+}

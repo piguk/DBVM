@@ -973,14 +973,23 @@ fn fs_put_file(conn: &Connection, vm_p: &str, mode: i64, mtime: i64, data: &[u8]
 
 /// Upsert a non-file row (dir/symlink). Any previous hash is released by the UPDATE trigger.
 fn fs_put_node(conn: &Connection, vm_p: &str, kind: &str, mode: i64, mtime: i64, link: Option<&str>) -> Result<()> {
-    // a file replaced by a dir/symlink must release its chunk references
-    conn.prepare_cached("DELETE FROM vm_file_chunks WHERE path=?1")?.execute(params![vm_p])?;
-    conn.execute(
-        "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,?2,?3,?4,0,NULL,NULL,0,?5)
-         ON CONFLICT(path) DO UPDATE SET kind=excluded.kind, mode=excluded.mode, mtime=excluded.mtime, size=0,
-            hash=NULL, content=NULL, compressed=0, link_target=excluded.link_target",
-        params![vm_p, kind, mode, mtime, link])?;
-    Ok(())
+    // Savepoint: releasing a replaced file's chunks and updating its row are one unit, so no
+    // other connection sees a regular-file row without content. Nests inside a caller's transaction.
+    conn.execute_batch("SAVEPOINT fs_node;")?;
+    let res: Result<()> = (|| {
+        // a file replaced by a dir/symlink must release its chunk references
+        conn.prepare_cached("DELETE FROM vm_file_chunks WHERE path=?1")?.execute(params![vm_p])?;
+        conn.execute(
+            "INSERT INTO vm_fs(path,kind,mode,mtime,size,hash,content,compressed,link_target) VALUES (?1,?2,?3,?4,0,NULL,NULL,0,?5)
+             ON CONFLICT(path) DO UPDATE SET kind=excluded.kind, mode=excluded.mode, mtime=excluded.mtime, size=0,
+                hash=NULL, content=NULL, compressed=0, link_target=excluded.link_target",
+            params![vm_p, kind, mode, mtime, link])?;
+        Ok(())
+    })();
+    match res {
+        Ok(()) => { conn.execute_batch("RELEASE fs_node;")?; Ok(()) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK TO fs_node; RELEASE fs_node;"); Err(e) }
+    }
 }
 
 pub fn vm_add_bytes(conn: &Connection, vm_path: &str, data: &[u8], mode: i64, mtime: i64) -> Result<()> {
