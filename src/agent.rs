@@ -47,18 +47,14 @@ fn bwrap_available() -> bool {
     Command::new("bwrap").arg("--help").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
-/// Next snapshot name for this database, unique within it.
-fn next_snapshot_name(conn: &rusqlite::Connection, prefix: &str) -> Result<String> {
-    let n: i64 = conn.query_row("SELECT COALESCE(MAX(id),0)+1 FROM vm_snapshots", [], |r| r.get(0))?;
-    Ok(format!("{}-{}", prefix, n))
-}
-
 pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepResult> {
     if argv.is_empty() { return Err(anyhow!("empty command")); }
     if !bwrap_available() { return Err(anyhow!("bwrap is required for agent-step; refusing to run unisolated")); }
+    // one step at a time per database: the tree mirror would otherwise delete a concurrent step's writes
+    let _lock = StepLock::acquire(db)?;
     let conn = vm::vm_open(db.to_str().ok_or_else(|| anyhow!("non-utf8 db path"))?)?;
-    let before = next_snapshot_name(&conn, "step-before")?;
-    vm::snapshot_create(&conn, &before, "agent-step")?;
+    // the name comes from the snapshot's own row id, so two steps starting at once cannot collide
+    let (_, before) = vm::snapshot_create_named(&conn, "step-before", "agent-step")?;
 
     let scratch = vm::make_tmp_dir("agent-step-")?;
     let started = Instant::now();
@@ -87,8 +83,7 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
         vm::snapshot_restore(&conn, &before)?;
         None
     } else {
-        let a = next_snapshot_name(&conn, "step-after")?;
-        vm::snapshot_create(&conn, &a, "agent-step")?;
+        let (_, a) = vm::snapshot_create_named(&conn, "step-after", "agent-step")?;
         Some(a)
     };
     let duration_ms = started.elapsed().as_millis();
@@ -237,4 +232,29 @@ pub fn step_to_json(s: &StepRecord) -> String {
         "{{\"step_id\":{},\"cmd\":{},\"exit_code\":{},\"timed_out\":{},\"rolled_back\":{},\"duration_ms\":{},\"stdout_truncated\":{},\"stderr_truncated\":{},\"created_at\":{},\"changes\":{}}}",
         s.step_id, json_string(&s.cmd), s.exit_code, s.timed_out, s.rolled_back, s.duration_ms,
         s.stdout_truncated, s.stderr_truncated, s.created_at, s.fs_diff_json)
+}
+
+/// An exclusive lock over one database, held for a whole step.
+///
+/// `run_step` materialises the tree, runs the command, then mirrors the tree back. That mirror deletes
+/// every database path absent from the tree, so two steps running at once delete each other's writes:
+/// measured, two concurrent steps both reported creating a file and only one survived. Serialising the
+/// whole step is the only correct behaviour while writes go through a full-tree sync. Real parallelism
+/// needs one Delta per step instead (see docs/agentvm-gap-analysis.md).
+pub struct StepLock { _file: std::fs::File }
+
+impl StepLock {
+    /// Take the lock for `db`. Blocks until any running step on the same database finishes.
+    pub fn acquire(db: &Path) -> Result<StepLock> {
+        let mut p = db.as_os_str().to_owned();
+        p.push(".step-lock");
+        let path = std::path::PathBuf::from(p);
+        let f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path)
+            .map_err(|e| anyhow!("open step lock {}: {}", path.display(), e))?;
+        // an exclusive advisory lock: released by the kernel if this process dies
+        if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) } != 0 {
+            return Err(anyhow!("lock {}: {}", path.display(), std::io::Error::last_os_error()));
+        }
+        Ok(StepLock { _file: f })
+    }
 }

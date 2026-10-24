@@ -2369,6 +2369,47 @@ fn snapshot_id(conn: &Connection, name: &str) -> Result<i64> {
 
 /// Capture the whole live tree as a named content snapshot. Copies metadata and chunk
 /// references only, so no blob is duplicated. One transaction: all or nothing.
+/// Create a snapshot whose name is derived from its row id: `<prefix>-<id>`.
+///
+/// The name must not be computed by the caller from `MAX(id)+1`. Two callers computing it at the same
+/// time pick the same number and the second insert fails on the UNIQUE name. Here the row is inserted
+/// under a unique placeholder, its id is read back, and the name is set from that id, all inside one
+/// savepoint. Returns (id, name).
+pub fn snapshot_create_named(conn: &Connection, prefix: &str, note: &str) -> Result<(i64, String)> {
+    conn.execute_batch("SAVEPOINT snap_named;")?;
+    let res: Result<(i64, String)> = (|| {
+        // a placeholder that no other row can take, even if two callers insert at once
+        conn.prepare_cached("INSERT INTO vm_snapshots(name, page_count, page_size, bytes, note) VALUES (?1, 0, 0, 0, ?2)")?
+            .execute(params![format!("{}", uuid_like()), note])?;
+        let id = conn.last_insert_rowid();
+        let name = format!("{}-{}", prefix, id);
+        conn.prepare_cached("UPDATE vm_snapshots SET name=?1 WHERE id=?2")?.execute(params![name, id])?;
+        conn.prepare_cached(
+            "INSERT INTO vm_snapshot_fs(snap_id, path, kind, mode, mtime, mtime_ns, size, link_target, hash)
+             SELECT ?1, path, kind, mode, mtime, mtime_ns, size, link_target, hash FROM vm_fs")?
+            .execute(params![id])?;
+        conn.prepare_cached("INSERT INTO vm_snapshot_chunks(snap_id, path, idx, hash)
+             SELECT ?1, path, idx, hash FROM vm_file_chunks")?
+            .execute(params![id])?;
+        conn.prepare_cached("INSERT INTO vm_log(op, path, detail) VALUES ('snapshot', ?1, 'content')")?
+            .execute(params![name])?;
+        Ok((id, name))
+    })();
+    match res {
+        Ok(v) => { conn.execute_batch("RELEASE snap_named;")?; Ok(v) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK TO snap_named; RELEASE snap_named;"); Err(e) }
+    }
+}
+
+/// A name no other caller will choose: process id, a counter, and the time in nanoseconds.
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("pending-{}-{}-{}", std::process::id(), n, t)
+}
+
 pub fn snapshot_create(conn: &Connection, name: &str, note: &str) -> Result<i64> {
     conn.execute_batch("SAVEPOINT snap_create;")?;
     let res: Result<i64> = (|| {
