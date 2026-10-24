@@ -202,7 +202,9 @@ pub mod fuse_impl {
             let conn = &self.conn;
             let target: Result<String, _> = conn.prepare_cached("SELECT link_target FROM vm_fs WHERE path=?1").and_then(|mut st| st.query_row(params![path], |r| r.get(0)));
             match target {
-                Ok(t) => reply.data(t.as_bytes()),
+                // the stored target is unchanged; the mount shows absolute targets as paths that stay
+                // inside the mount (see owner::mount_link_text)
+                Ok(t) => reply.data(crate::owner::mount_link_text(&path, &t).as_bytes()),
                 Err(_) => reply.error(libc::ENOENT),
             }
         }

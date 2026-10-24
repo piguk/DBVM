@@ -67,3 +67,86 @@ mod tests {
         assert_eq!((o.uid, o.gid), (u, g));
     }
 }
+
+/// The link text a mounted VM shows for a stored symlink target.
+///
+/// Stored targets are kept as written (sync, materialize and resolution all read them), so this
+/// changes only what the mount presents. An absolute target would be resolved by the kernel against the
+/// host root, escaping the mount. It is shown as a relative path from the link's own directory to the
+/// target, so the kernel resolves it inside the mount. Relative targets already stay inside the tree and
+/// are returned unchanged. `..` at the top of the tree stops at the root, so the result cannot climb out.
+pub fn mount_link_text(link_vm_path: &str, stored_target: &str) -> String {
+    if !stored_target.starts_with('/') {
+        return stored_target.to_string();
+    }
+    let from: Vec<&str> = parent_components(link_vm_path);
+    let to: Vec<&str> = split_components(stored_target);
+    // common prefix of the two directory paths
+    let common = from.iter().zip(to.iter()).take_while(|(a, b)| a == b).count();
+    let mut out: Vec<&str> = Vec::new();
+    for _ in common..from.len() { out.push(".."); }
+    out.extend(to[common..].iter().copied());
+    if out.is_empty() { ".".to_string() } else { out.join("/") }
+}
+
+/// Components of a VM path with `.` and `..` resolved lexically, not climbing above `/`.
+fn split_components(p: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => { out.pop(); }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Components of the directory that contains `p`.
+fn parent_components(p: &str) -> Vec<&str> {
+    let mut v = split_components(p);
+    v.pop();
+    v
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn absolute_target_becomes_relative_from_the_link_directory() {
+        // /bin/sh -> /usr/bin/dash : from /bin, climb one, then down to usr/bin/dash
+        assert_eq!(mount_link_text("/bin/sh", "/usr/bin/dash"), "../usr/bin/dash");
+        // /bin -> /usr/bin : from / (the link's own parent), straight down
+        assert_eq!(mount_link_text("/bin", "/usr/bin"), "usr/bin");
+        // a target in the link's own directory
+        assert_eq!(mount_link_text("/a/b/link", "/a/b/c"), "c");
+    }
+
+    #[test]
+    fn relative_targets_are_unchanged() {
+        assert_eq!(mount_link_text("/bin/sh", "dash"), "dash");
+        assert_eq!(mount_link_text("/a/b", "../x"), "../x");
+    }
+
+    #[test]
+    fn the_result_never_climbs_above_the_mount_root() {
+        // from a shallow link, nothing above the root is ever requested
+        assert_eq!(mount_link_text("/x", "/usr/bin"), "usr/bin");
+        // a link in /a/b/c reaches /a/z by climbing from /a/b/c to /a (two levels), then down to z
+        assert_eq!(mount_link_text("/a/b/c/d", "/a/z"), "../../z");
+    }
+
+    #[test]
+    fn a_link_to_the_root_is_handled() {
+        // a link in /a reaches the root with one climb
+        assert_eq!(mount_link_text("/a/link", "/"), "..");
+        assert_eq!(mount_link_text("/link", "/"), ".");
+    }
+
+    #[test]
+    fn dotdot_inside_an_absolute_target_is_resolved_lexically() {
+        // /usr/lib/../bin resolves to /usr/bin before the relative form is computed
+        assert_eq!(mount_link_text("/bin/sh", "/usr/lib/../bin/dash"), "../usr/bin/dash");
+    }
+}
