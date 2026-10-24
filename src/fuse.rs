@@ -43,6 +43,11 @@ pub mod fuse_impl {
             Ok(fs)
         }
 
+        /// errno for a failed database write: a policy refusal is EACCES, anything else is EIO.
+        fn write_errno(e: &dyn std::error::Error) -> c_int {
+            if crate::policy::is_refusal(&anyhow::anyhow!(e.to_string())) { libc::EACCES } else { libc::EIO }
+        }
+
         fn rebuild(&mut self) -> Result<()> {
             self.ino_to_path.clear();
             self.path_to_ino.clear();
@@ -422,9 +427,13 @@ pub mod fuse_impl {
             let ino = match self.path_to_ino.get(&norm).copied() { Some(i)=> i, None=> {reply.error(libc::ENOENT); return;} };
             let kind = self.ino_to_kind.get(&ino).cloned().unwrap_or_default();
             if kind == "dir" { reply.error(libc::EISDIR); return; }
-            let conn = &self.conn;
-            // DELETE fires vm_fs_hash_del, which releases the blob reference
-            let _ = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![norm.clone()]));
+            // DELETE fires vm_fs_hash_del, which releases the blob reference. A refused delete (a policy
+            // rule) must be reported and must not touch the in-memory view, or the mount would show the
+            // entry as gone while the database still has it.
+            if let Err(e) = self.conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![norm.clone()])) {
+                reply.error(Self::write_errno(&e));
+                return;
+            }
             self.path_to_ino.remove(&norm);
             self.ino_to_path.remove(&ino);
             self.ino_to_kind.remove(&ino);
@@ -447,8 +456,11 @@ pub mod fuse_impl {
                     if pp_norm == norm { reply.error(libc::ENOTEMPTY); return; }
                 }
             }
-            let conn = &self.conn;
-            let _ = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![norm.clone()]));
+            // as in unlink: report a refused delete and leave the view untouched
+            if let Err(e) = self.conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![norm.clone()])) {
+                reply.error(Self::write_errno(&e));
+                return;
+            }
             self.path_to_ino.remove(&norm);
             self.ino_to_path.remove(&ino);
             self.ino_to_kind.remove(&ino);
@@ -499,35 +511,46 @@ pub mod fuse_impl {
             let old_path = normalize_vm_path(& if old_parent_path=="/" { format!("/{}", old_n) } else { format!("{}/{}", old_parent_path, old_n) });
             let new_path = normalize_vm_path(& if new_parent_path=="/" { format!("/{}", new_n) } else { format!("{}/{}", new_parent_path, new_n) });
             if !self.path_to_ino.contains_key(&old_path) { reply.error(libc::ENOENT); return; }
-            if self.path_to_ino.contains_key(&new_path) {
-                // if target exists, remove it first (like overwrite)
-                if let Some(ino) = self.path_to_ino.get(&new_path).copied() {
-                    // simple unlink if file
-                    let kind = self.ino_to_kind.get(&ino).cloned().unwrap_or_default();
-                    if kind == "dir" { reply.error(libc::EEXIST); return; }
-                    let conn = &self.conn;
-                    let _ = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![new_path.clone()]));
-                    let old_ino = self.path_to_ino.remove(&new_path).unwrap();
-                    self.ino_to_path.remove(&old_ino);
-                    self.ino_to_kind.remove(&old_ino);
-                    self.ino_to_attr.remove(&old_ino);
-                }
-            }
-            let conn = &self.conn;
-            // update vm_fs for old_path and descendants
+            if new_path == old_path { reply.ok(); return; }
             let old_prefix = if old_path=="/" { "/".to_string() } else { format!("{}/", old_path) };
             let new_prefix = if new_path=="/" { "/".to_string() } else { format!("{}/", new_path) };
-            // collect affected paths
-            let mut affected: Vec<String> = Vec::new();
-            for p in self.path_to_ino.keys() {
-                if p == &old_path || p.starts_with(&old_prefix) {
-                    affected.push(p.clone());
-                }
+            // every path that moves: the entry itself and its descendants
+            let mut affected: Vec<String> = self.path_to_ino.keys()
+                .filter(|p| **p == old_path || p.starts_with(&old_prefix)).cloned().collect();
+            if self.path_to_ino.get(&new_path).map(|_| ()).is_some() {
+                let ino = self.path_to_ino[&new_path];
+                if self.ino_to_kind.get(&ino).map(|k| k == "dir").unwrap_or(false) { reply.error(libc::EEXIST); return; }
             }
             affected.sort_by(|a,b| b.len().cmp(&a.len())); // longer first to avoid collision
-            for old_p in affected {
-                let new_p = if old_p == old_path { new_path.clone() } else { format!("{}{}", new_prefix, &old_p[old_prefix.len()..]) };
-                let _ = conn.prepare_cached("UPDATE vm_fs SET path=?1 WHERE path=?2").and_then(|mut st| st.execute(params![new_p.clone(), old_p.clone()]));
+            // Build the final mapping, then apply it in one savepoint. Only after the commit is the
+            // in-memory view updated, so a refused rename leaves the mount showing the old state.
+            let moves: Vec<(String, String)> = affected.iter().map(|old_p| {
+                let new_p = if *old_p == old_path { new_path.clone() } else { format!("{}{}", new_prefix, &old_p[old_prefix.len()..]) };
+                (old_p.clone(), new_p)
+            }).collect();
+            let res: Result<(), rusqlite::Error> = (|| {
+                self.conn.execute_batch("SAVEPOINT fuse_rename;")?;
+                // an existing destination is replaced (removed with its chunks by the cascade)
+                self.conn.execute("DELETE FROM vm_fs WHERE path=?1", params![new_path.clone()])?;
+                for (old_p, new_p) in &moves {
+                    // vm_fs and vm_file_chunks both key on path, and there is no ON UPDATE CASCADE:
+                    // moving one without the other leaves the content unreachable at the new name.
+                    self.conn.prepare_cached("UPDATE vm_fs SET path=?1 WHERE path=?2")?.execute(params![new_p, old_p])?;
+                    self.conn.prepare_cached("UPDATE vm_file_chunks SET path=?1 WHERE path=?2")?.execute(params![new_p, old_p])?;
+                }
+                self.conn.execute_batch("RELEASE fuse_rename;")?;
+                Ok(())
+            })();
+            if let Err(e) = res {
+                let _ = self.conn.execute_batch("ROLLBACK TO fuse_rename; RELEASE fuse_rename;");
+                reply.error(if crate::policy::is_refusal(&anyhow::anyhow!(e.to_string())) { libc::EACCES } else { libc::EIO });
+                return;
+            }
+            // the database committed: now move the in-memory view, dropping any replaced entry
+            if let Some(ino) = self.path_to_ino.remove(&new_path) {
+                self.ino_to_path.remove(&ino); self.ino_to_kind.remove(&ino); self.ino_to_attr.remove(&ino);
+            }
+            for (old_p, new_p) in moves {
                 if let Some(ino) = self.path_to_ino.remove(&old_p) {
                     self.path_to_ino.insert(new_p.clone(), ino);
                     self.ino_to_path.insert(ino, new_p);
@@ -540,8 +563,13 @@ pub mod fuse_impl {
             let path = self.ino_to_path.get(&ino).cloned().unwrap_or_default();
             let conn = Some(&self.conn);
             if let Some(m) = mode {
+                if let Some(ref c) = conn {
+                    if let Err(e) = c.prepare_cached("UPDATE vm_fs SET mode=?1 WHERE path=?2").and_then(|mut st| st.execute(params![m as i64, path.clone()])) {
+                        reply.error(Self::write_errno(&e));
+                        return;
+                    }
+                }
                 if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.perm = (m & 0o7777) as u16; }
-                if let Some(ref c) = conn { let _ = c.prepare_cached("UPDATE vm_fs SET mode=?1 WHERE path=?2").and_then(|mut st| st.execute(params![m as i64, path.clone()])); }
             }
             // Ownership is fixed to the mounting process. A request to change it is refused with EPERM,
             // not silently ignored: a caller that believes its chown worked would be wrong. A request
@@ -559,7 +587,10 @@ pub mod fuse_impl {
                 if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.mtime = t; attr.ctime = t; }
                 if let Some(ref c) = conn {
                     let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                    let _ = c.prepare_cached("UPDATE vm_fs SET mtime=?1 WHERE path=?2").and_then(|mut st| st.execute(params![secs, path.clone()]));
+                    if let Err(e) = c.prepare_cached("UPDATE vm_fs SET mtime=?1 WHERE path=?2").and_then(|mut st| st.execute(params![secs, path.clone()])) {
+                        reply.error(Self::write_errno(&e));
+                        return;
+                    }
                 }
             }
             if let Some(sz) = size {

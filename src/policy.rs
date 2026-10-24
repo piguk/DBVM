@@ -214,8 +214,25 @@ pub fn rebuild_triggers(conn: &Connection) -> Result<()> {
         if prefixes.is_empty() { return None; }
         Some(prefixes.iter().map(|p| under_prefix(&format!("{}.path", r), p)).collect::<Vec<_>>().join(" OR "))
     };
+    // An UPDATE is refused when either side is protected. Checking only NEW would let a file be moved
+    // out of a protected directory: the old path is protected, the new one is not, and the row would
+    // change. Checking only OLD would let one be moved in.
+    for (name, event, from, to) in [
+        ("vm_pol_fs_upd", "UPDATE", Some("OLD"), Some("NEW")),
+        ("vm_pol_ch_upd", "UPDATE", Some("OLD"), Some("NEW")),
+    ] {
+        let conds: Vec<String> = [from, to].into_iter().flatten()
+            .filter_map(|r| if name.starts_with("vm_pol_fs") { fs_row(r) } else { ch_row(r) })
+            .collect();
+        if !conds.is_empty() {
+            let (table, _) = if name.starts_with("vm_pol_fs") { ("vm_fs", ()) } else { ("vm_file_chunks", ()) };
+            sql.push_str(&format!(
+                "CREATE TRIGGER {name} BEFORE {event} ON {table} WHEN NOT {bypass} AND ({cond}) BEGIN {refuse}; END;\n",
+                name = name, event = event, table = table, bypass = bypass, cond = conds.join(" OR "), refuse = refuse));
+        }
+    }
     for (name, event, row) in [
-        ("vm_pol_fs_ins", "INSERT", "NEW"), ("vm_pol_fs_upd", "UPDATE", "NEW"), ("vm_pol_fs_del", "DELETE", "OLD"),
+        ("vm_pol_fs_ins", "INSERT", "NEW"), ("vm_pol_fs_del", "DELETE", "OLD"),
     ] {
         if let Some(cond) = fs_row(row) {
             sql.push_str(&format!(
@@ -224,7 +241,7 @@ pub fn rebuild_triggers(conn: &Connection) -> Result<()> {
         }
     }
     for (name, event, row) in [
-        ("vm_pol_ch_ins", "INSERT", "NEW"), ("vm_pol_ch_upd", "UPDATE", "NEW"), ("vm_pol_ch_del", "DELETE", "OLD"),
+        ("vm_pol_ch_ins", "INSERT", "NEW"), ("vm_pol_ch_del", "DELETE", "OLD"),
     ] {
         if let Some(cond) = ch_row(row) {
             sql.push_str(&format!(

@@ -231,3 +231,21 @@ fn the_overlay_check_and_the_trigger_agree_on_tricky_prefixes() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+#[test]
+fn renaming_a_file_out_of_a_protected_prefix_is_refused() {
+    // The UPDATE changes a row whose OLD path is protected and whose NEW path is not. Checking only the
+    // new path would let a file be moved out of a read-only directory.
+    let (d, c) = make("moveout");
+    policy::add(&c, &Rule::ReadonlyPrefix("/tests".into())).unwrap();
+    let r = c.execute("UPDATE vm_fs SET path='/moved.sh' WHERE path='/tests/eval.sh'", []);
+    assert!(r.is_err(), "moving a file out of a protected directory must be refused");
+    let still: i64 = c.query_row("SELECT count(*) FROM vm_fs WHERE path='/tests/eval.sh'", [], |r| r.get(0)).unwrap();
+    assert_eq!(still, 1, "the file stays where it was");
+    // moving an unprotected file INTO the protected prefix is refused too
+    let r2 = c.execute("UPDATE vm_fs SET path='/tests/inside.sh' WHERE path='/work/a.txt'", []);
+    assert!(r2.is_err(), "moving a file into a protected directory must be refused");
+    // and an ordinary rename outside the prefix still works
+    c.execute("UPDATE vm_fs SET path='/work/b.txt' WHERE path='/work/a.txt'", []).expect("unprotected rename must work");
+    let _ = std::fs::remove_dir_all(&d);
+}
