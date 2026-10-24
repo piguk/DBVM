@@ -23,12 +23,15 @@ pub mod fuse_impl {
         ino_to_kind: HashMap<u64, String>,
         ino_to_attr: HashMap<u64, FileAttr>,
         next_ino: u64,
+        /// The identity every node reports: the mounting process (see owner.rs).
+        owner: crate::owner::Owner,
     }
 
     impl VmFuse {
         pub fn new(db_path: String) -> Result<Self> {
             let conn = vm_open(&db_path)?;
             let mut fs = Self {
+                owner: crate::owner::Owner::of_current_process(),
                 conn,
                 ino_to_path: HashMap::new(),
                 path_to_ino: HashMap::new(),
@@ -57,8 +60,8 @@ pub mod fuse_impl {
                 kind: FileType::Directory,
                 perm: 0o755,
                 nlink: 2,
-                uid: 0,
-                gid: 0,
+                uid: self.owner.uid,
+                gid: self.owner.gid,
                 rdev: 0,
                 blksize: BLOCK_SIZE,
                 flags: 0,
@@ -69,6 +72,7 @@ pub mod fuse_impl {
             self.ino_to_attr.insert(1, root_attr);
 
             let conn = &self.conn;
+            // uid/gid are read only to be passed to Owner::for_node, which ignores them (see owner.rs)
             let mut stmt = conn.prepare("SELECT path, kind, mode, size, mtime, uid, gid, link_target, compressed FROM vm_fs ORDER BY length(path), path")?;
             let rows = stmt.query_map([], |r| Ok((
                 r.get::<_,String>(0)?,
@@ -82,7 +86,7 @@ pub mod fuse_impl {
                 r.get::<_,Option<i64>>(8)?,
             )))?;
             for row in rows {
-                let (path, kind, mode, size, mtime, uid, gid, link_target, _comp) = row?;
+                let (path, kind, mode, size, mtime, stored_uid, stored_gid, link_target, _comp) = row?;
                 let norm = normalize_vm_path(&path);
                 if norm == "/" { 
                     // update root mtime if needed but keep ino 1
@@ -111,6 +115,7 @@ pub mod fuse_impl {
                 let t = UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64);
                 let nlink = if ft == FileType::Directory { 2 } else { 1 };
                 // directories need parent check but default nlink 2
+                let (node_uid, node_gid) = self.owner.for_node(stored_uid, stored_gid);
                 let attr = FileAttr {
                     ino,
                     size: sz,
@@ -122,8 +127,8 @@ pub mod fuse_impl {
                     kind: ft,
                     perm,
                     nlink,
-                    uid: uid as u32,
-                    gid: gid as u32,
+                    uid: node_uid,
+                    gid: node_gid,
                     rdev: 0,
                     blksize: BLOCK_SIZE,
                     flags: 0,
@@ -360,8 +365,8 @@ pub mod fuse_impl {
                 kind: FileType::RegularFile,
                 perm: perm as u16,
                 nlink: 1,
-                uid: _req.uid(),
-                gid: _req.gid(),
+                uid: self.owner.uid,
+                gid: self.owner.gid,
                 rdev: 0,
                 blksize: BLOCK_SIZE,
                 flags: 0,
@@ -398,8 +403,8 @@ pub mod fuse_impl {
                 kind: FileType::Directory,
                 perm: perm as u16,
                 nlink: 2,
-                uid: _req.uid(),
-                gid: _req.gid(),
+                uid: self.owner.uid,
+                gid: self.owner.gid,
                 rdev: 0,
                 blksize: BLOCK_SIZE,
                 flags: 0,
@@ -475,8 +480,8 @@ pub mod fuse_impl {
                 kind: FileType::Symlink,
                 perm: 0o777,
                 nlink: 1,
-                uid: _req.uid(),
-                gid: _req.gid(),
+                uid: self.owner.uid,
+                gid: self.owner.gid,
                 rdev: 0,
                 blksize: BLOCK_SIZE,
                 flags: 0,
@@ -536,13 +541,12 @@ pub mod fuse_impl {
                 if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.perm = (m & 0o7777) as u16; }
                 if let Some(ref c) = conn { let _ = c.prepare_cached("UPDATE vm_fs SET mode=?1 WHERE path=?2").and_then(|mut st| st.execute(params![m as i64, path.clone()])); }
             }
-            if let Some(u) = uid {
-                if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.uid = u; }
-                if let Some(ref c) = conn { let _ = c.prepare_cached("UPDATE vm_fs SET uid=?1 WHERE path=?2").and_then(|mut st| st.execute(params![u as i64, path.clone()])); }
-            }
-            if let Some(g) = gid {
-                if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.gid = g; }
-                if let Some(ref c) = conn { let _ = c.prepare_cached("UPDATE vm_fs SET gid=?1 WHERE path=?2").and_then(|mut st| st.execute(params![g as i64, path.clone()])); }
+            // Ownership is fixed to the mounting process. A request to change it is refused with EPERM,
+            // not silently ignored: a caller that believes its chown worked would be wrong. A request
+            // that names the current owner is a no-op and succeeds.
+            if self.owner.is_owner_change(uid, gid) {
+                reply.error(libc::EPERM);
+                return;
             }
             if let Some(at) = atime {
                 let t = match at { fuser::TimeOrNow::SpecificTime(t)=> t, fuser::TimeOrNow::Now => SystemTime::now() };
@@ -600,7 +604,7 @@ pub mod fuse_impl {
             let now_sys = UNIX_EPOCH + Duration::from_secs(now as u64);
             let attr = FileAttr {
                 ino, size: 0, blocks: 0, atime: now_sys, mtime: now_sys, ctime: now_sys, crtime: now_sys,
-                kind: FileType::RegularFile, perm: perm as u16, nlink: 1, uid: _req.uid(), gid: _req.gid(), rdev: 0, blksize: BLOCK_SIZE, flags: 0,
+                kind: FileType::RegularFile, perm: perm as u16, nlink: 1, uid: self.owner.uid, gid: self.owner.gid, rdev: 0, blksize: BLOCK_SIZE, flags: 0,
             };
             self.ino_to_attr.insert(ino, attr);
             reply.entry(&TTL, &attr, 0);

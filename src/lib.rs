@@ -7,5 +7,6 @@ pub mod overlay;
 pub mod agent;
 pub mod policy;
 pub mod inject;
+pub mod owner;
 #[cfg(feature = "fuse")]
 pub mod fuse;
