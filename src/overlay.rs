@@ -96,8 +96,31 @@ impl Overlay {
     }
 
     /// Write a regular file. Always goes to Delta; clears any whiteout for the path.
+    /// Refuse a write under a read-only prefix of the base's policies.
+    ///
+    /// The rules live in `base.vm_policies`. The delta's triggers cannot read them (a trigger is compiled
+    /// for its own schema), so the overlay checks them itself, on every write, from the live table. A
+    /// rule cannot go stale, and the same refusal the database gives is returned, so callers map it the
+    /// same way (see policy::is_refusal).
+    fn check_base_policy(&self, p: &str) -> Result<()> {
+        let has_table: i64 = self.conn.query_row(
+            "SELECT count(*) FROM base.sqlite_master WHERE type='table' AND name='vm_policies'", [], |r| r.get(0))?;
+        if has_table == 0 { return Ok(()); }
+        let mut st = self.conn.prepare(
+            "SELECT pattern FROM base.vm_policies WHERE rule_type='readonly_prefix'")?;
+        let prefixes = st.query_map([], |r| r.get::<_, String>(0))?;
+        for pref in prefixes {
+            let pref = pref?;
+            if crate::policy::covers(&pref, p) {
+                return Err(anyhow!(crate::policy::REFUSAL_MESSAGE));
+            }
+        }
+        Ok(())
+    }
+
     pub fn write(&self, vm_path: &str, data: &[u8], mode: i64, mtime: i64) -> Result<()> {
         let p = normalize_vm_path(vm_path);
+        self.check_base_policy(&p)?;
         self.write_tx(|| {
             self.clear_whiteouts_for(&p)?;
             crate::vm::vm_add_bytes(&self.conn, &p, data, mode, mtime)?;
@@ -108,6 +131,7 @@ impl Overlay {
     /// Create a directory in Delta (clears whiteouts on it and its ancestors).
     pub fn mkdir(&self, vm_path: &str) -> Result<()> {
         let p = normalize_vm_path(vm_path);
+        self.check_base_policy(&p)?;
         self.write_tx(|| {
             self.clear_whiteouts_for(&p)?;
             crate::vm::vm_add_dir(&self.conn, &p, 0o755, crate::vm::now_secs())?;
@@ -118,6 +142,7 @@ impl Overlay {
     /// Create a symlink in Delta. The target is stored verbatim, as in the VM.
     pub fn symlink(&self, vm_path: &str, target: &str) -> Result<()> {
         let p = normalize_vm_path(vm_path);
+        self.check_base_policy(&p)?;
         self.write_tx(|| {
             self.clear_whiteouts_for(&p)?;
             crate::vm::vm_add_symlink(&self.conn, &p, target)?;
@@ -223,6 +248,7 @@ impl Overlay {
     /// Delete a path as seen through the overlay. Base is untouched: a whiteout hides it.
     pub fn remove(&self, vm_path: &str) -> Result<()> {
         let p = normalize_vm_path(vm_path);
+        self.check_base_policy(&p)?;
         self.write_tx(|| {
             // drop the Delta subtree (rows and their chunk references go with them)
             let prefix = format!("{}/%", if p == "/" { "" } else { &p });
