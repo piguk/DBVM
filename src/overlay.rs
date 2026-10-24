@@ -282,6 +282,17 @@ impl Overlay {
                 }
             }
         }
+        // p itself may be whited out (its directory was removed). Clearing that whiteout would revive
+        // the Base subtree below p, so lock every Base path under p first. p itself is excluded:
+        // the caller is making p visible, and p's own row (if Base has one) is what it replaces.
+        if self.whited_out_exact(p)? {
+            let prefix = format!("{}/%", p);
+            let mut st = self.conn.prepare("SELECT path FROM base.vm_fs WHERE path LIKE ?1")?;
+            let below: Vec<String> = st.query_map(params![prefix], |r| r.get(0))?.map(|x| x.unwrap()).collect();
+            for bp in below {
+                self.conn.execute("INSERT OR IGNORE INTO main.vm_whiteouts(path) VALUES (?1)", params![bp])?;
+            }
+        }
         // now clear whiteouts on p and its ancestors so p is visible
         self.conn.execute("DELETE FROM main.vm_whiteouts WHERE path=?1", params![p])?;
         for a in &ancestors {

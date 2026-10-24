@@ -139,3 +139,103 @@ fn many_readers_many_rewrites_no_bad_read() {
     assert_eq!(bad, 0, "{} of {} concurrent reads were not whole versions", bad, total);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Concurrency smoke test: `list` of a directory being removed and recreated returns only legal
+/// results (full Base set, "not a directory", or empty) and never errors otherwise. This does NOT
+/// prove the remove/recreate semantics: the bug it was written around (Base children revived by
+/// mkdir) is only visible in the short window after mkdir, which the readers rarely hit. The
+/// deterministic tests `overlay_list_after_remove_hides_base_children` and
+/// `overlay_recreate_then_write_shows_only_new_children` carry that guarantee.
+#[test]
+fn overlay_list_is_consistent_during_remove_and_recreate() {
+    let d = std::env::temp_dir().join(format!("rc-list-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let base = d.join("base.db");
+    let b = vm::init_vm_db_with_opts(base.to_str().unwrap(), true, true).unwrap();
+    vm::vm_add_dir(&b, "/d", 0o755, 1).unwrap();
+    vm::vm_add_bytes(&b, "/d/x", b"x", 0o644, 1).unwrap();
+    vm::vm_add_bytes(&b, "/d/y", b"y", 0o644, 1).unwrap();
+    drop(b);
+    let delta = d.join("delta.db");
+    drop(vm::Overlay::open(&delta, &base).unwrap());
+
+    let full = vec!["x".to_string(), "y".to_string()];
+    let (b2, d2) = (base.clone(), delta.clone());
+    let (reads, bad) = run_reader_against_writer(
+        move |stop| {
+            let ov = vm::Overlay::open(&d2, &b2).unwrap();
+            let (mut n, mut bad) = (0usize, Vec::new());
+            while !stop.load(Ordering::SeqCst) {
+                n += 1;
+                match ov.list("/d") {
+                    Ok(names) if names == full => {}
+                    Ok(names) if names.is_empty() => {}
+                    Ok(names) => bad.push(format!("partial/stale list: {:?}", names)),
+                    Err(e) if e.to_string().contains("not a directory") => {}
+                    Err(e) => bad.push(format!("err: {}", e)),
+                }
+            }
+            (n, bad)
+        },
+        || {
+            let ov = vm::Overlay::open(&delta, &base).unwrap();
+            for _ in 0..60 {
+                ov.remove("/d").unwrap();
+                ov.mkdir("/d").unwrap();
+            }
+        },
+    );
+    eprintln!("overlay list reads: {} total, {} bad", reads, bad.len());
+    assert!(reads > 0);
+    assert!(bad.is_empty(), "list returned an inconsistent result {} times, e.g. {:?}", bad.len(), bad.iter().take(3).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Deterministic: after removing a directory that has Base children, the directory is gone and
+/// `list` must not report those children. Also covers the recreate-empty case.
+#[test]
+fn overlay_list_after_remove_hides_base_children() {
+    let d = std::env::temp_dir().join(format!("rc-list-det-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let base = d.join("base.db");
+    let b = vm::init_vm_db_with_opts(base.to_str().unwrap(), true, true).unwrap();
+    vm::vm_add_dir(&b, "/d", 0o755, 1).unwrap();
+    vm::vm_add_bytes(&b, "/d/x", b"x", 0o644, 1).unwrap();
+    vm::vm_add_bytes(&b, "/d/y", b"y", 0o644, 1).unwrap();
+    drop(b);
+    let delta = d.join("delta.db");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    assert_eq!(ov.list("/d").unwrap(), vec!["x".to_string(), "y".to_string()], "base listing");
+    ov.remove("/d").unwrap();
+    assert!(ov.list("/d").is_err(), "removed directory is not a directory: {:?}", ov.list("/d"));
+    assert!(!ov.exists("/d/x").unwrap(), "Base child must be hidden once its directory is removed");
+    ov.mkdir("/d").unwrap();
+    assert_eq!(ov.list("/d").unwrap(), Vec::<String>::new(), "recreated directory is empty");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// After a remove, recreating the directory and writing one of its former Base names must show
+/// exactly that name (the new row), and nothing else from Base.
+#[test]
+fn overlay_recreate_then_write_shows_only_new_children() {
+    let d = std::env::temp_dir().join(format!("rc-recreate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let base = d.join("base.db");
+    let b = vm::init_vm_db_with_opts(base.to_str().unwrap(), true, true).unwrap();
+    vm::vm_add_dir(&b, "/d", 0o755, 1).unwrap();
+    vm::vm_add_bytes(&b, "/d/x", b"base-x", 0o644, 1).unwrap();
+    vm::vm_add_bytes(&b, "/d/y", b"base-y", 0o644, 1).unwrap();
+    drop(b);
+    let delta = d.join("delta.db");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    ov.remove("/d").unwrap();
+    ov.mkdir("/d").unwrap();
+    ov.write("/d/x", b"new-x", 0o644, 2).unwrap();
+    assert_eq!(ov.list("/d").unwrap(), vec!["x".to_string()], "only the new x is visible");
+    assert_eq!(ov.read("/d/x").unwrap(), b"new-x", "the new row wins over the hidden Base x");
+    assert!(!ov.exists("/d/y").unwrap(), "Base y stays hidden");
+    let _ = std::fs::remove_dir_all(&d);
+}
