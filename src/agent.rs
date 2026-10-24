@@ -160,8 +160,74 @@ fn run_in(root: &Path, argv: &[String], timeout_secs: u64, max_output: usize) ->
 /// Compact JSON for the change list, written with stable key order.
 fn diff_to_json(d: &vm::SnapDiff) -> String {
     let arr = |v: &Vec<String>| -> String {
-        let items: Vec<String> = v.iter().map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))).collect();
+        let items: Vec<String> = v.iter().map(|s| json_string(s)).collect();
         format!("[{}]", items.join(","))
     };
     format!("{{\"created\":{},\"modified\":{},\"deleted\":{}}}", arr(&d.created), arr(&d.modified), arr(&d.deleted))
+}
+
+/// A JSON string literal. Escapes the quote, backslash, and every control character (U+0000..U+001F),
+/// so any path, including one with a newline or tab, produces valid JSON.
+pub fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One recorded step, as stored in agent_steps.
+#[derive(Debug, Clone)]
+pub struct StepRecord {
+    pub step_id: i64,
+    pub cmd: String,
+    pub exit_code: i64,
+    pub timed_out: bool,
+    pub rolled_back: bool,
+    pub duration_ms: i64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub fs_diff_json: String,
+    pub created_at: i64,
+}
+
+/// Recorded steps, oldest first. `limit` keeps the most recent N when given.
+pub fn list_steps(db: &Path, limit: Option<usize>) -> Result<Vec<StepRecord>> {
+    let conn = vm::vm_open(db.to_str().ok_or_else(|| anyhow!("non-utf8 db path"))?)?;
+    let sql = "SELECT step_id, cmd, exit_code, timed_out, rolled_back, duration_ms, stdout_truncated, stderr_truncated, fs_diff_json, created_at
+         FROM agent_steps ORDER BY step_id";
+    let mut rows: Vec<StepRecord> = Vec::new();
+    let map = |r: &rusqlite::Row| -> rusqlite::Result<StepRecord> {
+        Ok(StepRecord {
+            step_id: r.get(0)?, cmd: r.get(1)?, exit_code: r.get::<_, Option<i64>>(2)?.unwrap_or(-1),
+            timed_out: r.get::<_, i64>(3)? != 0, rolled_back: r.get::<_, i64>(4)? != 0,
+            duration_ms: r.get(5)?, stdout_truncated: r.get::<_, i64>(6)? != 0,
+            stderr_truncated: r.get::<_, i64>(7)? != 0, fs_diff_json: r.get(8)?, created_at: r.get(9)?,
+        })
+    };
+    let mut st = conn.prepare(sql)?;
+    for r in st.query_map([], map)? { rows.push(r?); }
+    if let Some(n) = limit {
+        let skip = rows.len().saturating_sub(n);
+        rows.drain(..skip);
+    }
+    Ok(rows)
+}
+
+/// One step as a JSON object. Every string goes through `json_string`.
+pub fn step_to_json(s: &StepRecord) -> String {
+    format!(
+        "{{\"step_id\":{},\"cmd\":{},\"exit_code\":{},\"timed_out\":{},\"rolled_back\":{},\"duration_ms\":{},\"stdout_truncated\":{},\"stderr_truncated\":{},\"created_at\":{},\"changes\":{}}}",
+        s.step_id, json_string(&s.cmd), s.exit_code, s.timed_out, s.rolled_back, s.duration_ms,
+        s.stdout_truncated, s.stderr_truncated, s.created_at, s.fs_diff_json)
 }

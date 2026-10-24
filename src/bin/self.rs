@@ -65,6 +65,8 @@ enum Cmd {
     /// delete a content snapshot; blobs no other holder uses are released
     VmSnapDelete{ db: String, name: String },
     /// Run one command in a sandbox against the VM; record output, changes, and optionally roll back.
+    /// List recorded agent steps (oldest first); --json prints one JSON array.
+    AgentLog{ db: String, #[arg(long, help="print a JSON array instead of a table")] json: bool, #[arg(long, help="only the most recent N steps")] last: Option<usize> },
     VmStep{ db: String, #[arg(long, default_value_t=60, help="kill the step after N seconds")] timeout: u64, #[arg(long, help="restore the pre-step snapshot if the step fails or times out")] rollback_on_fail: bool, #[arg(long, default_value_t=selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES, help="keep at most N bytes of each of stdout/stderr")] max_output: usize, #[arg(trailing_var_arg=true, allow_hyphen_values=true, required=true)] argv: Vec<String> },
     /// keep the newest N content snapshots, delete the rest (reports each removed name)
     VmRetain{ db: String, keep: usize },
@@ -481,6 +483,20 @@ fn main() -> anyhow::Result<()> {
             selfdb::vm::snapshot_restore(&c, &name)?;
             println!("rolled back to {}", name);
         },
+        Cmd::AgentLog{db, json, last} => {
+            let rows = selfdb::agent::list_steps(std::path::Path::new(&db), last)?;
+            if json {
+                let items: Vec<String> = rows.iter().map(selfdb::agent::step_to_json).collect();
+                println!("[{}]", items.join(","));
+            } else {
+                println!("{:>5}  {:>4}  {:<3}  {:<3}  {:>7}  cmd", "step", "exit", "to", "rb", "ms");
+                for r in &rows {
+                    println!("{:>5}  {:>4}  {:<3}  {:<3}  {:>7}  {}", r.step_id, r.exit_code,
+                        if r.timed_out { "yes" } else { "no" }, if r.rolled_back { "yes" } else { "no" },
+                        r.duration_ms, r.cmd);
+                }
+            }
+        }
         Cmd::VmStep{db, timeout, rollback_on_fail, max_output, argv} => {
             let opts = selfdb::agent::StepOptions{ rollback_on_fail, timeout_secs: timeout, max_output_bytes: max_output };
             let r = selfdb::agent::run_step(std::path::Path::new(&db), &argv, &opts)?;

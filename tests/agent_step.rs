@@ -138,3 +138,42 @@ fn step_runs_in_its_own_network_namespace() {
     assert_eq!(ifaces, vec!["lo"], "step must see only loopback: {:?}", ifaces);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn agent_log_json_is_valid_and_keeps_exact_paths() {
+    if !step_available() { eprintln!("skip: bwrap not available"); return; }
+    let (d, db) = make("alog");
+    // a file whose name has a newline and a quote: the change list must carry it exactly
+    // the shell builds the real newline itself: printf expands \n in the name
+    let odd = "/odd\nname\"q.txt";
+    let script = "printf y > \"$(printf '/odd\\nname\"q.txt')\"; exit 3".to_string();
+    let r1 = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), script.clone()],
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+    assert_eq!(r1.exit_code, 3);
+    let rows = agent::list_steps(&db, None).unwrap();
+    assert_eq!(rows.len(), 1);
+    let items: Vec<String> = rows.iter().map(agent::step_to_json).collect();
+    let text = format!("[{}]", items.join(","));
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("agent-log --json must be valid JSON");
+    let created = &parsed[0]["changes"]["created"];
+    assert!(odd.contains('\n') && odd.contains('"'), "the test path must really contain a newline and a quote");
+    assert!(created.as_array().unwrap().iter().any(|v| v == odd), "exact path must round-trip: {}", created);
+    assert_eq!(parsed[0]["exit_code"], 3);
+    assert_eq!(parsed[0]["rolled_back"], false);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn list_steps_limit_keeps_the_most_recent() {
+    if !step_available() { eprintln!("skip: bwrap not available"); return; }
+    let (d, db) = make("alimit");
+    for i in 0..3 {
+        agent::run_step(&db, &["/bin/sh".into(), "-c".into(), format!("exit {}", i)],
+            &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+    }
+    let all = agent::list_steps(&db, None).unwrap();
+    assert_eq!(all.iter().map(|r| r.exit_code).collect::<Vec<_>>(), vec![0, 1, 2], "oldest first");
+    let last2 = agent::list_steps(&db, Some(2)).unwrap();
+    assert_eq!(last2.iter().map(|r| r.exit_code).collect::<Vec<_>>(), vec![1, 2], "limit keeps the most recent");
+    let _ = std::fs::remove_dir_all(&d);
+}
