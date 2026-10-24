@@ -291,6 +291,191 @@ pub fn provision_agent(db: &Path, node: &Path, pi_dir: &Path) -> Result<Provisio
     Ok(ProvisionReport { objects: objects + shell_objects, files, node: node_real.to_string_lossy().to_string() })
 }
 
+/// Options for one agent task.
+#[derive(Debug, Clone)]
+pub struct AgentOptions {
+    /// Restore the pre-task snapshot when the agent exits non-zero or times out.
+    pub rollback_on_fail: bool,
+    pub timeout_secs: u64,
+    pub max_output_bytes: usize,
+    /// Model base URL the host proxy forwards to, e.g. `https://host/v1`.
+    pub model_base: String,
+    /// Name of the environment variable holding the model credential. It is read on the host side and
+    /// never placed in the sandbox environment.
+    pub key_env: String,
+    /// Model id the agent asks for.
+    pub model: String,
+    /// Port the in-sandbox forwarder listens on (loopback).
+    pub forward_port: u16,
+    /// The task text handed to the agent.
+    pub task: String,
+}
+
 /// What `provision_agent` put in the database.
 #[derive(Debug)]
 pub struct ProvisionReport { pub objects: usize, pub files: usize, pub node: String }
+
+/// Run one task with the pi agent inside the VM, recorded like a step.
+///
+/// The chain, all of it measured by `tests/agent_proxy_e2e.rs`:
+/// - snapshot the tree, materialise it, and start a host proxy on a unix socket;
+/// - run the sandbox with no network, with that socket bound in, and a loopback forwarder started
+///   before the agent;
+/// - point the agent at the forwarder through a generated `models.json`, so the agent sees a local
+///   endpoint and never a credential;
+/// - mirror the tree back, diff it, and record the run in `agent_steps`.
+pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
+    if opts.task.trim().is_empty() { return Err(anyhow!("empty task")); }
+    if !bwrap_available() { return Err(anyhow!("bwrap is required for vm-agent; refusing to run unisolated")); }
+    let api_key = std::env::var(&opts.key_env)
+        .map_err(|_| anyhow!("{} is not set; the proxy needs the model credential", opts.key_env))?;
+    if api_key.is_empty() { return Err(anyhow!("{} is empty", opts.key_env)); }
+    let _lock = StepLock::acquire(db)?;
+    let conn = vm::vm_open(db.to_str().ok_or_else(|| anyhow!("non-utf8 db path"))?)?;
+
+    // The agent must be in the VM, or the task cannot run at all.
+    let has_agent: i64 = conn.query_row(
+        "SELECT count(*) FROM vm_fs WHERE path='/opt/pi/dist/bundle/cli.js'", [], |r| r.get(0))?;
+    if has_agent == 0 {
+        return Err(anyhow!("this VM has no agent; run `vm-provision-agent {}` first", db.display()));
+    }
+
+    let (_, before) = vm::snapshot_create_named(&conn, "agent-before", "vm-agent")?;
+    let scratch = vm::make_tmp_dir("vm-agent-")?;
+    let started = Instant::now();
+    if let Err(e) = vm::vm_materialize_tree(&conn, &scratch) {
+        let _ = std::fs::remove_dir_all(&scratch);
+        return Err(anyhow!("materialize failed: {}", e));
+    }
+
+    // The agent's settings live in the VM tree, so they are part of the diff and can be rolled back.
+    let agent_dir = scratch.join("opt/piagent");
+    std::fs::create_dir_all(&agent_dir)?;
+    std::fs::write(agent_dir.join("models.json"), model_config(&opts.model, opts.forward_port))?;
+    std::fs::write(agent_dir.join("settings.json"), agent_settings(&opts.model))?;
+    // .cjs: inside a directory with "type": "module" a .js file would load as ESM and lose `require`
+    let forwarder = scratch.join("opt/fwd.cjs");
+    std::fs::write(&forwarder, crate::proxy::FORWARDER_JS)?;
+
+    // host side of the tunnel
+    let sock = scratch.parent().map(|p| p.join("proxy.sock")).unwrap_or_else(|| std::path::PathBuf::from("/tmp/vm-agent-proxy.sock"));
+    let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
+    let proxy = crate::proxy::Proxy::bind(&sock, upstream, &prefix)?;
+
+    let outcome = run_agent_in(&scratch, &sock, opts);
+    drop(proxy);
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => { let _ = std::fs::remove_dir_all(&scratch); return Err(e); }
+    };
+    let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
+
+    // The agent rewrote settings the run itself created; do not report those as task changes.
+    for rel in ["opt/piagent/models.json", "opt/piagent/settings.json", "opt/fwd.cjs", "opt/run-agent.sh", "tmp/proxy.sock", "tmp/fwd.log"] {
+        let _ = std::fs::remove_file(scratch.join(rel));
+    }
+    let sync = vm::vm_sync_report(&conn, &scratch)?;
+    if let Some(why) = sync.failure_summary() {
+        let _ = std::fs::remove_dir_all(&scratch);
+        return Err(anyhow!("agent ran but {}; the sandbox content was not applied", why));
+    }
+    let changes = vm::snapshot_diff_live(&conn, &before)?;
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    let failed = exit_code != 0 || timed_out;
+    let rolled_back = failed && opts.rollback_on_fail;
+    let after_name = if rolled_back {
+        vm::snapshot_restore(&conn, &before)?;
+        None
+    } else {
+        let (_, a) = vm::snapshot_create_named(&conn, "agent-after", "vm-agent")?;
+        Some(a)
+    };
+    let duration_ms = started.elapsed().as_millis();
+    let diff_json = diff_to_json(&changes);
+    conn.execute(
+        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![format!("vm-agent: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
+                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
+    let step_id = conn.last_insert_rowid();
+    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+}
+
+/// pi's provider config: a local endpoint that the forwarder serves, with a placeholder key. The real
+/// credential is added by the host proxy, so this file carries nothing secret and can live in the VM.
+fn model_config(model: &str, port: u16) -> String {
+    format!(r#"{{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {{
+    "vmproxy": {{
+      "baseUrl": "http://127.0.0.1:{port}",
+      "api": "openai-completions",
+      "apiKey": "the-host-proxy-adds-the-real-key",
+      "models": [ {{ "id": "{model}" }} ]
+    }}
+  }}
+}}
+"#)
+}
+
+/// pi's defaults for a one-shot run: no startup noise, the proxied provider selected.
+fn agent_settings(model: &str) -> String {
+    format!(r#"{{"defaultProvider":"vmproxy","defaultModel":"{model}","quietStartup":true,"hideThinkingBlock":true}}
+"#)
+}
+
+/// The shell script the sandbox runs: start the forwarder, wait for its port, then run the agent.
+///
+/// Kept as its own small file inside the VM (`/opt/run-agent.sh`) rather than a long `-c` string, so
+/// quoting cannot be mangled by a nested format!. The task itself travels in the environment.
+const RUN_AGENT_SH: &str = r#"#!/bin/sh
+# start the loopback forwarder, wait until it accepts, then run the agent once
+PROXY_SOCK=/tmp/proxy.sock PROXY_PORT=$VM_AGENT_PORT /usr/bin/node /opt/fwd.cjs >/tmp/fwd.log 2>&1 &
+i=0
+while [ $i -lt 400 ]; do
+  /usr/bin/node -e 'require("net").connect(Number(process.env.VM_AGENT_PORT),"127.0.0.1").on("connect",()=>process.exit(0)).on("error",()=>process.exit(1))' && break
+  i=$((i+1))
+  sleep 0.05
+done
+HOME=/opt/home PI_CODING_AGENT_DIR=/opt/piagent /usr/bin/node /opt/pi/dist/bundle/cli.js --print "$VM_AGENT_TASK"
+"#;
+
+/// Run the agent in the sandbox: bind the proxy socket in, then run the script above.
+fn run_agent_in(root: &Path, proxy_sock: &Path, opts: &AgentOptions) -> Result<Outcome> {
+    // the script lives in the tree that is bound as the sandbox root
+    std::fs::write(root.join("opt/run-agent.sh"), RUN_AGENT_SH)?;
+    let mut cmd = Command::new("bwrap");
+    cmd.arg("--bind").arg(root).arg("/")
+        .arg("--dev").arg("/dev")
+        .arg("--proc").arg("/proc")
+        .arg("--unshare-pid")
+        .arg("--unshare-net")
+        .arg("--die-with-parent")
+        .arg("--bind").arg(proxy_sock).arg("/tmp/proxy.sock")
+        .arg("--chdir").arg("/")
+        .arg("/bin/sh").arg("/opt/run-agent.sh");
+    // a clean environment: nothing from the host leaks in, and the credential is not here at all
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/bin:/bin");
+    cmd.env("VM_AGENT_TASK", &opts.task);
+    cmd.env("VM_AGENT_PORT", opts.forward_port.to_string());
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| anyhow!("spawn bwrap: {}", e))?;
+    let mut out_pipe = child.stdout.take().unwrap();
+    let mut err_pipe = child.stderr.take().unwrap();
+    let max = opts.max_output_bytes;
+    let out_t = std::thread::spawn(move || drain_capped(&mut out_pipe, max));
+    let err_t = std::thread::spawn(move || drain_capped(&mut err_pipe, max));
+    let deadline = Instant::now() + Duration::from_secs(opts.timeout_secs);
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(st) = child.try_wait()? { break st; }
+        if Instant::now() >= deadline { timed_out = true; let _ = child.kill(); break child.wait()?; }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (stdout, stdout_truncated) = out_t.join().unwrap_or_default();
+    let (stderr, stderr_truncated) = err_t.join().unwrap_or_default();
+    let exit_code = if timed_out { 124 } else { status.code().unwrap_or(128) };
+    Ok(Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated })
+}

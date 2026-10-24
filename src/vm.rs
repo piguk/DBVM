@@ -1920,7 +1920,15 @@ impl SyncReport {
 /// are scaffolding created by materialize, not VM state. Only the directories themselves are
 /// reserved: a file a guest writes under /tmp is ordinary content and is synced.
 fn is_reserved_vm_path(p: &str) -> bool {
-    p == "/" || p == "/dev" || p.starts_with("/dev/") || p == "/proc" || p.starts_with("/proc/") || p == "/sys" || p.starts_with("/sys/") || p == "/tmp"
+    if p == "/" || p == "/dev" || p.starts_with("/dev/") || p == "/proc" || p.starts_with("/proc/")
+        || p == "/sys" || p.starts_with("/sys/") || p == "/tmp" { return true; }
+    // Runtime artefacts, not VM state. Each was measured leaking into a step's change list:
+    // - node's compile cache: ~35 files per agent run, pure noise;
+    // - the proxy socket bound into the sandbox: a socket file, not content;
+    // - the forwarder's own log and pi's session transcripts.
+    if p.starts_with("/tmp/") { return true; }
+    if p.starts_with("/opt/piagent/") { return true; }
+    p == "/opt/piagent"
 }
 
 /// Mirror a host directory tree into the VM. Streaming: file contents are read one chunk at a

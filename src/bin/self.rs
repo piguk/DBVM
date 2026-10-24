@@ -64,6 +64,18 @@ enum Cmd {
     VmSnapDiff{ db: String, name: String },
     /// delete a content snapshot; blobs no other holder uses are released
     VmSnapDelete{ db: String, name: String },
+    /// Run one task with the pi agent inside the VM: no network, model via the host proxy.
+    VmAgent{ db: String, #[arg(long, default_value_t=600, help="kill the agent after N seconds")] timeout: u64,
+             #[arg(long)] rollback_on_fail: bool,
+             #[arg(long, default_value="https://cpa.lolli.tech/v1")] model_base: String,
+             #[arg(long, default_value="PIMM_API_KEY")] key_env: String,
+             #[arg(long, default_value="gpt-6.1-sol")] model: String,
+             #[arg(long, default_value_t=18081)] port: u16,
+             #[arg(long, default_value_t=selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES)] max_output: usize,
+             task: String },
+    /// Host-side model proxy: a unix socket the sandboxed agent reaches without network access.
+    VmProxy{ #[arg(long)] base: String, #[arg(long)] key_env: String, socket: String,
+             #[arg(long, default_value_t=18081)] port: u16, #[arg(long)] forwarder: Option<String> },
     /// Put node and the pi coding agent into a VM, so `pi` can run inside it.
     VmProvisionAgent{ db: String, #[arg(long)] node: Option<String>, #[arg(long)] pi: Option<String> },
     /// Merge a package VM database (a tool and its libraries) into a target, in one transaction.
@@ -489,6 +501,42 @@ fn main() -> anyhow::Result<()> {
             selfdb::vm::snapshot_restore(&c, &name)?;
             println!("rolled back to {}", name);
         },
+        Cmd::VmAgent{db, timeout, rollback_on_fail, model_base, key_env, model, port, max_output, task} => {
+            let opts = selfdb::agent::AgentOptions {
+                rollback_on_fail, timeout_secs: timeout, max_output_bytes: max_output,
+                model_base, key_env, model, forward_port: port, task,
+            };
+            let r = selfdb::agent::run_agent(std::path::Path::new(&db), &opts)?;
+            use std::io::Write;
+            std::io::stdout().write_all(&r.stdout)?;
+            std::io::stderr().write_all(&r.stderr)?;
+            if r.stdout_truncated || r.stderr_truncated { eprintln!("output truncated at {} bytes", max_output); }
+            eprintln!("agent step {}: exit={} timed_out={} rolled_back={} created={} modified={} deleted={} ({} ms)",
+                r.step_id, r.exit_code, r.timed_out, r.rolled_back,
+                r.changes.created.len(), r.changes.modified.len(), r.changes.deleted.len(), r.duration_ms);
+            std::process::exit(r.exit_code);
+        }
+        Cmd::VmProxy{base, key_env, socket, port, forwarder} => {
+            let key = std::env::var(&key_env).unwrap_or_default();
+            if key.is_empty() { eprintln!("{} is not set (or empty)", key_env); std::process::exit(2); }
+            let (up, prefix) = selfdb::proxy::Upstream::from_base_url(&base, &key)?;
+            if let Some(f) = forwarder {
+                std::fs::write(&f, selfdb::proxy::FORWARDER_JS)?;
+                eprintln!("forwarder written to {}", f);
+            }
+            eprintln!("proxy: socket={} -> {} (key from {})", socket, base, key_env);
+            eprintln!("guest: bind {} into the sandbox, run the forwarder on 127.0.0.1:{}, point the agent at http://127.0.0.1:{}",
+                socket, port, port);
+            // Wait for a signal instead of stdin: with stdin redirected, a read returns at once and the
+            // proxy would stop immediately, removing the socket before any guest could use it.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t); }
+            }
+            STOP_FLAG.with(|f| *f.borrow_mut() = Some(stop.clone()));
+            selfdb::proxy::serve_until_stopped(std::path::Path::new(&socket), up, &prefix, stop)?;
+            eprintln!("proxy stopped");
+        }
         Cmd::VmProvisionAgent{db, node, pi} => {
             let node = node.map(std::path::PathBuf::from).unwrap_or_else(|| {
                 let out = std::process::Command::new("sh").args(["-c", "readlink -f \"$(command -v node)\" && true"]).output().ok();
@@ -826,4 +874,14 @@ fn default_pi_dir() -> std::path::PathBuf {
     ];
     for c in candidates { let p = std::path::PathBuf::from(c); if p.exists() { return p; } }
     std::path::PathBuf::from(candidates[0])
+}
+
+thread_local! {
+    static STOP_FLAG: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Signal handler: flip the stop flag so the proxy loop exits and removes its socket.
+extern "C" fn on_signal(_sig: libc::c_int) {
+    STOP_FLAG.with(|f| { if let Some(flag) = f.borrow().as_ref() { flag.store(true, std::sync::atomic::Ordering::SeqCst); } });
 }
