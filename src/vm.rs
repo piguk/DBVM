@@ -314,6 +314,8 @@ CREATE TABLE IF NOT EXISTS agent_steps(
     duration_ms INTEGER NOT NULL,
     stdout BLOB,
     stderr BLOB,
+    stdout_truncated INTEGER NOT NULL DEFAULT 0,
+    stderr_truncated INTEGER NOT NULL DEFAULT 0,
     snap_before TEXT NOT NULL,
     snap_after TEXT,
     fs_diff_json TEXT NOT NULL,

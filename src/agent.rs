@@ -21,7 +21,12 @@ pub struct StepOptions {
     /// Restore the pre-step snapshot when the step exits non-zero or times out.
     pub rollback_on_fail: bool,
     pub timeout_secs: u64,
+    /// Keep at most this many bytes of each of stdout and stderr; the rest is read and dropped.
+    pub max_output_bytes: usize,
 }
+
+/// Default output cap per stream (1 MiB).
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1 << 20;
 
 #[derive(Debug)]
 pub struct StepResult {
@@ -31,6 +36,8 @@ pub struct StepResult {
     pub rolled_back: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
     pub changes: vm::SnapDiff,
     pub duration_ms: u128,
 }
@@ -57,9 +64,9 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
     let mat = vm::vm_materialize_tree(&conn, &scratch);
     let outcome = match mat {
         Err(e) => { let _ = std::fs::remove_dir_all(&scratch); return Err(anyhow!("materialize failed: {}", e)); }
-        Ok(_) => run_in(&scratch, argv, opts.timeout_secs)?,
+        Ok(_) => run_in(&scratch, argv, opts.timeout_secs, opts.max_output_bytes)?,
     };
-    let (exit_code, timed_out, stdout, stderr) = outcome;
+    let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
 
     // sync the scratch tree back, then diff against the snapshot taken before the step
     vm::vm_sync_from_host(&conn, &scratch)?;
@@ -80,16 +87,40 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
 
     let diff_json = diff_to_json(&changes);
     conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![argv.join(" "), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &stdout, &stderr, before, after_name, diff_json])?;
+                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
     let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, changes, duration_ms })
+    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
 }
 
-/// Run argv under bwrap with `root` as /. Returns (exit code, timed out, stdout, stderr).
-fn run_in(root: &Path, argv: &[String], timeout_secs: u64) -> Result<(i32, bool, Vec<u8>, Vec<u8>)> {
+/// Result of one sandboxed run.
+struct Outcome { exit_code: i32, timed_out: bool, stdout: Vec<u8>, stderr: Vec<u8>, stdout_truncated: bool, stderr_truncated: bool }
+
+/// Read a pipe to EOF, keeping the first `cap` bytes. Bytes past the cap are still read and dropped,
+/// so the child never blocks on a full pipe. Returns (kept bytes, truncated).
+fn drain_capped<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(kept.len());
+                if room > 0 { kept.extend_from_slice(&buf[..n.min(room)]); }
+                if n > room { truncated = true; }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (kept, truncated)
+}
+
+/// Run argv under bwrap with `root` as /.
+fn run_in(root: &Path, argv: &[String], timeout_secs: u64, max_output: usize) -> Result<Outcome> {
     let mut cmd = Command::new("bwrap");
     cmd.arg("--bind").arg(root).arg("/")
         .arg("--dev").arg("/dev")
@@ -104,8 +135,8 @@ fn run_in(root: &Path, argv: &[String], timeout_secs: u64) -> Result<(i32, bool,
     // drain both pipes on their own threads so a chatty command cannot block on a full pipe
     let mut out_pipe = child.stdout.take().unwrap();
     let mut err_pipe = child.stderr.take().unwrap();
-    let out_t = std::thread::spawn(move || { let mut b = Vec::new(); let _ = out_pipe.read_to_end(&mut b); b });
-    let err_t = std::thread::spawn(move || { let mut b = Vec::new(); let _ = err_pipe.read_to_end(&mut b); b });
+    let out_t = std::thread::spawn(move || drain_capped(&mut out_pipe, max_output));
+    let err_t = std::thread::spawn(move || drain_capped(&mut err_pipe, max_output));
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut timed_out = false;
@@ -118,10 +149,10 @@ fn run_in(root: &Path, argv: &[String], timeout_secs: u64) -> Result<(i32, bool,
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let stdout = out_t.join().unwrap_or_default();
-    let stderr = err_t.join().unwrap_or_default();
-    let code = if timed_out { 124 } else { status.code().unwrap_or(128) };
-    Ok((code, timed_out, stdout, stderr))
+    let (stdout, stdout_truncated) = out_t.join().unwrap_or_default();
+    let (stderr, stderr_truncated) = err_t.join().unwrap_or_default();
+    let exit_code = if timed_out { 124 } else { status.code().unwrap_or(128) };
+    Ok(Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated })
 }
 
 /// Compact JSON for the change list, written with stable key order.
