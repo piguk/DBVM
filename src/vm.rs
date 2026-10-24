@@ -1656,6 +1656,16 @@ pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
 }
 
 /// Materialize with an explicit content-cache root (tests and callers that manage their own cache).
+/// Translated path under which the materialize writes a DB link (inverse of `link_alias`).
+fn link_alias_target_of(link_path: &str, alias: &std::collections::HashMap<String, String>) -> Option<String> {
+    alias.iter().find(|(_, v)| v.as_str() == link_path).map(|(k, _)| k.clone())
+}
+
+/// DB link path that a walked host entry stands for, if the entry is a materialize alias.
+fn link_alias_row(vm_p: &str, alias: &std::collections::HashMap<String, String>) -> Option<String> {
+    alias.get(vm_p).cloned()
+}
+
 /// Parent directory of `p` with every ancestor that is itself a VM symlink replaced by its
 /// target (absolute targets only; relative ones are resolved against the link's own parent).
 /// Returns None when no ancestor is a link, so the caller uses the path as written.
@@ -1822,8 +1832,28 @@ fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool) -
         }
     }
 
+    // Translated path -> DB link path, for links the materialize wrote under a resolved parent.
+    let link_alias: HashMap<String, String> = {
+        let link_rows: HashMap<String, String> = db.iter()
+            .filter(|(_, r)| r.kind == "symlink").filter_map(|(p, r)| r.link.clone().map(|t| (p.clone(), t))).collect();
+        let mut m = HashMap::new();
+        for p in link_rows.keys() {
+            if let Some(pv) = resolve_parent_in_vm(p, &link_rows) {
+                let translated = format!("{}/{}", pv.trim_end_matches('/'), Path::new(p).file_name().unwrap().to_string_lossy());
+                m.insert(normalize_vm_path(&translated), p.clone());
+            }
+        }
+        m
+    };
     // 2) Host side: walk, keep only metadata. Entries are processed as we go.
     let mut seen: HashSet<String> = HashSet::new();
+    // A link whose translated path holds a real entry is never written by the materialize (it is
+    // an alias served by that entry), so it is not missing: keep its row.
+    for (vm_link_path, _) in db.iter().filter(|(_, r)| r.kind == "symlink") {
+        if let Some(tp) = link_alias_target_of(vm_link_path, &link_alias) {
+            if matches!(db.get(&tp), Some(r) if r.kind != "symlink") { seen.insert(vm_link_path.clone()); }
+        }
+    }
     let mut rep = SyncReport::default();
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let now = now_secs();
@@ -1832,6 +1862,16 @@ fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool) -
         let rel = e.path().strip_prefix(host_root).unwrap_or(e.path()).to_string_lossy().to_string();
         let vm_p = normalize_vm_path(&format!("/{}", rel.trim_start_matches('/')));
         if is_reserved_vm_path(&vm_p) { continue; }
+        // A link the materialize placed under its translated path (e.g. usr/bin/sh for the VM's
+        // /bin/sh) is the same row, not a new one: keep the DB's own path and do not create it.
+        // Only a walked *symlink* is an alias: a real file or dir at the translated path is its own row.
+        let is_link = std::fs::symlink_metadata(e.path()).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+        if is_link {
+            if let Some(alias) = link_alias_row(&vm_p, &link_alias) {
+                seen.insert(alias);
+                continue;
+            }
+        }
         let md = match std::fs::symlink_metadata(e.path()) { Ok(m) => m, Err(_) => { rep.failed += 1; continue; } };
         // permission bits only: the VM stores modes as 0o7777 (the sync used to store the full
         // st_mode, so every file looked changed on the next sync)

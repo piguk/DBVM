@@ -870,3 +870,27 @@ fn symlinked_directory_children_materialize_under_the_real_directory() {
     assert!(std::fs::symlink_metadata(dest.join("bin")).unwrap().file_type().is_symlink(), "/bin must stay a link");
     assert!(!std::fs::symlink_metadata(dest.join("usr/bin")).unwrap().file_type().is_symlink(), "usr/bin must be a real directory");
 }
+
+#[test]
+fn noop_round_trip_keeps_alias_links_and_real_files() {
+    // /bin -> /usr/bin with /bin/sh and /bin/rm links, plus real files at /usr/bin/rm and
+    // /usr/bin/dash. A materialize followed by a sync must change nothing: the links are not
+    // deleted, /usr/bin/sh is not created as a new row, and the real /usr/bin/rm is not deleted.
+    let (_g, db) = tmpdb("noop-alias");
+    let c = open(&db);
+    vm::vm_add_symlink(&c, "/bin", "/usr/bin").unwrap();
+    vm::vm_add_bytes(&c, "/usr/bin/dash", b"sh", 0o755, 1).unwrap();
+    vm::vm_add_bytes(&c, "/usr/bin/rm", b"rm", 0o755, 1).unwrap();
+    vm::vm_add_symlink(&c, "/bin/sh", "/usr/bin/dash").unwrap();
+    vm::vm_add_symlink(&c, "/bin/rm", "/usr/bin/rm").unwrap();
+    let snap = |c: &rusqlite::Connection| -> Vec<String> {
+        c.prepare("SELECT path||' '||kind||' '||coalesce(link_target,'') FROM vm_fs ORDER BY path").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+    };
+    let before = snap(&c);
+    let dest = _g.path().join("scratch");
+    vm::vm_materialize_tree(&c, &dest).unwrap();
+    let rep = vm::vm_sync_report(&c, &dest).unwrap();
+    assert_eq!((rep.created, rep.updated, rep.deleted), (0, 0, 0), "no-op round trip must change nothing");
+    assert_eq!(snap(&c), before, "DB rows must be identical after the round trip");
+}
