@@ -276,12 +276,19 @@ pub fn provision_agent(db: &Path, node: &Path, pi_dir: &Path) -> Result<Provisio
     let node_s = node.to_str().ok_or_else(|| anyhow!("non-utf8 node path"))?;
     let pi_s = pi_dir.to_str().ok_or_else(|| anyhow!("non-utf8 pi path"))?;
     let objects = vm::vm_import_closure(&conn, node_s, "/")?;
+    // an agent runs shell commands, so a shell and its libraries must be there too
+    let mut shell_objects = 0usize;
+    for prog in ["/bin/sh", "/bin/rm", "/bin/ls", "/bin/cat", "/bin/mv", "/bin/cp", "/bin/mkdir", "/bin/sleep", "/bin/grep"] {
+        if std::path::Path::new(prog).exists() {
+            shell_objects += vm::vm_import_closure(&conn, prog, "/").unwrap_or(0);
+        }
+    }
     let files = vm::vm_pack_host_dir_parallel(&conn, pi_s, "/opt/pi")?;
     // the names a command line inside the VM uses
     let node_real = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
     vm::vm_add_symlink(&conn, "/usr/bin/node", &node_real.to_string_lossy())?;
     vm::vm_add_symlink(&conn, "/usr/bin/pi", "/opt/pi/dist/bundle/cli.js")?;
-    Ok(ProvisionReport { objects, files, node: node_real.to_string_lossy().to_string() })
+    Ok(ProvisionReport { objects: objects + shell_objects, files, node: node_real.to_string_lossy().to_string() })
 }
 
 /// What `provision_agent` put in the database.
