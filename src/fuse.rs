@@ -22,7 +22,6 @@ pub mod fuse_impl {
         path_to_ino: HashMap<String, u64>,
         ino_to_kind: HashMap<u64, String>,
         ino_to_attr: HashMap<u64, FileAttr>,
-        staged: HashMap<u64, Vec<u8>>,
         next_ino: u64,
     }
 
@@ -35,7 +34,6 @@ pub mod fuse_impl {
                 path_to_ino: HashMap::new(),
                 ino_to_kind: HashMap::new(),
                 ino_to_attr: HashMap::new(),
-                staged: HashMap::new(),
                 next_ino: 2,
             };
             fs.rebuild()?;
@@ -145,32 +143,6 @@ pub mod fuse_impl {
             self.path_to_ino.get(&parent_norm).copied()
         }
 
-        fn flush_staged(&mut self, ino: u64) -> Result<()> {
-            if let Some(buf) = self.staged.get(&ino).cloned() {
-                let path = self.ino_to_path.get(&ino).cloned().ok_or_else(|| anyhow::anyhow!("ino not found"))?;
-                let attr = self.ino_to_attr.get(&ino).cloned().unwrap();
-                let mode = attr.perm as i64 | if attr.kind == FileType::Directory { 0o40000 } else { 0o100000 };
-                // use current time
-                let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                let conn = &self.conn;
-                // vm_add_bytes handles dedup and blob insertion
-                vm_add_bytes(&conn, &path, &buf, mode as i64, mtime)?;
-                // update attr size/blocks/mtime
-                if let Some(a) = self.ino_to_attr.get_mut(&ino) {
-                    a.size = buf.len() as u64;
-                    a.blocks = if buf.is_empty() { 0 } else { (buf.len() as u64 + 511)/512 };
-                    let t = UNIX_EPOCH + Duration::from_secs(mtime as u64);
-                    a.mtime = t;
-                    a.ctime = t;
-                }
-                // keep staged as is? we keep it to serve reads without re-fetch; but on next flush it's same
-                // optionally clear after persist but keep for cache
-                // we keep it; writes will continue to modify it
-                // To reflect persisted state, we keep staged until release? Keep it.
-            }
-            Ok(())
-        }
-
         fn ensure_not_exists(&self, parent: u64, name: &OsStr) -> Result<String> {
             let parent_path = self.ino_to_path.get(&parent).ok_or_else(|| anyhow::anyhow!("parent not found"))?.clone();
             let n = name.to_string_lossy().to_string();
@@ -192,11 +164,7 @@ pub mod fuse_impl {
             Ok(())
         }
         fn destroy(&mut self) {
-            // flush all staged
-            let inos: Vec<u64> = self.staged.keys().copied().collect();
-            for ino in inos {
-                let _ = self.flush_staged(ino);
-            }
+            // nothing is buffered: every write already reached the database
         }
         fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
             let parent_path = match self.ino_to_path.get(&parent) {
@@ -248,17 +216,6 @@ pub mod fuse_impl {
         }
         fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
             if offset < 0 { reply.error(libc::EINVAL); return; }
-            // staged overrides
-            if let Some(buf) = self.staged.get(&ino) {
-                let start = offset as usize;
-                if start >= buf.len() {
-                    reply.data(&[]);
-                    return;
-                }
-                let end = std::cmp::min(buf.len(), start + size as usize);
-                reply.data(&buf[start..end]);
-                return;
-            }
             let path = match self.ino_to_path.get(&ino) {
                 Some(p) => p.clone(),
                 None => { reply.error(libc::ENOENT); return; }
@@ -273,46 +230,37 @@ pub mod fuse_impl {
         }
         fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
             if offset < 0 { reply.error(libc::EINVAL); return; }
-            let path_exists = self.ino_to_path.contains_key(&ino);
-            if !path_exists { reply.error(libc::ENOENT); return; }
+            let path = match self.ino_to_path.get(&ino) { Some(p) => p.clone(), None => { reply.error(libc::ENOENT); return; } };
             let kind = self.ino_to_kind.get(&ino).map(|s| s.as_str()).unwrap_or("file").to_string();
             if kind == "dir" { reply.error(libc::EISDIR); return; }
-            // init staged if missing
-            if !self.staged.contains_key(&ino) {
-                // load existing
-                let p = self.ino_to_path.get(&ino).unwrap().clone();
-                // A failed read must NOT be treated as empty: that would overwrite real data.
-                match crate::vm::read_range(&self.conn, &p, 0, usize::MAX) {
-                    Ok(existing) => { self.staged.insert(ino, existing); }
-                    Err(e) => { eprintln!("vm-fuse load {}: {}", p, e); reply.error(libc::EIO); return; }
+            // Only the 64 KiB chunks this write touches are rewritten. A failed write is reported as
+            // EIO, never as success: the file is left unchanged by write_range.
+            let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+            if let Err(e) = crate::vm::write_range(&self.conn, &path, offset as u64, data, mtime) {
+                eprintln!("vm-fuse write {}: {}", path, e);
+                reply.error(libc::EIO);
+                return;
+            }
+            // refresh the cached attributes from the stored row
+            if let Ok((size, mt)) = self.conn.query_row("SELECT size, mtime FROM vm_fs WHERE path=?1", params![path], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
+                if let Some(a) = self.ino_to_attr.get_mut(&ino) {
+                    a.size = size as u64;
+                    a.blocks = if size == 0 { 0 } else { (size as u64 + 511) / 512 };
+                    let t = UNIX_EPOCH + Duration::from_secs(mt as u64);
+                    a.mtime = t;
+                    a.ctime = t;
                 }
-            }
-            let buf = self.staged.get_mut(&ino).unwrap();
-            let off = offset as usize;
-            if buf.len() < off + data.len() {
-                buf.resize(off + data.len(), 0);
-            }
-            buf[off..off+data.len()].copy_from_slice(data);
-            // update attr
-            if let Some(attr) = self.ino_to_attr.get_mut(&ino) {
-                attr.size = buf.len() as u64;
-                attr.blocks = if buf.is_empty() { 0 } else { (buf.len() as u64 + 511)/512 };
-                let now = SystemTime::now();
-                attr.mtime = now;
-                attr.ctime = now;
             }
             reply.written(data.len() as u32);
         }
-        fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock: u64, reply: ReplyEmpty) {
-            let _ = self.flush_staged(ino);
+
+        fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock: u64, reply: ReplyEmpty) {
             reply.ok();
         }
-        fn fsync(&mut self, _req: &Request, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
-            let _ = self.flush_staged(ino);
+        fn fsync(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
             reply.ok();
         }
-        fn release(&mut self, _req: &Request, ino: u64, _fh: u64, _flags: i32, _lock: Option<u64>, _flush: bool, reply: ReplyEmpty) {
-            let _ = self.flush_staged(ino);
+        fn release(&mut self, _req: &Request, _ino: u64, _fh: u64, _flags: i32, _lock: Option<u64>, _flush: bool, reply: ReplyEmpty) {
             reply.ok();
         }
         fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -414,7 +362,6 @@ pub mod fuse_impl {
                 flags: 0,
             };
             self.ino_to_attr.insert(ino, attr);
-            self.staged.insert(ino, Vec::new());
             reply.created(&TTL, &attr, 0, 0, flags as u32);
         }
         fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
@@ -470,7 +417,6 @@ pub mod fuse_impl {
             self.ino_to_path.remove(&ino);
             self.ino_to_kind.remove(&ino);
             self.ino_to_attr.remove(&ino);
-            self.staged.remove(&ino);
             reply.ok();
         }
         fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -553,7 +499,6 @@ pub mod fuse_impl {
                     self.ino_to_path.remove(&old_ino);
                     self.ino_to_kind.remove(&old_ino);
                     self.ino_to_attr.remove(&old_ino);
-                    self.staged.remove(&old_ino);
                 }
             }
             let conn = &self.conn;
@@ -607,33 +552,16 @@ pub mod fuse_impl {
                 }
             }
             if let Some(sz) = size {
-                let cur_len = {
-                    let staged_len = self.staged.get(&ino).map(|b| b.len() as u64);
-                    let attr_len = self.ino_to_attr.get(&ino).map(|a| a.size).unwrap_or(0);
-                    staged_len.unwrap_or(attr_len)
-                };
-                if sz != cur_len {
-                    if !self.staged.contains_key(&ino) {
-                        match crate::vm::read_range(&self.conn, &path, 0, usize::MAX) {
-                            Ok(existing) => { self.staged.insert(ino, existing); }
-                            Err(e) => { eprintln!("vm-fuse load {}: {}", path, e); reply.error(libc::EIO); return; }
-                        }
-                    }
-                    let need_flush;
-                    {
-                        let buf = self.staged.get_mut(&ino).unwrap();
-                        if (sz as usize) < buf.len() { buf.truncate(sz as usize); }
-                        else if (sz as usize) > buf.len() { buf.resize(sz as usize, 0); }
-                        need_flush = true;
-                    }
-                    if let Some(attr) = self.ino_to_attr.get_mut(&ino) {
-                        attr.size = sz;
-                        attr.blocks = if sz ==0 {0} else {(sz+511)/512};
-                    }
-                    if need_flush {
-                        let _ = self.flush_staged(ino);
-                        // re-acquire after flush
-                    }
+                // Truncate through the database: only the chunks past the new end are touched.
+                let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+                if let Err(e) = crate::vm::truncate_range(&self.conn, &path, sz, mtime) {
+                    eprintln!("vm-fuse truncate {}: {}", path, e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+                if let Some(attr) = self.ino_to_attr.get_mut(&ino) {
+                    attr.size = sz;
+                    attr.blocks = if sz == 0 { 0 } else { (sz + 511) / 512 };
                 }
             }
             let attr_copy = *self.ino_to_attr.get(&ino).unwrap();
@@ -670,7 +598,6 @@ pub mod fuse_impl {
                 kind: FileType::RegularFile, perm: perm as u16, nlink: 1, uid: _req.uid(), gid: _req.gid(), rdev: 0, blksize: BLOCK_SIZE, flags: 0,
             };
             self.ino_to_attr.insert(ino, attr);
-            self.staged.insert(ino, Vec::new());
             reply.entry(&TTL, &attr, 0);
         }
         fn getxattr(&mut self, _req: &Request, _ino: u64, _name: &OsStr, _size: u32, reply: fuser::ReplyXattr) {
