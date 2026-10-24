@@ -14,6 +14,8 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///   3 = triggers maintain vm_meta counters (blob_bytes/file_count/logical_bytes)
 ///   4 = blob keys are raw 32-byte SHA-256 BLOBs (UNIQUE); vm_blobs keeps a rowid so large
 ///       content is not stored inside a key B-tree (WITHOUT ROWID measured no smaller)
+///   9 = agent_steps: one row per agent command, with output, exit code, file changes and the
+///       snapshots taken before and after it
 ///   8 = content snapshots: vm_snapshot_fs / vm_snapshot_chunks hold a copy of the file tree's
 ///       metadata and chunk references (never blob bytes). Keys carry no row ids, so a snapshot
 ///       is portable to another database under an ATTACH prefix (Base/Delta design).
@@ -23,7 +25,7 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///   5 = file content is split into CHUNK_SIZE chunks listed in vm_file_chunks; a file's
 ///       refcount on vm_blobs comes from its chunk rows. vm_fs.hash = whole-file sha256
 ///       (informational, no refcounting). Legacy single-blob files keep working via vm_fs.hash.
-pub const VM_USER_VERSION: u32 = 8;
+pub const VM_USER_VERSION: u32 = 9;
 
 /// Cache root: $SELF_VM_CACHE, else $XDG_CACHE_HOME/self-vm, else ~/.cache/self-vm.
 pub fn cache_dir() -> PathBuf {
@@ -111,6 +113,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
                 5 => migrate_5_to_6(conn)?,
                 6 => migrate_6_to_7(conn)?,
                 7 => migrate_7_to_8(conn)?,
+                8 => migrate_8_to_9(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -300,6 +303,30 @@ BEGIN
 END;
 ";
 
+/// Agent step log (schema 9). One row per executed step.
+const VM_AGENT_SQL: &str = "
+CREATE TABLE IF NOT EXISTS agent_steps(
+    step_id INTEGER PRIMARY KEY,
+    cmd TEXT NOT NULL,
+    exit_code INTEGER,
+    timed_out INTEGER NOT NULL DEFAULT 0,
+    rolled_back INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL,
+    stdout BLOB,
+    stderr BLOB,
+    snap_before TEXT NOT NULL,
+    snap_after TEXT,
+    fs_diff_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+";
+
+/// 8 -> 9: agent step log.
+fn migrate_8_to_9(conn: &Connection) -> Result<()> {
+    conn.execute_batch(VM_AGENT_SQL)?;
+    Ok(())
+}
+
 /// 7 -> 8: content snapshot tables. Only metadata and references are copied; no blob bytes.
 fn migrate_7_to_8(conn: &Connection) -> Result<()> {
     conn.execute_batch(VM_SNAPSHOT_SQL)?;
@@ -480,7 +507,8 @@ CREATE TABLE IF NOT EXISTS vm_disk_blocks(
 {counters}
 {counter_triggers}
 {snapshot}
-"#, app=VM_APP_ID, ver=VM_USER_VERSION, triggers=VM_TRIGGERS_SQL, counters=VM_COUNTERS_INIT_SQL, counter_triggers=VM_COUNTER_TRIGGERS_SQL, snapshot=VM_SNAPSHOT_SQL)
+{agent}
+"#, app=VM_APP_ID, ver=VM_USER_VERSION, triggers=VM_TRIGGERS_SQL, counters=VM_COUNTERS_INIT_SQL, counter_triggers=VM_COUNTER_TRIGGERS_SQL, snapshot=VM_SNAPSHOT_SQL, agent=VM_AGENT_SQL)
 }
 
 pub fn init_vm_db_with_opts(path: &str, overwrite: bool, vm_only: bool) -> Result<Connection> {
@@ -1001,7 +1029,9 @@ pub fn vm_add_bytes(conn: &Connection, vm_path: &str, data: &[u8], mode: i64, mt
 pub fn vm_add_symlink(conn: &Connection, vm_path: &str, target: &str) -> Result<()> {
     let vm_p = normalize_vm_path(vm_path);
     ensure_parent_dirs(conn, &vm_p)?;
-    fs_put_node(conn, &vm_p, "symlink", 493, now_secs(), Some(target))
+    // a symlink's own mode is always 0777 on Linux; match what the host reports, so a sync
+    // does not see a mode mismatch on every symlink
+    fs_put_node(conn, &vm_p, "symlink", 0o777, now_secs(), Some(target))
 }
 pub fn vm_add_dir(conn: &Connection, vm_path: &str, mode: i64, mtime: i64) -> Result<()> {
     let vm_p = normalize_vm_path(vm_path);
@@ -1014,7 +1044,7 @@ pub fn vm_add_file(conn: &Connection, host_path: &str, vm_path: &str) -> Result<
     let vm_p = normalize_vm_path(vm_path);
     ensure_parent_dirs(conn, &vm_p)?;
     let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(now_secs());
-    #[cfg(unix)] let mode = { use std::os::unix::fs::PermissionsExt; md.permissions().mode() as i64 };
+    #[cfg(unix)] let mode = { use std::os::unix::fs::PermissionsExt; (md.permissions().mode() & 0o7777) as i64 };
     #[cfg(not(unix))] let mode = 420;
     if md.is_dir() {
         fs_put_node(conn, &vm_p, "dir", mode, mtime, None)?;
@@ -1040,6 +1070,33 @@ pub fn vm_add_file(conn: &Connection, host_path: &str, vm_path: &str) -> Result<
 pub fn fx_hash_u64_static(data: &[u8]) -> String { fx_hash_u64(data) }
 pub fn vm_import_closure(conn: &Connection, host_elf: &str, vm_prefix: &str) -> Result<usize> {
     let host_real = std::fs::canonicalize(host_elf).unwrap_or(PathBuf::from(host_elf));
+    // The path the caller names is how a program is invoked (e.g. /bin/sh), and on merged-usr
+    // hosts it is a directory symlink (/bin -> usr/bin). Record it, so the VM resolves it, and
+    // point it at the canonical file. Canonicalization alone would store only /usr/bin/dash.
+    let literal = PathBuf::from(host_elf);
+    if literal.is_absolute() && literal != host_real {
+        let lit_vm = literal.to_string_lossy().to_string();
+        if let Some(parent) = literal.parent() {
+            if parent != Path::new("/") {
+                let _ = ensure_parent_dirs(conn, &lit_vm);
+            }
+        }
+        // a directory component that is a host symlink (e.g. /bin) must exist as a VM link too
+        let mut acc = PathBuf::from("/");
+        for comp in literal.parent().unwrap_or(Path::new("/")).components().skip(1) {
+            acc.push(comp);
+            if let Ok(md) = std::fs::symlink_metadata(&acc) {
+                if md.file_type().is_symlink() {
+                    if let Ok(t) = std::fs::read_link(&acc) {
+                        let target_abs = if t.is_absolute() { t.clone() } else { acc.parent().unwrap_or(Path::new("/")).join(&t) };
+                        let target_canon = std::fs::canonicalize(&target_abs).unwrap_or(target_abs);
+                        let _ = vm_add_symlink(conn, &acc.to_string_lossy(), &target_canon.to_string_lossy());
+                    }
+                }
+            }
+        }
+        let _ = vm_add_symlink(conn, &lit_vm, &host_real.to_string_lossy());
+    }
     use rustc_hash::FxHashMap;
     use crate::elf::ElfMeta;
     let mut meta_cache: FxHashMap<PathBuf, ElfMeta> = FxHashMap::default();
@@ -1455,7 +1512,7 @@ fn vm_pack_host_dir_parallel_inner(conn: &Connection, host_dir: &str, vm_prefix:
             .par_iter()
             .map(|(host, vm_p)| {
                 let md = std::fs::metadata(host)?;
-                #[cfg(unix)] let mode = { use std::os::unix::fs::PermissionsExt; md.permissions().mode() };
+                #[cfg(unix)] let mode = { use std::os::unix::fs::PermissionsExt; md.permissions().mode() & 0o7777 };
                 #[cfg(not(unix))] let mode = 0o644u32;
                 let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or_else(now_secs);
                 let data = std::fs::read(host)?;
@@ -1599,6 +1656,29 @@ pub fn vm_materialize_tree(conn: &Connection, dest: &Path) -> Result<usize> {
 }
 
 /// Materialize with an explicit content-cache root (tests and callers that manage their own cache).
+/// Parent directory of `p` with every ancestor that is itself a VM symlink replaced by its
+/// target (absolute targets only; relative ones are resolved against the link's own parent).
+/// Returns None when no ancestor is a link, so the caller uses the path as written.
+fn resolve_parent_in_vm(p: &str, links: &std::collections::HashMap<String, String>) -> Option<String> {
+    let parent = Path::new(p).parent()?.to_string_lossy().to_string();
+    let mut cur = String::from("/");
+    let mut changed = false;
+    for comp in parent.split('/').filter(|c| !c.is_empty()) {
+        let next = if cur == "/" { format!("/{}", comp) } else { format!("{}/{}", cur, comp) };
+        match links.get(&next) {
+            Some(t) => {
+                changed = true;
+                cur = if t.starts_with('/') { normalize_vm_path(t) } else {
+                    let dir = Path::new(&cur).parent().map(|x| x.to_string_lossy().to_string()).unwrap_or("/".into());
+                    normalize_vm_path(&format!("{}/{}", dir, t))
+                };
+            }
+            None => cur = next,
+        }
+    }
+    if changed { Some(cur) } else { None }
+}
+
 pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root: &Path) -> Result<usize> {
     use rayon::prelude::*;
     std::fs::create_dir_all(dest)?;
@@ -1610,13 +1690,36 @@ pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root
         std::fs::create_dir_all(&host)?;
         #[cfg(unix)] { let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode as u32)); }
     }
-    let mut st = conn.prepare("SELECT path, link_target FROM vm_fs WHERE kind='symlink'")?;
-    for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))? {
-        let (p,target)=r?;
-        let host = dest.join(p.trim_start_matches('/'));
-        if host.exists() || std::fs::symlink_metadata(&host).is_ok() { let _ = std::fs::remove_file(&host); let _ = std::fs::remove_dir(&host); }
+    // Symlinks are written in the VM's own path order, shallowest first, and each one is placed
+    // under the real directory its parent resolves to inside the VM. Creating a child through a
+    // parent link would write into the link's target instead: e.g. /bin/sh under /bin -> /usr/bin
+    // must land at usr/bin/sh, not at bin/sh (which is a link, not a directory).
+    let links: Vec<(String, String)> = {
+        let mut st = conn.prepare("SELECT path, link_target FROM vm_fs WHERE kind='symlink' ORDER BY length(path), path")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let link_map: std::collections::HashMap<String, String> = links.iter().cloned().collect();
+    // Real entries (files, dirs) are materialized before links below, so a link never overwrites
+    // a file that the VM holds at the same translated path. A link whose translated path is a
+    // real entry is an alias with no room to exist, and is skipped (the real entry serves it).
+    let real_paths: std::collections::HashSet<String> = {
+        let mut st = conn.prepare("SELECT path FROM vm_fs WHERE kind <> 'symlink'")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (p, target) in &links {
+        // the VM path of the directory this link sits in, with any link ancestor expanded to its target
+        let parent_vm = resolve_parent_in_vm(p, &link_map);
+        let translated = match &parent_vm {
+            Some(pv) => format!("{}/{}", pv.trim_end_matches('/'), Path::new(p).file_name().unwrap().to_string_lossy()),
+            None => p.clone(),
+        };
+        if translated != *p && real_paths.contains(&normalize_vm_path(&translated)) { continue; }
+        let host = dest.join(translated.trim_start_matches('/'));
+        if std::fs::symlink_metadata(&host).is_ok() { let _ = std::fs::remove_file(&host); let _ = std::fs::remove_dir(&host); }
         if let Some(par)=host.parent(){ std::fs::create_dir_all(par)?; }
-        #[cfg(unix)] { let _ = std::os::unix::fs::symlink(&target, &host); }
+        #[cfg(unix)] { let _ = std::os::unix::fs::symlink(target, &host); }
     }
     // Metadata only: blobs are loaded per file inside the worker, so memory stays O(one file).
     struct Task { path: String, mode: i64, hash: Option<String>, size: i64, mtime: i64 }  // hash: hex text
@@ -1674,8 +1777,11 @@ pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyncReport { pub created: usize, pub updated: usize, pub unchanged: usize, pub deleted: usize, pub failed: usize }
 
+/// Paths the host-side sync never mirrors. The runtime mount points (/dev, /proc, /sys, /tmp)
+/// are scaffolding created by materialize, not VM state. Only the directories themselves are
+/// reserved: a file a guest writes under /tmp is ordinary content and is synced.
 fn is_reserved_vm_path(p: &str) -> bool {
-    p == "/" || p == "/dev" || p.starts_with("/dev/") || p == "/proc" || p.starts_with("/proc/") || p == "/sys" || p.starts_with("/sys/")
+    p == "/" || p == "/dev" || p.starts_with("/dev/") || p == "/proc" || p.starts_with("/proc/") || p == "/sys" || p.starts_with("/sys/") || p == "/tmp"
 }
 
 /// Mirror a host directory tree into the VM. Streaming: file contents are read one chunk at a
@@ -1727,7 +1833,9 @@ fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool) -
         let vm_p = normalize_vm_path(&format!("/{}", rel.trim_start_matches('/')));
         if is_reserved_vm_path(&vm_p) { continue; }
         let md = match std::fs::symlink_metadata(e.path()) { Ok(m) => m, Err(_) => { rep.failed += 1; continue; } };
-        #[cfg(unix)] let mode = md.permissions().mode() as i64;
+        // permission bits only: the VM stores modes as 0o7777 (the sync used to store the full
+        // st_mode, so every file looked changed on the next sync)
+        #[cfg(unix)] let mode = (md.permissions().mode() & 0o7777) as i64;
         #[cfg(not(unix))] let mode = 420i64;
         let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(now);
         let ns_before = host_mtime_ns(e.path());

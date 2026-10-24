@@ -4,5 +4,6 @@ pub mod closure;
 pub mod vm;
 pub mod bundle_cache;
 pub mod overlay;
+pub mod agent;
 #[cfg(feature = "fuse")]
 pub mod fuse;

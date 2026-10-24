@@ -836,7 +836,7 @@ fn full_verify_catches_stale_rows_that_metadata_check_misses() {
     // Corrupt the stored row into a stale, metadata-identical version: same mode and same mtime
     // as the host, but different content and no ns stamp. Capture the host's real mtime/mode first.
     let hmd = std::fs::symlink_metadata(&f).unwrap();
-    let hmode = std::os::unix::fs::PermissionsExt::mode(&hmd.permissions()) as i64;
+    let hmode = (std::os::unix::fs::PermissionsExt::mode(&hmd.permissions()) & 0o7777) as i64;  // VM stores permission bits only
     let hsec = hmd.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     vm::fs_put_file_stream_pub(&c, "/cfg", hmode, hsec, b"AAAA").unwrap();
     c.execute("UPDATE vm_fs SET mtime_ns=0 WHERE path='/cfg'", []).unwrap();
@@ -848,4 +848,25 @@ fn full_verify_catches_stale_rows_that_metadata_check_misses() {
     let full = vm::vm_sync_full(&c, &host).unwrap();
     assert_eq!(full.updated, 1, "full verify must rewrite the stale row");
     assert_eq!(vm::vm_cat(&c, "/cfg").unwrap(), b"BBBB");
+}
+
+#[test]
+fn symlinked_directory_children_materialize_under_the_real_directory() {
+    // /bin -> /usr/bin is a directory link, and /bin/sh is a child of it. The child must be
+    // written under usr/bin (where the VM resolves it), never through the link into a path that
+    // does not exist in the tree. Checked with lstat on the scratch tree, not through the link.
+    let (_g, db) = tmpdb("symlink-child");
+    let c = open(&db);
+    vm::vm_add_symlink(&c, "/bin", "/usr/bin").unwrap();
+    vm::vm_add_bytes(&c, "/usr/bin/dash", b"sh-bytes", 0o755, 1).unwrap();
+    vm::vm_add_symlink(&c, "/bin/sh", "/usr/bin/dash").unwrap();
+    let dest = _g.path().join("scratch");
+    vm::vm_materialize_tree(&c, &dest).unwrap();
+    let sh = dest.join("usr/bin/sh");
+    let md = std::fs::symlink_metadata(&sh).expect("usr/bin/sh must exist as a link");
+    assert!(md.file_type().is_symlink(), "usr/bin/sh must be a symlink");
+    assert_eq!(std::fs::read_link(&sh).unwrap(), std::path::PathBuf::from("/usr/bin/dash"));
+    // the link /bin itself must remain a link, not become a real directory holding copies
+    assert!(std::fs::symlink_metadata(dest.join("bin")).unwrap().file_type().is_symlink(), "/bin must stay a link");
+    assert!(!std::fs::symlink_metadata(dest.join("usr/bin")).unwrap().file_type().is_symlink(), "usr/bin must be a real directory");
 }
