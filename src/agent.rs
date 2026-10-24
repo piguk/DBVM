@@ -69,8 +69,15 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
     };
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
 
-    // sync the scratch tree back, then diff against the snapshot taken before the step
-    vm::vm_sync_from_host(&conn, &scratch)?;
+    // Sync the scratch tree back, then diff against the snapshot taken before the step. A sync that
+    // could not write some paths must fail the step: the command ran and its writes were refused (a
+    // policy rule, for instance), so reporting success would tell the caller something untrue. The
+    // failed files are named in the error.
+    let sync = vm::vm_sync_report(&conn, &scratch)?;
+    if let Some(why) = sync.failure_summary() {
+        let _ = std::fs::remove_dir_all(&scratch);
+        return Err(anyhow!("step ran but {}; the sandbox content was not applied", why));
+    }
     let changes = vm::snapshot_diff_live(&conn, &before)?;
     let _ = std::fs::remove_dir_all(&scratch);
 

@@ -177,3 +177,32 @@ fn list_steps_limit_keeps_the_most_recent() {
     assert_eq!(last2.iter().map(|r| r.exit_code).collect::<Vec<_>>(), vec![1, 2], "limit keeps the most recent");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn a_write_the_policy_refuses_does_not_look_like_success() {
+    // The sandbox lets the command write the file. The policy refuses the sync back. That refusal must
+    // not be silently dropped: a step whose changes could not be applied must not report success with an
+    // empty change list. Found by running the step against a protected path: exit 0, empty stderr, empty
+    // change list, content unchanged -- the caller had no way to know the write was rejected.
+    if !step_available() { eprintln!("skip: bwrap not available"); return; }
+    let (d, db) = make("policydeny");
+    {
+        let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+        vm::vm_add_bytes(&c, "/etc/app.conf", b"orig", 0o644, 1).unwrap();
+        selfdb::policy::add(&c, &selfdb::policy::Rule::ReadonlyPrefix("/etc".into())).unwrap();
+    }
+    let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "echo tampered > /etc/app.conf".into()],
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES });
+    let content = {
+        let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+        vm::vm_cat(&c, "/etc/app.conf").unwrap()
+    };
+    assert_eq!(content, b"orig", "the policy must keep protecting the file");
+    match r {
+        Err(e) => assert!(e.to_string().contains("EACCES") || e.to_string().contains("protected") || e.to_string().contains("failed"),
+            "a refused write must surface as an error naming the refusal: {}", e),
+        Ok(x) => panic!("a step whose write was refused must not report success (exit={}, stderr={:?}, changes={:?})",
+            x.exit_code, String::from_utf8_lossy(&x.stderr), x.changes),
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

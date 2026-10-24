@@ -1903,7 +1903,18 @@ pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root
 }
 /// Summary of one sync pass.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct SyncReport { pub created: usize, pub updated: usize, pub unchanged: usize, pub deleted: usize, pub failed: usize }
+pub struct SyncReport { pub created: usize, pub updated: usize, pub unchanged: usize, pub deleted: usize, pub failed: usize,
+    /// Why each failed path failed. Kept so a caller can tell the user what was refused and cannot
+    /// mistake a policy refusal for a successful step (see agent::run_step).
+    pub failures: Vec<(String, String)> }
+
+impl SyncReport {
+    /// First failure as a message, if any. Used by callers that must not ignore a partial sync.
+    pub fn failure_summary(&self) -> Option<String> {
+        let (path, why) = self.failures.first()?;
+        Some(format!("{} path(s) could not be written, first: {}: {}", self.failed, path, why))
+    }
+}
 
 /// Paths the host-side sync never mirrors. The runtime mount points (/dev, /proc, /sys, /tmp)
 /// are scaffolding created by materialize, not VM state. Only the directories themselves are
@@ -1976,7 +1987,7 @@ fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool) -
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let now = now_secs();
     for entry in walkdir::WalkDir::new(host_root).follow_links(false).min_depth(1) {
-        let e = match entry { Ok(v) => v, Err(_) => { rep.failed += 1; continue; } };
+        let e = match entry { Ok(v) => v, Err(err) => { rep.failed += 1; rep.failures.push((String::from("<walk>"), err.to_string())); continue; } };
         let rel = e.path().strip_prefix(host_root).unwrap_or(e.path()).to_string_lossy().to_string();
         let vm_p = normalize_vm_path(&format!("/{}", rel.trim_start_matches('/')));
         if is_reserved_vm_path(&vm_p) { continue; }
@@ -1990,7 +2001,10 @@ fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool) -
                 continue;
             }
         }
-        let md = match std::fs::symlink_metadata(e.path()) { Ok(m) => m, Err(_) => { rep.failed += 1; continue; } };
+        let md = match std::fs::symlink_metadata(e.path()) {
+            Ok(m) => m,
+            Err(err) => { rep.failed += 1; rep.failures.push((vm_p.clone(), err.to_string())); continue; }
+        };
         // permission bits only: the VM stores modes as 0o7777 (the sync used to store the full
         // st_mode, so every file looked changed on the next sync)
         #[cfg(unix)] let mode = (md.permissions().mode() & 0o7777) as i64;
@@ -2064,7 +2078,7 @@ fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool) -
             Ok(Some(false)) => rep.created += 1,
             Ok(Some(true)) => rep.updated += 1,
             Ok(None) => rep.unchanged += 1,
-            Err(err) => { eprintln!("sync {}: {}", vm_p, err); rep.failed += 1; }
+            Err(err) => { rep.failed += 1; rep.failures.push((vm_p.clone(), err.to_string())); }
         }
     }
 
