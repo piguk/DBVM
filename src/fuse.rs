@@ -237,8 +237,13 @@ pub mod fuse_impl {
             // EIO, never as success: the file is left unchanged by write_range.
             let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
             if let Err(e) = crate::vm::write_range(&self.conn, &path, offset as u64, data, mtime) {
-                eprintln!("vm-fuse write {}: {}", path, e);
-                reply.error(libc::EIO);
+                // a write the policy forbids is EACCES, the answer a user expects; anything else is EIO
+                if crate::policy::is_refusal(&e) {
+                    reply.error(libc::EACCES);
+                } else {
+                    eprintln!("vm-fuse write {}: {}", path, e);
+                    reply.error(libc::EIO);
+                }
                 return;
             }
             // refresh the cached attributes from the stored row
