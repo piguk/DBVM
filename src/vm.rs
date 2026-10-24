@@ -1270,6 +1270,97 @@ pub fn read_range(conn: &Connection, vm_path: &str, off: u64, len: usize) -> Res
     Ok(out)
 }
 
+/// Write `data` at `off` in a regular file, rewriting only the CHUNK_SIZE chunks it touches.
+///
+/// Untouched chunks keep their rows and blobs. A write past the end extends the file and zero-fills
+/// any gap (the gap's chunks are written too). The whole-file sha256 is recomputed from the chunk
+/// list, so `vm_fs.hash` stays exact. Runs in one savepoint: a failure leaves the file unchanged.
+pub fn write_range(conn: &Connection, vm_path: &str, off: u64, data: &[u8], mtime: i64) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let real = resolve_path(conn, vm_path)?;
+    let (kind, size): (String, i64) = conn
+        .prepare_cached("SELECT kind, size FROM vm_fs WHERE path=?1")?
+        .query_row(params![real], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?
+        .ok_or_else(|| anyhow!("not found in VM: {}", real))?;
+    if kind != "file" { return Err(anyhow!("not a regular file: {}", real)); }
+    if data.is_empty() { return Ok(()); }
+    let old_size = size as u64;
+    let new_size = old_size.max(off + data.len() as u64);
+    let end = off + data.len() as u64;
+    // Start at the chunk holding min(off, old_size). If the write extends the file, the old last chunk
+    // may be short; it must be rewritten to full length (zero-filled) as well, not just the chunks
+    // the write itself covers. Otherwise it stays short while the file grows past it.
+    let first = off.min(old_size) / CHUNK_SIZE as u64;
+    let last = (end - 1) / CHUNK_SIZE as u64;
+
+    conn.execute_batch("SAVEPOINT write_range;")?;
+    let res: Result<()> = (|| {
+        for idx in first..=last {
+            let base = idx * CHUNK_SIZE as u64;
+            let chunk_end = (base + CHUNK_SIZE as u64).min(new_size);
+            // the old bytes of this chunk (empty past the old end), then overlay the new bytes
+            let mut piece = if base < old_size {
+                read_range(conn, &real, base, CHUNK_SIZE)?
+            } else {
+                Vec::new()
+            };
+            let want = (chunk_end - base) as usize;
+            if piece.len() < want { piece.resize(want, 0); }
+            let w_from = off.max(base);
+            let w_to = end.min(chunk_end);
+            if w_from < w_to {
+                let src = &data[(w_from - off) as usize..(w_to - off) as usize];
+                piece[(w_from - base) as usize..(w_to - base) as usize].copy_from_slice(src);
+            }
+            let key = blob_key(&piece);
+            blob_ensure(conn, &key, &piece)?;
+            // Replace the row only when its content changed. Deleting a row fires vm_fc_del, which
+            // drops the blob once its refcount reaches zero. If the new content equals the old, the
+            // delete would remove the very blob the re-insert needs (dangling reference). So an
+            // unchanged chunk is left alone entirely.
+            let old_hash: Option<Vec<u8>> = conn.prepare_cached("SELECT hash FROM vm_file_chunks WHERE path=?1 AND idx=?2")?
+                .query_row(params![real, idx as i64], |r| r.get(0)).optional()?;
+            if old_hash.as_deref() == Some(key.as_slice()) { continue; }
+            // Delete then insert, not INSERT OR REPLACE: a replace does not fire the DELETE trigger
+            // (recursive_triggers is off), so the old blob's refcount would never be decremented.
+            conn.prepare_cached("DELETE FROM vm_file_chunks WHERE path=?1 AND idx=?2")?
+                .execute(params![real, idx as i64])?;
+            conn.prepare_cached("INSERT INTO vm_file_chunks(path, idx, hash) VALUES (?1,?2,?3)")?
+                .execute(params![real, idx as i64, key.as_slice()])?;
+        }
+        // Whole-file hash over the final chunk list, one chunk in memory at a time. This reads the
+        // chunk rows directly, not through read_range: read_range clamps to vm_fs.size, which still
+        // holds the old size until the UPDATE below.
+        let mut h = Sha256::new();
+        let total_chunks = (new_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64;
+        let mut get = conn.prepare_cached(
+            "SELECT b.content, b.compressed, b.dict_id, c.hash FROM vm_file_chunks c
+             JOIN vm_blobs b ON b.hash=c.hash WHERE c.path=?1 AND c.idx=?2")?;
+        for idx in 0..total_chunks {
+            let (body, comp, dict_id, key): (Vec<u8>, i64, i64, Vec<u8>) = get
+                .query_row(params![real, idx as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .optional()?
+                .ok_or_else(|| anyhow!("{}: missing chunk {} after write", real, idx))?;
+            let piece = decode_block(conn, &body, comp, dict_id)?;
+            let base = idx * CHUNK_SIZE as u64;
+            let want = (new_size - base).min(CHUNK_SIZE as u64) as usize;
+            if piece.len() != want || blob_key(&piece).as_slice() != key.as_slice() {
+                return Err(anyhow!("{}: chunk {} has wrong length or hash after write", real, idx));
+            }
+            h.update(&piece);
+        }
+        let whole: [u8; 32] = h.finalize().into();
+        conn.prepare_cached("UPDATE vm_fs SET size=?2, hash=?3, mtime=?4 WHERE path=?1")?
+            .execute(params![real, new_size as i64, whole.as_slice(), mtime])?;
+        Ok(())
+    })();
+    match res {
+        Ok(()) => { conn.execute_batch("RELEASE write_range;")?; Ok(()) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK TO write_range; RELEASE write_range;"); Err(e) }
+    }
+}
+
 /// Follow symlinks and return the real path. Does not load any content.
 pub fn resolve_path(conn: &Connection, vm_path: &str) -> Result<String> {
     let mut cur = normalize_vm_path(vm_path);
@@ -2642,3 +2733,72 @@ pub fn vm_disk_info(conn: &Connection) -> Result<String> {
         conn.prepare_cached("PRAGMA page_count")?.query_row( [], |r| r.get::<_,i64>(0)).unwrap_or(0)))
 }
 
+
+/// Set a regular file's size. Shrinking drops the chunks past the new end and trims the last one;
+/// growing zero-fills (write_range does the work). Whole-file hash and size are updated together.
+pub fn truncate_range(conn: &Connection, vm_path: &str, new_size: u64, mtime: i64) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let real = resolve_path(conn, vm_path)?;
+    let (kind, size): (String, i64) = conn
+        .prepare_cached("SELECT kind, size FROM vm_fs WHERE path=?1")?
+        .query_row(params![real], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?
+        .ok_or_else(|| anyhow!("not found in VM: {}", real))?;
+    if kind != "file" { return Err(anyhow!("not a regular file: {}", real)); }
+    let old_size = size as u64;
+    if new_size == old_size { return Ok(()); }
+    if new_size > old_size {
+        // extend: a zero-filled tail. write_range writes the new chunks and the whole-file hash.
+        let zeros = vec![0u8; (new_size - old_size) as usize];
+        return write_range(conn, &real, old_size, &zeros, mtime);
+    }
+    conn.execute_batch("SAVEPOINT truncate_range;")?;
+    let res: Result<()> = (|| {
+        // chunks entirely past the new end are removed (their blob refcounts drop via the trigger)
+        let keep_chunks = if new_size == 0 { 0 } else { (new_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64 };
+        conn.prepare_cached("DELETE FROM vm_file_chunks WHERE path=?1 AND idx>=?2")?
+            .execute(params![real, keep_chunks as i64])?;
+        // the last kept chunk may hold bytes past the new end: rewrite it trimmed
+        if new_size > 0 && new_size % CHUNK_SIZE as u64 != 0 {
+            let last = keep_chunks - 1;
+            let base = last * CHUNK_SIZE as u64;
+            let want = (new_size - base) as usize;
+            let (body, comp, dict_id, key): (Vec<u8>, i64, i64, Vec<u8>) = conn.prepare_cached(
+                "SELECT b.content, b.compressed, b.dict_id, c.hash FROM vm_file_chunks c
+                 JOIN vm_blobs b ON b.hash=c.hash WHERE c.path=?1 AND c.idx=?2")?
+                .query_row(params![real, last as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .optional()?
+                .ok_or_else(|| anyhow!("{}: missing chunk {} while truncating", real, last))?;
+            let mut piece = decode_block(conn, &body, comp, dict_id)?;
+            if blob_key(&piece).as_slice() != key.as_slice() { return Err(anyhow!("{}: chunk {} hash mismatch", real, last)); }
+            piece.truncate(want);
+            let nkey = blob_key(&piece);
+            blob_ensure(conn, &nkey, &piece)?;
+            conn.prepare_cached("DELETE FROM vm_file_chunks WHERE path=?1 AND idx=?2")?.execute(params![real, last as i64])?;
+            conn.prepare_cached("INSERT INTO vm_file_chunks(path, idx, hash) VALUES (?1,?2,?3)")?
+                .execute(params![real, last as i64, nkey.as_slice()])?;
+        }
+        // whole-file hash over the remaining chunks
+        let mut h = Sha256::new();
+        let mut get = conn.prepare_cached(
+            "SELECT b.content, b.compressed, b.dict_id, c.hash FROM vm_file_chunks c
+             JOIN vm_blobs b ON b.hash=c.hash WHERE c.path=?1 AND c.idx=?2")?;
+        for idx in 0..keep_chunks {
+            let (body, comp, dict_id, key): (Vec<u8>, i64, i64, Vec<u8>) = get
+                .query_row(params![real, idx as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .optional()?
+                .ok_or_else(|| anyhow!("{}: missing chunk {} after truncate", real, idx))?;
+            let piece = decode_block(conn, &body, comp, dict_id)?;
+            if blob_key(&piece).as_slice() != key.as_slice() { return Err(anyhow!("{}: chunk {} hash mismatch", real, idx)); }
+            h.update(&piece);
+        }
+        let whole: [u8; 32] = h.finalize().into();
+        conn.prepare_cached("UPDATE vm_fs SET size=?2, hash=?3, mtime=?4 WHERE path=?1")?
+            .execute(params![real, new_size as i64, whole.as_slice(), mtime])?;
+        Ok(())
+    })();
+    match res {
+        Ok(()) => { conn.execute_batch("RELEASE truncate_range;")?; Ok(()) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK TO truncate_range; RELEASE truncate_range;"); Err(e) }
+    }
+}
