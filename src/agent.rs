@@ -72,7 +72,10 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
     let sync = vm::vm_sync_report(&conn, &scratch)?;
     if let Some(why) = sync.failure_summary() {
         let _ = std::fs::remove_dir_all(&scratch);
-        return Err(anyhow!("step ran but {}; the sandbox content was not applied", why));
+        let duration_ms = started.elapsed().as_millis();
+        let cmd = argv.join(" ");
+        return Err(record_and_fail(&conn, &cmd, &stdout, &stderr, stdout_truncated, exit_code, timed_out,
+            &before, &why, duration_ms));
     }
     let changes = vm::snapshot_diff_live(&conn, &before)?;
     let _ = std::fs::remove_dir_all(&scratch);
@@ -291,6 +294,35 @@ pub fn provision_agent(db: &Path, node: &Path, pi_dir: &Path) -> Result<Provisio
     Ok(ProvisionReport { objects: objects + shell_objects, files, node: node_real.to_string_lossy().to_string() })
 }
 
+
+/// Record a run whose synced content could not be applied, then report the failure.
+///
+/// A refused write (a policy rule, for example) aborts the sync. The run still happened, so it must be
+/// auditable: `agent_steps` gets the row with the reason attached to stderr, and the caller still sees an
+/// error. Silently dropping the row leaves no trace of why the sandbox content vanished.
+/// Exit code recorded for a run whose content was refused. The agent process may itself have exited 0
+/// (it wrote inside the sandbox and saw no error), but the run did not take effect, so reporting 0 would
+/// tell the reader the task succeeded. 125 is the shell's "command could not be executed" code, distinct
+/// from 124 (timeout) and from an agent's own failure.
+const EXIT_NOT_APPLIED: i32 = 125;
+
+#[allow(clippy::too_many_arguments)]
+fn record_and_fail(conn: &rusqlite::Connection, cmd: &str, stdout: &[u8], stderr: &[u8],
+                   stdout_truncated: bool, _exit_code: i32, _timed_out: bool,
+                   before: &str, why: &str, duration_ms: u128) -> anyhow::Error {
+    let note = format!("sandbox content not applied: {}", why);
+    let mut err_bytes = stderr.to_vec();
+    err_bytes.extend_from_slice(b"\n");
+    err_bytes.extend_from_slice(note.as_bytes());
+    let _ = conn.execute(
+        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![cmd, EXIT_NOT_APPLIED, 0i64, 0i64, duration_ms as i64,
+                stdout, &err_bytes, stdout_truncated as i64, false, before, None::<String>,
+                format!("{{\"created\":[],\"modified\":[],\"deleted\":[]}}")]);
+    anyhow!("{}", note)
+}
+
 /// Options for one agent task.
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
@@ -413,7 +445,10 @@ pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     let sync = vm::vm_sync_report(&conn, &scratch)?;
     if let Some(why) = sync.failure_summary() {
         let _ = std::fs::remove_dir_all(&scratch);
-        return Err(anyhow!("agent ran but {}; the sandbox content was not applied", why));
+        let duration_ms = started.elapsed().as_millis();
+        let cmd = format!("vm-agent: {}", opts.task);
+        return Err(record_and_fail(&conn, &cmd, &stdout, &stderr, stdout_truncated, exit_code, timed_out,
+            &before, &why, duration_ms));
     }
     let changes = vm::snapshot_diff_live(&conn, &before)?;
     let _ = std::fs::remove_dir_all(&scratch);
