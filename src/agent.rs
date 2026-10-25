@@ -56,29 +56,26 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
     // the name comes from the snapshot's own row id, so two steps starting at once cannot collide
     let (_, before) = vm::snapshot_create_named(&conn, "step-before", "agent-step")?;
 
-    let scratch = vm::make_tmp_dir("agent-step-")?;
+    // same guard as run_agent: no early return may leave the materialised tree behind
+    let scratch = ScratchDir::create("agent-step-")?;
     let started = Instant::now();
-    let mat = vm::vm_materialize_tree(&conn, &scratch);
-    let outcome = match mat {
-        Err(e) => { let _ = std::fs::remove_dir_all(&scratch); return Err(anyhow!("materialize failed: {}", e)); }
-        Ok(_) => run_in(&scratch, argv, opts.timeout_secs, opts.max_output_bytes)?,
-    };
+    vm::vm_materialize_tree(&conn, scratch.path()).map_err(|e| anyhow!("materialize failed: {}", e))?;
+    let outcome = run_in(scratch.path(), argv, opts.timeout_secs, opts.max_output_bytes)?;
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
 
     // Sync the scratch tree back, then diff against the snapshot taken before the step. A sync that
     // could not write some paths must fail the step: the command ran and its writes were refused (a
     // policy rule, for instance), so reporting success would tell the caller something untrue. The
     // failed files are named in the error.
-    let sync = vm::vm_sync_report(&conn, &scratch)?;
+    let sync = vm::vm_sync_report(&conn, scratch.path())?;
     if let Some(why) = sync.failure_summary() {
-        let _ = std::fs::remove_dir_all(&scratch);
         let duration_ms = started.elapsed().as_millis();
         let cmd = argv.join(" ");
         return Err(record_and_fail(&conn, &cmd, &stdout, &stderr, stdout_truncated, exit_code, timed_out,
             &before, &why, duration_ms));
     }
     let changes = vm::snapshot_diff_live(&conn, &before)?;
-    let _ = std::fs::remove_dir_all(&scratch);
+    // the guard removes the tree when this function returns
 
     let failed = exit_code != 0 || timed_out;
     let rolled_back = failed && opts.rollback_on_fail;
@@ -323,6 +320,29 @@ fn record_and_fail(conn: &rusqlite::Connection, cmd: &str, stdout: &[u8], stderr
     anyhow!("{}", note)
 }
 
+
+/// Removes a scratch directory when it goes out of scope.
+///
+/// Every early return in a run must clean up. Writing `remove_dir_all` on each error path is easy to
+/// forget: measured, three failed agent runs left 539 MB of materialised trees under /tmp because the
+/// paths after the proxy was bound returned with `?` and never cleaned up.
+struct ScratchDir { path: std::path::PathBuf }
+
+impl ScratchDir {
+    fn create(prefix: &str) -> Result<ScratchDir> {
+        Ok(ScratchDir { path: vm::make_tmp_dir(prefix)? })
+    }
+    fn path(&self) -> &Path { &self.path }
+    /// Keep a file that lives inside the tree: used before syncing, so the guard still removes it.
+    fn remove(&self, rel: &str) { let _ = std::fs::remove_file(self.path.join(rel)); }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() { let _ = std::fs::remove_dir_all(&self.path); }
+    }
+}
+
 /// Options for one agent task.
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
@@ -409,49 +429,45 @@ pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     }
 
     let (_, before) = vm::snapshot_create_named(&conn, "agent-before", "vm-agent")?;
-    let scratch = vm::make_tmp_dir("vm-agent-")?;
+    // A guard, not ad-hoc cleanups: every early return below must remove the materialised tree.
+    let scratch = ScratchDir::create("vm-agent-")?;
     let started = Instant::now();
-    if let Err(e) = vm::vm_materialize_tree(&conn, &scratch) {
-        let _ = std::fs::remove_dir_all(&scratch);
-        return Err(anyhow!("materialize failed: {}", e));
-    }
+    vm::vm_materialize_tree(&conn, scratch.path()).map_err(|e| anyhow!("materialize failed: {}", e))?;
 
     // The agent's settings live in the VM tree, so they are part of the diff and can be rolled back.
-    let agent_dir = scratch.join("opt/piagent");
+    let agent_dir = scratch.path().join("opt/piagent");
     std::fs::create_dir_all(&agent_dir)?;
     std::fs::write(agent_dir.join("models.json"), model_config(&opts.model, opts.forward_port))?;
     std::fs::write(agent_dir.join("settings.json"), agent_settings(&opts.model))?;
     // .cjs: inside a directory with "type": "module" a .js file would load as ESM and lose `require`
-    let forwarder = scratch.join("opt/fwd.cjs");
-    std::fs::write(&forwarder, crate::proxy::FORWARDER_JS)?;
+    std::fs::create_dir_all(scratch.path().join("opt"))?;
+    std::fs::write(scratch.path().join("opt/fwd.cjs"), crate::proxy::FORWARDER_JS)?;
 
-    // host side of the tunnel
-    let sock = scratch.parent().map(|p| p.join("proxy.sock")).unwrap_or_else(|| std::path::PathBuf::from("/tmp/vm-agent-proxy.sock"));
+    // Host side of the tunnel. The socket lives inside the tree under tmp/, which the sync reserves, so it
+    // is never mistaken for VM content and is removed with the tree.
+    std::fs::create_dir_all(scratch.path().join("tmp"))?;
+    let sock = scratch.path().join("tmp/proxy.sock");
     let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
     let proxy = crate::proxy::Proxy::bind(&sock, upstream, &prefix)?;
 
-    let outcome = run_agent_in(&scratch, &sock, opts);
+    let outcome = run_agent_in(scratch.path(), &sock, opts);
     drop(proxy);
-    let outcome = match outcome {
-        Ok(o) => o,
-        Err(e) => { let _ = std::fs::remove_dir_all(&scratch); return Err(e); }
-    };
+    let outcome = outcome?;
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
 
     // The agent rewrote settings the run itself created; do not report those as task changes.
     for rel in ["opt/piagent/models.json", "opt/piagent/settings.json", "opt/fwd.cjs", "opt/run-agent.sh", "tmp/proxy.sock", "tmp/fwd.log"] {
-        let _ = std::fs::remove_file(scratch.join(rel));
+        scratch.remove(rel);
     }
-    let sync = vm::vm_sync_report(&conn, &scratch)?;
+    let sync = vm::vm_sync_report(&conn, scratch.path())?;
     if let Some(why) = sync.failure_summary() {
-        let _ = std::fs::remove_dir_all(&scratch);
         let duration_ms = started.elapsed().as_millis();
         let cmd = format!("vm-agent: {}", opts.task);
         return Err(record_and_fail(&conn, &cmd, &stdout, &stderr, stdout_truncated, exit_code, timed_out,
             &before, &why, duration_ms));
     }
     let changes = vm::snapshot_diff_live(&conn, &before)?;
-    let _ = std::fs::remove_dir_all(&scratch);
+    // the guard removes the tree when this function returns
 
     let failed = exit_code != 0 || timed_out;
     let rolled_back = failed && opts.rollback_on_fail;

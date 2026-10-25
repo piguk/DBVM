@@ -286,3 +286,39 @@ fn a_real_multi_step_task_is_audited_and_rolled_back() {
         v.lines().last().unwrap_or(""));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A failed run must not leave its materialised tree behind.
+///
+/// Measured before the guard existed: three failed runs left 539 MB under /tmp, because the paths after
+/// the proxy was bound returned with `?` and never cleaned up. This counts the scratch directories
+/// before and after a run that is expected to fail.
+#[test]
+fn a_failed_step_leaves_no_scratch_directory() {
+    if !bwrap_ok() { eprintln!("skip: bwrap not available"); return; }
+    fn count() -> usize {
+        let dir = std::env::temp_dir();
+        std::fs::read_dir(&dir).map(|it| it.filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("agent-step-") || n.starts_with("vm-agent-")
+            }).count()).unwrap_or(0)
+    }
+    let before = count();
+    let d = std::env::temp_dir().join(format!("scrub-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let db = d.join("v.db");
+    {
+        let c = vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap();
+        vm::vm_import_closure(&c, "/bin/sh", "/").unwrap();
+        vm::vm_add_bytes(&c, "/tests/eval.sh", b"PROTECTED", 0o644, 1).unwrap();
+        selfdb::policy::add(&c, &selfdb::policy::Rule::ReadonlyPrefix("/tests".into())).unwrap();
+    }
+    // this run fails by design: the policy refuses the write on the way back
+    let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "echo X > /tests/eval.sh".into()],
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 60, max_output_bytes: 1 << 20 });
+    assert!(r.is_err(), "the run is expected to fail");
+    let after = count();
+    assert_eq!(after, before, "a failed run must leave no scratch tree (before {}, after {})", before, after);
+    let _ = std::fs::remove_dir_all(&d);
+}
