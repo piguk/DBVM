@@ -173,8 +173,10 @@ fn an_unchanged_tree_writes_no_whiteouts() {
     let dc = rusqlite::Connection::open(&delta).unwrap();
     let whites: i64 = dc.query_row("SELECT count(*) FROM vm_whiteouts", [], |r| r.get(0)).unwrap();
     assert_eq!(whites, 0, "an unchanged tree must not white anything out, got {}", whites);
-    // and the view is unchanged
+    // and the view is unchanged. `/bin/tool` is a symlink in the view, so `read` on it is not the way to
+    // reach the bytes: the kernel follows it to /usr/bin/tool. Both must still resolve.
     assert!(ov.exists("/bin/tool").unwrap(), "/bin/tool is still visible");
-    assert_eq!(ov.read("/bin/tool").unwrap(), b"TOOL");
+    assert!(ov.exists("/usr/bin/tool").unwrap(), "/usr/bin/tool is still visible");
+    assert_eq!(ov.read("/usr/bin/tool").unwrap(), b"TOOL");
     let _ = std::fs::remove_dir_all(&d);
 }

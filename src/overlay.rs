@@ -628,6 +628,9 @@ impl Overlay {
     pub fn absorb_tree(&self, tree: &Path) -> Result<usize> {
         use std::collections::HashSet;
         let mut seen: HashSet<String> = HashSet::new();
+        // View paths the tree actually holds. An alias row (/bin/tool, a link whose target is a real entry)
+        // shares its view path with that real entry, so it is served by it and must not be treated as gone.
+        let mut view_seen: HashSet<String> = HashSet::new();
         let mut written = 0usize;
         // view path -> database path, so an entry reached through a directory link is recognised
         let links = self.view_links()?;
@@ -642,8 +645,30 @@ impl Overlay {
             let vp = self.resolved_path(p, &links);
             if vp != *p { translated.insert(vp, p.clone()); }
         }
-        for (p, _k) in &paths { view_to_db.insert(p.clone(), p.clone()); }
-        for (vp, p) in translated { view_to_db.insert(vp, p); }
+        // A view path may be claimed by two database paths: /bin (a link) and /usr/bin (a directory) both
+        // answer to "usr/bin", and /bin/cat versus usr/bin/cat likewise. The entry that is not behind a link
+        // wins, because that is where the tree actually stores the bytes; otherwise an alias hid the real
+        // entry and the tree's regular file was written back over a Base link (measured: /bin/cat, /bin/ls
+        // and the rest became plain files in Delta).
+        let under_link = |p: &str| -> bool {
+            let mut cur = p.to_string();
+            while let Some(i) = cur.rfind('/') {
+                if i == 0 { break; }
+                cur.truncate(i);
+                if links.contains_key(&cur) { return true; }
+            }
+            false
+        };
+        for (p, _k) in &paths {
+            if !under_link(p) { view_to_db.insert(p.clone(), p.clone()); }
+        }
+        for (p, _k) in &paths {
+            view_to_db.entry(p.clone()).or_insert_with(|| p.clone());
+        }
+        // A translated mapping is only a fallback: /bin/cat (a Base link) and usr/bin/cat (the real file the
+        // tree holds) both answer to usr/bin/cat. The real path must win, or the tree's regular file was
+        // written back over the Base link (measured: /bin/cat became a 47 KiB plain file in Delta).
+        for (vp, p) in translated { view_to_db.entry(vp).or_insert(p); }
         for entry in walkdir::WalkDir::new(tree).follow_links(false).min_depth(1) {
             let e = match entry { Ok(v) => v, Err(_) => continue };
             let rel = e.path().strip_prefix(tree).unwrap_or(e.path()).to_string_lossy().to_string();
@@ -655,7 +680,26 @@ impl Overlay {
             // link /bin -> /usr/bin) appears at usr/bin/gcc. Looking that up literally finds nothing and the
             // tree write-back would create a duplicate in Delta (measured: /usr/bin/gcc, /usr/bin/python3,
             // /usr/bin/sh appearing as created). The view path is translated back to the database path first.
+            // A path with a symlink ancestor is not stored here: the tree shows /bin as a link to /usr/bin, so
+            // /bin/cat on disk is really usr/bin/cat. Writing at the literal path turned Base links into plain
+            // files in Delta (measured: /bin/cat, /bin/ls, ...). Such paths are skipped entirely; the real
+            // location (usr/bin/cat) is handled on its own when the walk reaches it.
+            let mut cur = p.clone();
+            let mut has_link_ancestor = false;
+            while let Some(i) = cur.rfind('/') {
+                if i == 0 { break; }
+                cur.truncate(i);
+                if links.contains_key(&cur) { has_link_ancestor = true; break; }
+            }
             let db_p = view_to_db.get(&p).cloned().unwrap_or_else(|| p.clone());
+            view_seen.insert(p.clone());
+            if has_link_ancestor {
+                // Not written back, but the entry does exist in the view. Record its *database* path: the
+                // deletion pass below compares against database paths, so recording the view path left the
+                // real row looking gone and it was whited out (measured: /bin/tool).
+                seen.insert(db_p);
+                continue;
+            }
             // Record the database path: the collection below compares against database paths, and a view path
             // would make every entry behind a directory link look deleted (measured: an unchanged tree wrote
             // 7 rows into Delta and whited out /bin/sh).
@@ -671,10 +715,13 @@ impl Overlay {
                     // relative path that stays inside the tree), so the stored absolute target is converted
                     // the same way before comparing; otherwise every directory link looked changed and was
                     // re-written into Delta on every run (measured: /bin created in each run).
-                    let stored = self.readlink(&db_p)?;
+                    // `readlink` already applies the mount form (absolute targets become paths inside the
+                    // tree). Comparing against the text on disk is then a plain string equality; routing it
+                    // through resolved_path again double-translated the target and made every link look
+                    // changed (measured: 11 links rewritten on an untouched tree, every round trip).
+                    let stored_mount_form = self.readlink(&db_p)?;
                     let disk = std::fs::read_link(e.path())?.to_string_lossy().to_string();
-                    let view = view_to_db.get(&p).cloned().unwrap_or_else(|| p.clone());
-                    if crate::owner::mount_link_text(&self.resolved_path(&view, &links), &stored) == disk { continue; }
+                    if stored_mount_form == disk { continue; }
                     self.symlink(&db_p, &disk)?;
                 }
                 ("file", Some("file")) => {
@@ -698,7 +745,11 @@ impl Overlay {
         let mut gone: Vec<String> = Vec::new();
         for (p, kind) in self.all_paths()? {
             if vm::is_reserved_vm_path(&p) { continue; }
-            if !seen.contains(&p) { let _ = kind; gone.push(p); }
+            if seen.contains(&p) { continue; }
+            let vp = self.resolved_path(&p, &links);
+            if vp != p && view_seen.contains(&vp) { continue; }
+            let _ = kind;
+            gone.push(p);
         }
         for p in gone { self.remove(&p)?; written += 1; }
         Ok(written)
