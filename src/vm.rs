@@ -1787,7 +1787,7 @@ fn link_alias_row(vm_p: &str, alias: &std::collections::HashMap<String, String>)
 /// Parent directory of `p` with every ancestor that is itself a VM symlink replaced by its
 /// target (absolute targets only; relative ones are resolved against the link's own parent).
 /// Returns None when no ancestor is a link, so the caller uses the path as written.
-fn resolve_parent_in_vm(p: &str, links: &std::collections::HashMap<String, String>) -> Option<String> {
+pub(crate) fn resolve_parent_in_vm(p: &str, links: &std::collections::HashMap<String, String>) -> Option<String> {
     let parent = Path::new(p).parent()?.to_string_lossy().to_string();
     let mut cur = String::from("/");
     let mut changed = false;
@@ -1919,7 +1919,7 @@ impl SyncReport {
 /// Paths the host-side sync never mirrors. The runtime mount points (/dev, /proc, /sys, /tmp)
 /// are scaffolding created by materialize, not VM state. Only the directories themselves are
 /// reserved: a file a guest writes under /tmp is ordinary content and is synced.
-fn is_reserved_vm_path(p: &str) -> bool {
+pub(crate) fn is_reserved_vm_path(p: &str) -> bool {
     if p == "/" || p == "/dev" || p.starts_with("/dev/") || p == "/proc" || p.starts_with("/proc/")
         || p == "/sys" || p.starts_with("/sys/") || p == "/tmp" { return true; }
     // Runtime artefacts, not VM state. Each was measured leaking into a step's change list:

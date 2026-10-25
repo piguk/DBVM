@@ -12,6 +12,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
+use crate::vm;
 use crate::vm::{decode_block_in, normalize_vm_path, vm_open, blob_key};
 
 pub struct Overlay { conn: Connection }
@@ -517,6 +518,202 @@ impl Overlay {
             self.refresh_delta_file(&p, new_size, mtime)?;
             Ok(())
         })
+    }
+
+    /// The VM path a link's target sits at, with every link ancestor expanded, or the path itself when no
+    /// ancestor is a link. Mirrors what `vm_materialize_tree` does: a child of `/bin` (a symlink to
+    /// `/usr/bin`) belongs at `usr/bin`, and writing it literally at `bin/` collides with the link.
+    fn resolved_path(&self, p: &str, links: &std::collections::HashMap<String, String>) -> String {
+        match vm::resolve_parent_in_vm(p, links) {
+            Some(pv) => format!("{}/{}", pv.trim_end_matches('/'), Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+            None => p.to_string(),
+        }
+    }
+
+    /// Every symlink in the merged view, as (path, target).
+    fn view_links(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut out = std::collections::HashMap::new();
+        for (p, k) in self.all_paths()? {
+            if k != "symlink" { continue; }
+            if let Ok(t) = self.readlink(&p) { out.insert(p, t); }
+        }
+        Ok(out)
+    }
+
+    /// Materialise the merged view into `dest`, so a sandbox can run against it.
+    ///
+    /// The tree is built from Base and Delta together: Delta entries are applied over Base ones, and a
+    /// whiteout removes the Base entry. Writing the tree out is unavoidable for a sandbox that needs a
+    /// directory (bwrap binds one); the saving comes later, from `absorb_tree` writing back only the
+    /// paths that actually changed.
+    pub fn materialize(&self, dest: &Path) -> Result<usize> {
+        // Base first: every layer entry Base holds, then Delta on top
+        let mut n = 0usize;
+        let links = self.view_links()?;
+        let real: std::collections::HashSet<String> = self.all_paths()?.into_iter()
+            .filter(|(_, k)| k != "symlink").map(|(p, _)| p).collect();
+        {
+            let base_rows: Vec<(String, String, i64, Option<String>)> = {
+                let mut st = self.conn.prepare(
+                    "SELECT path, kind, mode, link_target FROM base.vm_fs WHERE path <> '/' ORDER BY length(path), path")?;
+                let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            for (p, kind, mode, target) in base_rows {
+                if vm::is_reserved_vm_path(&p) { continue; }
+                if self.whited_out(&p)? { continue; }
+                let target_p = self.resolved_path(&p, &links);
+                // a link that only aliases a real entry has no room in the tree; the real entry serves it
+                if target_p != p && real.contains(&target_p) { n += 1; continue; }
+                let host = dest.join(target_p.trim_start_matches('/'));
+                match kind.as_str() {
+                    "dir" => { std::fs::create_dir_all(&host)?; }
+                    "symlink" => {
+                        if let Some(t) = target {
+                            if let Some(par) = host.parent() { std::fs::create_dir_all(par)?; }
+                            let _ = std::fs::remove_file(&host);
+                            #[cfg(unix)] std::os::unix::fs::symlink(&t, &host)?;
+                        }
+                    }
+                    _ => {
+                        let data = self.read(&p)?;
+                        if let Some(par) = host.parent() { std::fs::create_dir_all(par)?; }
+                        let _ = std::fs::remove_file(&host);
+                        std::fs::write(&host, &data)?;
+                        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode as u32)); }
+                    }
+                }
+                n += 1;
+            }
+        }
+        // Delta rows: files, dirs, symlinks
+        let entries: Vec<(String, String, i64, i64, Option<String>)> = {
+            let mut st = self.conn.prepare(
+                "SELECT path, kind, mode, size, link_target FROM main.vm_fs ORDER BY length(path), path")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (p, kind, mode, _size, target) in entries {
+            if vm::is_reserved_vm_path(&p) { continue; }
+            let target_p = self.resolved_path(&p, &links);
+            if target_p != p && real.contains(&target_p) { n += 1; continue; }
+            let host = dest.join(target_p.trim_start_matches('/'));
+            match kind.as_str() {
+                "dir" => { std::fs::create_dir_all(&host)?; }
+                "symlink" => {
+                    if let Some(t) = target {
+                        if let Some(par) = host.parent() { std::fs::create_dir_all(par)?; }
+                        let _ = std::fs::remove_file(&host);
+                        #[cfg(unix)] std::os::unix::fs::symlink(&t, &host)?;
+                    }
+                }
+                _ => {
+                    let data = self.read(&p)?;
+                    if let Some(par) = host.parent() { std::fs::create_dir_all(par)?; }
+                    let _ = std::fs::remove_file(&host);
+                    std::fs::write(&host, &data)?;
+                    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode as u32)); }
+                }
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Write back only what changed in `tree`, compared with the merged view.
+    ///
+    /// A new or modified path goes through `write` / `write_range` / `mkdir` / `symlink`; a path that is
+    /// gone gets a whiteout. A path whose bytes already match the view produces nothing in Delta, which is
+    /// the whole point: a task that edits one file leaves one Delta entry, not a copy of the tree.
+    pub fn absorb_tree(&self, tree: &Path) -> Result<usize> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut written = 0usize;
+        for entry in walkdir::WalkDir::new(tree).follow_links(false).min_depth(1) {
+            let e = match entry { Ok(v) => v, Err(_) => continue };
+            let rel = e.path().strip_prefix(tree).unwrap_or(e.path()).to_string_lossy().to_string();
+            let p = crate::vm::normalize_vm_path(&format!("/{}", rel.trim_start_matches('/')));
+            if vm::is_reserved_vm_path(&p) { continue; }
+            seen.insert(p.clone());
+            let md = match std::fs::symlink_metadata(e.path()) { Ok(m) => m, Err(_) => continue };
+            let layer_kind = self.kind_in_overlay(&p)?;
+            let ft = md.file_type();
+            let host_kind = if ft.is_symlink() { "symlink" } else if md.is_dir() { "dir" } else { "file" };
+            // unchanged content is skipped: this is what keeps Delta small
+            match (host_kind, layer_kind.as_deref()) {
+                ("dir", Some("dir")) => continue,
+                ("symlink", Some("symlink")) => {
+                    let want = std::fs::read_link(e.path())?.to_string_lossy().to_string();
+                    if self.readlink(&p).map(|t| t == want).unwrap_or(false) { continue; }
+                    self.symlink(&p, &want)?;
+                }
+                ("file", Some("file")) => {
+                    let disk = std::fs::read(e.path())?;
+                    let now = self.read(&p)?;
+                    if disk == now { continue; }
+                    // a small change to a large file keeps copy-on-write: only the touched chunks move
+                    self.write_smallest(&p, &disk, &now)?;
+                }
+                _ => {
+                    match host_kind {
+                        "dir" => { self.mkdir(&p)?; }
+                        "symlink" => { let t = std::fs::read_link(e.path())?.to_string_lossy().to_string(); self.symlink(&p, &t)?; }
+                        _ => { let data = std::fs::read(e.path())?; self.write(&p, &data, 0o644, crate::vm::now_secs())?; }
+                    }
+                }
+            }
+            written += 1;
+        }
+        // paths in the view that the tree no longer has
+        let mut gone: Vec<String> = Vec::new();
+        for (p, kind) in self.all_paths()? {
+            if vm::is_reserved_vm_path(&p) { continue; }
+            if !seen.contains(&p) { let _ = kind; gone.push(p); }
+        }
+        for p in gone { self.remove(&p)?; written += 1; }
+        Ok(written)
+    }
+
+    /// Every path in the merged view (Base not shadowed by a whiteout, plus Delta).
+    fn all_paths(&self) -> Result<Vec<(String, String)>> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        {
+            let mut st = self.conn.prepare("SELECT path, kind FROM base.vm_fs WHERE path <> '/'")?;
+            for r in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+                let (p, k) = r?;
+                if self.whited_out(&p)? { continue; }
+                out.push((p, k));
+            }
+        }
+        {
+            let mut st = self.conn.prepare("SELECT path, kind FROM main.vm_fs WHERE path <> '/'")?;
+            for r in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write a file whose new content is already known, using `write_range` when only part changed.
+    fn write_smallest(&self, p: &str, disk: &[u8], now: &[u8]) -> Result<()> {
+        let cs = crate::vm::CHUNK_SIZE;
+        if disk.len() == now.len() {
+            // find the single changed chunk; if there is exactly one, move only that one
+            let mut changed: Vec<usize> = Vec::new();
+            let chunks = disk.len().div_ceil(cs);
+            for i in 0..chunks {
+                let a = &disk[i * cs..((i + 1) * cs).min(disk.len())];
+                let b = &now[i * cs..((i + 1) * cs).min(now.len())];
+                if a != b { changed.push(i); }
+            }
+            if changed.len() == 1 && chunks > 1 {
+                let i = changed[0];
+                let from = i * cs;
+                let to = ((i + 1) * cs).min(disk.len());
+                return self.write_range(p, from as u64, &disk[from..to], crate::vm::now_secs());
+            }
+        }
+        self.write(p, disk, 0o644, crate::vm::now_secs())
     }
 
     /// Make sure the Delta has a file row for `p` with the given size.

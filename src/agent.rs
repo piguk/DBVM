@@ -292,6 +292,65 @@ pub fn provision_agent(db: &Path, node: &Path, pi_dir: &Path) -> Result<Provisio
 }
 
 
+/// Run one task with `db` as a Delta over a read-only `base`.
+///
+/// Two tasks in parallel each get their own Delta, so neither can delete the other's writes: the failure
+/// mode of the tree-mirror path (a sync that deletes what its own tree does not show) cannot happen here,
+/// because each Delta is written back from its own tree only.
+pub fn run_agent_on_overlay(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
+    let base = opts.base.clone().ok_or_else(|| anyhow!("run_agent_on_overlay needs a base"))?;
+    if opts.task.trim().is_empty() { return Err(anyhow!("empty task")); }
+    if !bwrap_available() { return Err(anyhow!("bwrap is required for vm-agent; refusing to run unisolated")); }
+    let api_key = std::env::var(&opts.key_env)
+        .map_err(|_| anyhow!("{} is not set; the proxy needs the model credential", opts.key_env))?;
+    if api_key.is_empty() { return Err(anyhow!("{} is empty", opts.key_env)); }
+    let _lock = StepLock::acquire(db)?;   // one task at a time per Delta; other Deltas run freely
+    let ov = crate::overlay::Overlay::open(db, &base)?;
+    // use Overlay's connection: it is the only one with Base attached, so `base.*` queries work
+    let conn: &rusqlite::Connection = ov.conn();
+    let has_agent: i64 = conn.query_row(
+        "SELECT count(*) FROM base.vm_fs WHERE path='/opt/pi/dist/bundle/cli.js'", [], |r| r.get(0))?;
+    if has_agent == 0 {
+        return Err(anyhow!("the Base has no agent; run `vm-provision-agent {}` first", base.display()));
+    }
+    let (_, before) = vm::snapshot_create_named(conn, "agent-before", "vm-agent")?;
+    let scratch = ScratchDir::create("vm-agent-")?;
+    let started = Instant::now();
+    ov.materialize(scratch.path()).map_err(|e| anyhow!("materialize failed: {}", e))?;
+
+    let agent_dir = scratch.path().join("opt/piagent");
+    std::fs::create_dir_all(&agent_dir)?;
+    std::fs::write(agent_dir.join("models.json"), model_config(&opts.model, opts.forward_port))?;
+    std::fs::write(agent_dir.join("settings.json"), agent_settings(&opts.model))?;
+    std::fs::create_dir_all(scratch.path().join("opt"))?;
+    std::fs::write(scratch.path().join("opt/fwd.cjs"), crate::proxy::FORWARDER_JS)?;
+    std::fs::create_dir_all(scratch.path().join("tmp"))?;
+    let sock = scratch.path().join("tmp/proxy.sock");
+    let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
+    let proxy = crate::proxy::Proxy::bind(&sock, upstream, &prefix)?;
+    let outcome = run_agent_in(scratch.path(), &sock, opts);
+    drop(proxy);
+    let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome?;
+    for rel in ["opt/piagent/models.json", "opt/piagent/settings.json", "opt/fwd.cjs", "opt/run-agent.sh", "tmp/proxy.sock", "tmp/fwd.log"] {
+        scratch.remove(rel);
+    }
+    ov.absorb_tree(scratch.path())?;
+    let changes = vm::snapshot_diff_live(conn, &before)?;
+    let failed = exit_code != 0 || timed_out;
+    let rolled_back = failed && opts.rollback_on_fail;
+    let after_name = if rolled_back { vm::snapshot_restore(conn, &before)?; None }
+        else { let (_, a) = vm::snapshot_create_named(conn, "agent-after", "vm-agent")?; Some(a) };
+    let duration_ms = started.elapsed().as_millis();
+    let diff_json = diff_to_json(&changes);
+    conn.execute(
+        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![format!("vm-agent: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
+                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
+    let step_id = conn.last_insert_rowid();
+    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+}
+
 /// Record a run whose synced content could not be applied, then report the failure.
 ///
 /// A refused write (a policy rule, for example) aborts the sync. The run still happened, so it must be
@@ -363,6 +422,9 @@ pub struct AgentOptions {
     pub task: String,
     /// Resource limits for the sandbox. 0 disables that limit.
     pub limits: Limits,
+    /// Run against a read-only Base with `db` as its Delta (one Delta per task). Empty means the database
+    /// is standalone.
+    pub base: Option<std::path::PathBuf>,
 }
 
 /// Resource limits applied inside the sandbox.
