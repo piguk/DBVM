@@ -8,5 +8,6 @@ pub mod agent;
 pub mod policy;
 pub mod inject;
 pub mod owner;
+pub mod proxy;
 #[cfg(feature = "fuse")]
 pub mod fuse;
