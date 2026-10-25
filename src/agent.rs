@@ -292,6 +292,91 @@ pub fn provision_agent(db: &Path, node: &Path, pi_dir: &Path) -> Result<Provisio
 }
 
 
+/// Run one task with the sandbox bound to a FUSE mount instead of a materialised tree.
+///
+/// What this buys: no `/tmp` tree (nothing is unpacked), and a write is applied to the database as the
+/// sandbox makes it, so a refused write fails the command itself rather than the write-back afterwards.
+/// The mount is created for the duration of the run and dropped afterwards.
+#[cfg(feature = "fuse")]
+pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
+    if opts.task.trim().is_empty() { return Err(anyhow!("empty task")); }
+    if !bwrap_available() { return Err(anyhow!("bwrap is required for vm-agent; refusing to run unisolated")); }
+    let api_key = std::env::var(&opts.key_env)
+        .map_err(|_| anyhow!("{} is not set; the proxy needs the model credential", opts.key_env))?;
+    if api_key.is_empty() { return Err(anyhow!("{} is empty", opts.key_env)); }
+    let _lock = StepLock::acquire(db)?;
+    let conn = vm::vm_open(db.to_str().ok_or_else(|| anyhow!("non-utf8 db path"))?)?;
+    let has_agent: i64 = conn.query_row(
+        "SELECT count(*) FROM vm_fs WHERE path='/opt/pi/dist/bundle/cli.js'", [], |r| r.get(0))?;
+    if has_agent == 0 {
+        return Err(anyhow!("this VM has no agent; run `vm-provision-agent {}` first", db.display()));
+    }
+    let (_, before) = vm::snapshot_create_named(&conn, "agent-before", "vm-agent")?;
+    let started = Instant::now();
+
+    // A mount point and a working directory for the proxy socket: both outside the VM.
+    let work = scratch_base("vm-agent-fuse-")?;
+    let mnt = work.join("mnt");
+    std::fs::create_dir_all(&mnt)?;
+    let mount = crate::fuse::fuse_impl::mount_vm_background(db.to_str().unwrap(), mnt.to_str().unwrap())?;
+    // A fresh agent directory per run: pi writes its session transcript there, and a leftover transcript
+    // from an earlier run makes the next run fail with EEXIST on the session file (measured).
+    let agent_dir = format!("opt/piagent-{}", now_millis());
+    // the agent's own settings live in the VM so the run stays reproducible
+    for (rel, body) in [(format!("{}/models.json", agent_dir), model_config(&opts.model, opts.forward_port)),
+                        (format!("{}/settings.json", agent_dir), agent_settings(&opts.model)),
+                        ("opt/fwd.cjs".to_string(), crate::proxy::FORWARDER_JS.to_string())] {
+        let host = mnt.join(rel);
+        if let Some(par) = host.parent() { let _ = std::fs::create_dir_all(par); }
+        std::fs::write(&host, body)?;
+    }
+    let proxy_dir = work.join("proxy");
+    std::fs::create_dir_all(&proxy_dir)?;
+    let sock = proxy_dir.join("proxy.sock");
+    let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
+    let proxy = crate::proxy::Proxy::bind(&sock, upstream, &prefix)?;
+    let outcome = run_agent_in(&mnt, &sock, opts, &agent_dir);
+    drop(proxy);
+    drop(mount);
+    // remove the scaffolding the run itself created, so it does not show up as a task change
+    for rel in [agent_dir.as_str(), "opt/fwd.cjs", "opt/run-agent.sh"] {
+        let host = mnt.join(rel);
+        let _ = std::fs::remove_file(&host);
+        let _ = std::fs::remove_dir_all(&host);
+    }
+    let outcome = outcome?;
+    let _ = std::fs::remove_dir_all(&work);
+    let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
+    let changes = vm::snapshot_diff_live(&conn, &before)?;
+    let failed = exit_code != 0 || timed_out;
+    let rolled_back = failed && opts.rollback_on_fail;
+    let after_name = if rolled_back { vm::snapshot_restore(&conn, &before)?; None }
+        else { let (_, a) = vm::snapshot_create_named(&conn, "agent-after", "vm-agent")?; Some(a) };
+    let duration_ms = started.elapsed().as_millis();
+    let diff_json = diff_to_json(&changes);
+    conn.execute(
+        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![format!("vm-agent --fuse: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
+                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
+    let step_id = conn.last_insert_rowid();
+    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+}
+
+/// Milliseconds since the epoch, used to give each run its own agent directory.
+fn now_millis() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+/// Whether `root` accepts new files (a materialised tree does, a FUSE mount may not).
+fn allows_write(root: &Path) -> bool {
+    let probe = root.join(".write-probe");
+    match std::fs::write(&probe, b"x") { Ok(()) => { let _ = std::fs::remove_file(&probe); true } Err(_) => false }
+}
+
+/// A scratch directory that is removed by the caller (the fuse path keeps it until the mount is gone).
+fn scratch_base(prefix: &str) -> Result<std::path::PathBuf> { vm::make_tmp_dir(prefix) }
+
 /// Run one task with `db` as a Delta over a read-only `base`.
 ///
 /// Two tasks in parallel each get their own Delta, so neither can delete the other's writes: the failure
@@ -328,7 +413,7 @@ pub fn run_agent_on_overlay(db: &Path, opts: &AgentOptions) -> Result<StepResult
     let sock = scratch.path().join("tmp/proxy.sock");
     let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
     let proxy = crate::proxy::Proxy::bind(&sock, upstream, &prefix)?;
-    let outcome = run_agent_in(scratch.path(), &sock, opts);
+    let outcome = run_agent_in(scratch.path(), &sock, opts, "/opt/piagent");
     drop(proxy);
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome?;
     for rel in ["opt/piagent/models.json", "opt/piagent/settings.json", "opt/fwd.cjs", "opt/run-agent.sh", "tmp/proxy.sock", "tmp/fwd.log"] {
@@ -425,6 +510,9 @@ pub struct AgentOptions {
     /// Run against a read-only Base with `db` as its Delta (one Delta per task). Empty means the database
     /// is standalone.
     pub base: Option<std::path::PathBuf>,
+    /// Mount the VM instead of materialising it: the sandbox binds the mount point, so nothing is unpacked
+    /// to /tmp and writes reach the database as they happen.
+    pub fuse: bool,
 }
 
 /// Resource limits applied inside the sandbox.
@@ -512,7 +600,7 @@ pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
     let proxy = crate::proxy::Proxy::bind(&sock, upstream, &prefix)?;
 
-    let outcome = run_agent_in(scratch.path(), &sock, opts);
+    let outcome = run_agent_in(scratch.path(), &sock, opts, "/opt/piagent");
     drop(proxy);
     let outcome = outcome?;
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
@@ -587,13 +675,17 @@ while [ $i -lt 400 ]; do
   i=$((i+1))
   sleep 0.05
 done
-HOME=/opt/home PI_CODING_AGENT_DIR=/opt/piagent /usr/bin/node /opt/pi/dist/bundle/cli.js --print "$VM_AGENT_TASK"
+HOME=/opt/home PI_CODING_AGENT_DIR="$VM_AGENT_DIR" /usr/bin/node /opt/pi/dist/bundle/cli.js --print "$VM_AGENT_TASK"
 "#;
 
 /// Run the agent in the sandbox: bind the proxy socket in, then run the script above.
-fn run_agent_in(root: &Path, proxy_sock: &Path, opts: &AgentOptions) -> Result<Outcome> {
-    // the script lives in the tree that is bound as the sandbox root
-    std::fs::write(root.join("opt/run-agent.sh"), RUN_AGENT_SH)?;
+fn run_agent_in(root: &Path, proxy_sock: &Path, opts: &AgentOptions, agent_dir: &str) -> Result<Outcome> {
+    // The script must not be written into a FUSE-mounted root: bwrap cannot create files there (measured:
+    // "Can't create file /tmp/proxy.sock: Input/output error"). It is passed through the environment and
+    // written into /tmp by the shell instead, which works for both a mount and a materialised tree.
+    // The script is passed in through the environment (see below); a copy in the tree is only written
+    // when the tree accepts writes, which keeps the older materialised path unchanged.
+    if allows_write(root) && root.join("opt").is_dir() { let _ = std::fs::write(root.join("opt/run-agent.sh"), RUN_AGENT_SH); }
     let mut cmd = Command::new("bwrap");
     cmd.arg("--bind").arg(root).arg("/")
         .arg("--dev").arg("/dev")
@@ -601,13 +693,20 @@ fn run_agent_in(root: &Path, proxy_sock: &Path, opts: &AgentOptions) -> Result<O
         .arg("--unshare-pid")
         .arg("--unshare-net")
         .arg("--die-with-parent")
-        .arg("--bind").arg(proxy_sock).arg("/tmp/proxy.sock")
+        // Bind the directory that holds the socket, not the socket itself: bwrap must create the mount
+        // point, and it cannot create files on a FUSE-mounted root (measured: "Can't create file
+        // /tmp/proxy.sock: Input/output error"). /tmp inside the sandbox is the proxy's own directory.
+        .arg("--bind").arg(proxy_sock.parent().unwrap_or(Path::new("/tmp"))).arg("/tmp")
         .arg("--chdir").arg("/")
-        .arg("/bin/sh").arg("-c").arg(format!("{}. /opt/run-agent.sh", opts.limits.ulimit_prelude()));
+        .arg("/bin/sh").arg("-c")
+        .arg(format!("printf '%s' \"$VM_AGENT_SCRIPT\" > /tmp/run-agent.sh; {}. /tmp/run-agent.sh",
+            opts.limits.ulimit_prelude()));
     // a clean environment: nothing from the host leaks in, and the credential is not here at all
     cmd.env_clear();
     cmd.env("PATH", "/usr/bin:/bin");
     cmd.env("VM_AGENT_TASK", &opts.task);
+    cmd.env("VM_AGENT_SCRIPT", RUN_AGENT_SH);
+    cmd.env("VM_AGENT_DIR", agent_dir);
     cmd.env("VM_AGENT_PORT", opts.forward_port.to_string());
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| anyhow!("spawn bwrap: {}", e))?;

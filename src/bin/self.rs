@@ -77,6 +77,8 @@ enum Cmd {
              #[arg(long, default_value_t=1024, help="RLIMIT_FSIZE in MiB for the agent; 0 = unlimited")] file_mb: u32,
              #[arg(long, help="read-only Base database; <DB> becomes a Delta on top of it")]
              base: Option<String>,
+             #[arg(long, help="EXPERIMENTAL: bind the sandbox to a FUSE mount instead of unpacking to /tmp. The mount serves the whole VM and the agent starts, but pi's session file is opened with O_EXCL, which this FUSE layer answers with an error, so the run fails. Kept for further work; the materialised path stays the default.")]
+             fuse: bool,
              task: String },
     /// Host-side model proxy: a unix socket the sandboxed agent reaches without network access.
     VmProxy{ #[arg(long)] base: String, #[arg(long)] key_env: String, socket: String,
@@ -506,14 +508,17 @@ fn main() -> anyhow::Result<()> {
             selfdb::vm::snapshot_restore(&c, &name)?;
             println!("rolled back to {}", name);
         },
-        Cmd::VmAgent{db, timeout, rollback_on_fail, model_base, key_env, model, port, max_output, mem_mb, cpu_secs, file_mb, base, task} => {
+        Cmd::VmAgent{db, timeout, rollback_on_fail, model_base, key_env, model, port, max_output, mem_mb, cpu_secs, file_mb, base, fuse, task} => {
             let opts = selfdb::agent::AgentOptions {
                 rollback_on_fail, timeout_secs: timeout, max_output_bytes: max_output,
                 model_base, key_env, model, forward_port: port, task,
                 limits: selfdb::agent::Limits { address_space_mb: mem_mb, cpu_secs, file_size_mb: file_mb, processes: 0 },
                 base: base.map(std::path::PathBuf::from),
+                fuse,
             };
-            let r = if opts.base.is_some() {
+            let r = if fuse {
+                run_fused(std::path::Path::new(&db), &opts)?
+            } else if opts.base.is_some() {
                 selfdb::agent::run_agent_on_overlay(std::path::Path::new(&db), &opts)?
             } else {
                 selfdb::agent::run_agent(std::path::Path::new(&db), &opts)?
@@ -874,6 +879,15 @@ enum PolicyAction {
     AddMaxSize { bytes: u64 },
     /// Remove a rule by id (see list).
     Remove { id: i64 },
+}
+
+/// Dispatch to the FUSE path when the binary was built with it, with a clear error otherwise.
+fn run_fused(db: &std::path::Path, opts: &selfdb::agent::AgentOptions) -> anyhow::Result<selfdb::agent::StepResult> {
+    #[cfg(feature = "fuse")] { return selfdb::agent::run_agent_fused(db, opts); }
+    #[cfg(not(feature = "fuse"))] {
+        let _ = (db, opts);
+        anyhow::bail!("--fuse needs a binary built with --features fuse")
+    }
 }
 
 /// The pi package directory: alongside the node binary when installed globally, else the npm default.

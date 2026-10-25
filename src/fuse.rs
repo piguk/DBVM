@@ -210,7 +210,12 @@ pub mod fuse_impl {
 
     impl Filesystem for VmFuse {
         fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::result::Result<(), c_int> {
-            // rebuild already done
+            // Announce the atomic-create capability. Without it the kernel does not deliver O_EXCL creates
+            // to `create` and reports an I/O error instead (measured: node's `flag: 'wx'` failed while
+            // 'w'/'a' succeeded, and `create` was never called). pi opens its session file that way.
+            if let Err(e) = _config.add_capabilities(1 << 3 /* FUSE_ATOMIC_O_TRUNC */) {
+                eprintln!("vm-fuse: FUSE_ATOMIC_O_TRUNC not accepted: {}", e);
+            }
             Ok(())
         }
         fn destroy(&mut self) {
@@ -387,6 +392,25 @@ pub mod fuse_impl {
             reply.statfs(blocks, 0, 0, files, 0, bsize, 255, bsize);
         }
         fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
+            // O_CREAT without O_EXCL on an existing file must open it, not fail. pi opens its session file
+            // repeatedly; answering EEXIST made every run fail (measured).
+            if let Err(why) = self.ensure_not_exists(parent, name) {
+                let parent_path = match self.ino_to_path.get(&parent) {
+                    Some(p) => p.clone(),
+                    // the parent inode is unknown: that is missing, not existing
+                    None => { reply.error(libc::ENOENT); return; }
+                };
+                let _ = why;
+                let n = name.to_string_lossy().to_string();
+                let p = normalize_vm_path(&if parent_path == "/" { format!("/{}", n) } else { format!("{}/{}", parent_path, n) });
+                if let Some(&ino) = self.path_to_ino.get(&p) {
+                    if self.ino_to_kind.get(&ino).map(|k| k == "file").unwrap_or(false) {
+                        if let Some(attr) = self.ino_to_attr.get(&ino) { reply.created(&TTL, attr, 0, 0, flags as u32); return; }
+                    }
+                }
+                reply.error(libc::EEXIST);
+                return;
+            }
             let new_path = match self.ensure_not_exists(parent, name) {
                 Ok(p) => p,
                 Err(_) => { reply.error(libc::EEXIST); return; }
@@ -394,8 +418,9 @@ pub mod fuse_impl {
             let perm = mode & 0o7777;
             let now = now_secs();
             let conn = &self.conn;
-            if let Err(_) = vm_add_bytes(&conn, &new_path, &[], perm as i64, now) {
-                reply.error(libc::EIO);
+            if let Err(e) = vm_add_bytes(&conn, &new_path, &[], perm as i64, now) {
+                eprintln!("vm-fuse create {}: {}", new_path, e);
+                reply.error(if crate::policy::is_refusal(&e) { libc::EACCES } else { libc::EIO });
                 return;
             }
             let ino = self.next_ino;
@@ -422,9 +447,28 @@ pub mod fuse_impl {
                 flags: 0,
             };
             self.ino_to_attr.insert(ino, attr);
-            reply.created(&TTL, &attr, 0, 0, flags as u32);
+            reply.created(&TTL, &attr, 0, ino, flags as u32);
         }
         fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
+            // mkdir on an existing directory is success (EEXIST only if it is not a directory): pi creates
+            // its session directory on every run.
+            if let Err(why) = self.ensure_not_exists(parent, name) {
+                let parent_path = match self.ino_to_path.get(&parent) {
+                    Some(p) => p.clone(),
+                    // the parent inode is unknown: that is missing, not existing
+                    None => { reply.error(libc::ENOENT); return; }
+                };
+                let _ = why;
+                let n = name.to_string_lossy().to_string();
+                let p = normalize_vm_path(&if parent_path == "/" { format!("/{}", n) } else { format!("{}/{}", parent_path, n) });
+                if let Some(&ino) = self.path_to_ino.get(&p) {
+                    if self.ino_to_kind.get(&ino).map(|k| k == "dir").unwrap_or(false) {
+                        if let Some(attr) = self.ino_to_attr.get(&ino) { reply.entry(&TTL, attr, 0); return; }
+                    }
+                }
+                reply.error(libc::EEXIST);
+                return;
+            }
             let new_path = match self.ensure_not_exists(parent, name) {
                 Ok(p) => p,
                 Err(_) => { reply.error(libc::EEXIST); return; }
@@ -669,8 +713,9 @@ pub mod fuse_impl {
             }
             let now = now_secs();
             let conn = &self.conn;
-            if let Err(_) = vm_add_bytes(&conn, &new_path, &[], perm as i64, now) {
-                reply.error(libc::EIO); return;
+            if let Err(e) = vm_add_bytes(&conn, &new_path, &[], perm as i64, now) {
+                eprintln!("vm-fuse mknod {}: {}", new_path, e);
+                reply.error(if crate::policy::is_refusal(&e) { libc::EACCES } else { libc::EIO }); return;
             }
             let ino = self.next_ino;
             self.next_ino += 1;
