@@ -97,25 +97,35 @@ fn the_guest_reaches_the_upstream_and_never_sees_the_key() {
     for _ in 0..50 { if sock.exists() { break; } std::thread::sleep(std::time::Duration::from_millis(50)); }
     assert!(sock.exists(), "proxy socket must exist");
 
-    let script = r#"
-fetch('http://127.0.0.1:18081/v1/chat/completions', {method:'POST',headers:{'content-type':'application/json'},body:'{}'})
-  .then(r=>r.text()).then(t=>{console.log('BODY:'+t);process.exit(0)})
-  .catch(e=>{console.log('FAIL:'+e.message);process.exit(1)});
-"#;
+    // A fixed port here made the suite flaky: another test could hold 18081 at the same moment, since
+    // cargo runs test binaries in parallel. Bind a free port on the host to learn a number that is free,
+    // then use it inside the sandbox.
+    let free_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let script = format!(r#"
+fetch('http://127.0.0.1:{p}/v1/chat/completions', {{method:'POST',headers:{{'content-type':'application/json'}},body:'{{}}'}})
+  .then(r=>r.text()).then(t=>{{console.log('BODY:'+t);process.exit(0)}})
+  .catch(e=>{{console.log('FAIL:'+e.message);process.exit(1)}});
+"#, p = free_port);
     let ask = d.join("ask.js");
     std::fs::write(&ask, script).unwrap();
+    // the socket path inside the sandbox is unique per test as well
+    let guest_sock = format!("/tmp/proxy-{}.sock", std::process::id());
     // env -i: nothing from this process is inherited, so a key could only come from the sandbox itself
     let out = std::process::Command::new("env")
         .args(["-i", "PATH=/usr/bin:/bin", "HOME=/tmp"])
         .arg("bwrap")
         .args(["--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-pid", "--unshare-net",
-               "--die-with-parent", "--bind", sock.to_str().unwrap(), "/tmp/proxy.sock"])
+               "--die-with-parent", "--bind", sock.to_str().unwrap(), guest_sock.as_str()])
         .arg("/bin/sh").arg("-c").arg(format!(
             "echo IFACES:$(tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | tr '\\n' ' '); \
-             PROXY_SOCK=/tmp/proxy.sock PROXY_PORT=18081 {} {} >/dev/null 2>&1 & sleep 2; \
-             {} {}; \
-             grep -c sk- /proc/self/environ 2>/dev/null > /tmp/keycount.txt || true",
-            node.display(), fwd.display(), node.display(), ask.display()))
+             PROXY_SOCK={gsock} PROXY_PORT={port} {node} {fwd} >/dev/null 2>&1 & sleep 2; \
+             {node} {ask}; \
+             grep -c sk- /proc/self/environ 2>/dev/null > /tmp/keycount-{pid}.txt || true",
+            gsock = guest_sock, port = free_port,
+            node = node.display(), fwd = fwd.display(), ask = ask.display(), pid = std::process::id()))
         .output().expect("bwrap");
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(text.contains("BODY:"), "guest must get a response: {}", text);

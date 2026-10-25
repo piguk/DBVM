@@ -290,24 +290,32 @@ fn a_real_multi_step_task_is_audited_and_rolled_back() {
 /// A failed run must not leave its materialised tree behind.
 ///
 /// Measured before the guard existed: three failed runs left 539 MB under /tmp, because the paths after
-/// the proxy was bound returned with `?` and never cleaned up. This counts the scratch directories
-/// before and after a run that is expected to fail.
+/// the proxy was bound returned with `?` and never cleaned up.
+///
+/// The count runs in a private temp directory (`TMPDIR` set for this process only), because cargo runs
+/// test binaries in parallel: counting scratch directories under the shared /tmp saw another test's
+/// `agent-step-*` appear mid-run and failed intermittently. With TMPDIR set, `make_tmp_dir` creates its
+/// trees inside it and nothing else touches that directory.
 #[test]
 fn a_failed_step_leaves_no_scratch_directory() {
     if !bwrap_ok() { eprintln!("skip: bwrap not available"); return; }
-    fn count() -> usize {
-        let dir = std::env::temp_dir();
-        std::fs::read_dir(&dir).map(|it| it.filter_map(|e| e.ok())
+    let base = std::env::temp_dir().join(format!("scrub-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let private_tmp = base.join("tmp");
+    std::fs::create_dir_all(&private_tmp).unwrap();
+    // SAFETY: single-threaded within this test; the value is only read by paths created during it.
+    // Scoped as tightly as possible: it is set, the run happens, the count is taken, then it is cleared.
+    unsafe { std::env::set_var("TMPDIR", &private_tmp); }
+
+    let count = || -> usize {
+        std::fs::read_dir(&private_tmp).map(|it| it.filter_map(|e| e.ok())
             .filter(|e| {
                 let n = e.file_name().to_string_lossy().to_string();
                 n.starts_with("agent-step-") || n.starts_with("vm-agent-")
             }).count()).unwrap_or(0)
-    }
-    let before = count();
-    let d = std::env::temp_dir().join(format!("scrub-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    let db = d.join("v.db");
+    };
+    let db = base.join("v.db");
     {
         let c = vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap();
         vm::vm_import_closure(&c, "/bin/sh", "/").unwrap();
@@ -317,8 +325,9 @@ fn a_failed_step_leaves_no_scratch_directory() {
     // this run fails by design: the policy refuses the write on the way back
     let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "echo X > /tests/eval.sh".into()],
         &agent::StepOptions { rollback_on_fail: false, timeout_secs: 60, max_output_bytes: 1 << 20 });
+    let left = count();
+    unsafe { std::env::remove_var("TMPDIR"); }
     assert!(r.is_err(), "the run is expected to fail");
-    let after = count();
-    assert_eq!(after, before, "a failed run must leave no scratch tree (before {}, after {})", before, after);
-    let _ = std::fs::remove_dir_all(&d);
+    assert_eq!(left, 0, "a failed run must leave no scratch tree, found {}", left);
+    let _ = std::fs::remove_dir_all(&base);
 }
