@@ -77,12 +77,16 @@ enum Cmd {
              #[arg(long, default_value_t=1024, help="RLIMIT_FSIZE in MiB for the agent; 0 = unlimited")] file_mb: u32,
              #[arg(long, help="read-only Base database; <DB> becomes a Delta on top of it")]
              base: Option<String>,
+             #[arg(long, default_value="", help="comma-separated hosts the agent may fetch packages from via /pkg/<host>/<path>")]
+             allow_hosts: String,
              #[arg(long, help="EXPERIMENTAL: bind the sandbox to a FUSE mount instead of unpacking to /tmp. The mount serves the whole VM and the agent starts, but pi's session file is opened with O_EXCL, which this FUSE layer answers with an error, so the run fails. Kept for further work; the materialised path stays the default.")]
              fuse: bool,
              task: String },
     /// Host-side model proxy: a unix socket the sandboxed agent reaches without network access.
     VmProxy{ #[arg(long)] base: String, #[arg(long)] key_env: String, socket: String,
-             #[arg(long, default_value_t=18081)] port: u16, #[arg(long)] forwarder: Option<String> },
+             #[arg(long, default_value_t=18081)] port: u16, #[arg(long)] forwarder: Option<String>,
+             #[arg(long, default_value="", help="comma-separated hosts allowed for package downloads via /pkg/<host>/<path>")]
+             allow_hosts: String },
     /// Put node and the pi coding agent into a VM, so `pi` can run inside it.
     VmProvisionAgent{ db: String, #[arg(long)] node: Option<String>, #[arg(long)] pi: Option<String>,
                       #[arg(long, default_value="minimal", help="system tools to install: none, minimal or dev (git, coreutils, python3+stdlib, make, gcc)")]
@@ -510,13 +514,14 @@ fn main() -> anyhow::Result<()> {
             selfdb::vm::snapshot_restore(&c, &name)?;
             println!("rolled back to {}", name);
         },
-        Cmd::VmAgent{db, timeout, rollback_on_fail, model_base, key_env, model, port, max_output, mem_mb, cpu_secs, file_mb, base, fuse, task} => {
+        Cmd::VmAgent{db, timeout, rollback_on_fail, model_base, key_env, model, port, max_output, mem_mb, cpu_secs, file_mb, base, fuse, allow_hosts, task} => {
             let opts = selfdb::agent::AgentOptions {
                 rollback_on_fail, timeout_secs: timeout, max_output_bytes: max_output,
                 model_base, key_env, model, forward_port: port, task,
                 limits: selfdb::agent::Limits { address_space_mb: mem_mb, cpu_secs, file_size_mb: file_mb, processes: 0 },
                 base: base.map(std::path::PathBuf::from),
                 fuse,
+                allow_hosts: allow_hosts.split(',').map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).collect(),
             };
             let r = if fuse {
                 run_fused(std::path::Path::new(&db), &opts)?
@@ -534,7 +539,7 @@ fn main() -> anyhow::Result<()> {
                 r.changes.created.len(), r.changes.modified.len(), r.changes.deleted.len(), r.duration_ms);
             std::process::exit(r.exit_code);
         }
-        Cmd::VmProxy{base, key_env, socket, port, forwarder} => {
+        Cmd::VmProxy{base, key_env, socket, port, forwarder, allow_hosts} => {
             let key = std::env::var(&key_env).unwrap_or_default();
             if key.is_empty() { eprintln!("{} is not set (or empty)", key_env); std::process::exit(2); }
             let (up, prefix) = selfdb::proxy::Upstream::from_base_url(&base, &key)?;
@@ -552,7 +557,9 @@ fn main() -> anyhow::Result<()> {
                 unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t); }
             }
             STOP_FLAG.with(|f| *f.borrow_mut() = Some(stop.clone()));
-            selfdb::proxy::serve_until_stopped(std::path::Path::new(&socket), up, &prefix, stop)?;
+            let allow = selfdb::proxy::AllowList::parse(&allow_hosts);
+            if !allow.hosts.is_empty() { eprintln!("package hosts allowed: {:?}", allow.hosts); }
+            selfdb::proxy::serve_until_stopped_with(std::path::Path::new(&socket), up, &prefix, allow, stop)?;
             eprintln!("proxy stopped");
         }
         Cmd::VmProvisionAgent{db, node, pi, tools} => {

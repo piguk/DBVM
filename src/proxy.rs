@@ -54,6 +54,29 @@ impl Upstream {
     }
 }
 
+/// Which extra hosts the guest may reach, and under which path prefix.
+///
+/// Everything else is refused. The guest cannot widen this: it is host-side state, and a request names its
+/// destination only through the prefix, so an unlisted host is rejected before any connection is made.
+#[derive(Debug, Clone, Default)]
+pub struct AllowList {
+    pub hosts: Vec<String>,
+}
+
+impl AllowList {
+    /// Parse `host1,host2` (host names, optional `:port`). Empty means "no package access".
+    pub fn parse(spec: &str) -> AllowList {
+        AllowList { hosts: spec.split(',').map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).collect() }
+    }
+    fn allows(&self, host: &str) -> bool {
+        self.hosts.iter().any(|h| h == host)
+    }
+}
+
+/// Requests the guest sends to `<prefix>/<host>/<path>` are forwarded to `https://<host>/<path>` when the
+/// host is allowed; anything else is refused with 403 and a message the guest can read.
+pub const PACKAGE_PREFIX: &str = "/pkg";
+
 /// A running proxy bound to a socket path; dropping it stops the loop and removes the socket.
 pub struct Proxy {
     socket: PathBuf,
@@ -64,13 +87,18 @@ pub struct Proxy {
 impl Proxy {
     /// Bind `socket` and serve on a background thread.
     pub fn bind(socket: &Path, upstream: Upstream, path_prefix: &str) -> Result<Proxy> {
+        Proxy::bind_with(socket, upstream, path_prefix, AllowList::default())
+    }
+
+    /// Bind with an allowlist for package downloads.
+    pub fn bind_with(socket: &Path, upstream: Upstream, path_prefix: &str, allow: AllowList) -> Result<Proxy> {
         let listener = bind_listener(socket)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let pre = path_prefix.to_string();
         let listener_thread = listener;
         let handle = std::thread::spawn(move || {
-            serve_loop(listener_thread, upstream, pre, stop2);
+            serve_loop(listener_thread, upstream, pre, allow, stop2);
         });
         Ok(Proxy { socket: socket.to_path_buf(), stop, handle: Some(handle) })
     }
@@ -100,13 +128,13 @@ fn bind_listener(socket: &Path) -> Result<UnixListener> {
 
 /// Accept and serve until `stop` is set. Polls with a short sleep so a stop request is noticed even
 /// when no connection arrives.
-fn serve_loop(listener: UnixListener, upstream: Upstream, prefix: String, stop: Arc<AtomicBool>) {
+fn serve_loop(listener: UnixListener, upstream: Upstream, prefix: String, allow: AllowList, stop: Arc<AtomicBool>) {
     let _ = listener.set_nonblocking(true);
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((c, _)) => {
-                let (up, pre) = (upstream.clone(), prefix.clone());
-                std::thread::spawn(move || { let _ = serve(c, &up, &pre); });
+                let (up, pre, al) = (upstream.clone(), prefix.clone(), allow.clone());
+                std::thread::spawn(move || { let _ = serve(c, &up, &pre, &al); });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -120,14 +148,19 @@ fn serve_loop(listener: UnixListener, upstream: Upstream, prefix: String, stop: 
 /// that waited on stdin would return at once when stdin is not a terminal, dropping the proxy and
 /// removing the socket before any guest could use it.
 pub fn serve_until_stopped(socket: &Path, upstream: Upstream, path_prefix: &str, stop: Arc<AtomicBool>) -> Result<()> {
+    serve_until_stopped_with(socket, upstream, path_prefix, AllowList::default(), stop)
+}
+
+/// As `serve_until_stopped`, with an allowlist for package hosts.
+pub fn serve_until_stopped_with(socket: &Path, upstream: Upstream, path_prefix: &str, allow: AllowList, stop: Arc<AtomicBool>) -> Result<()> {
     let l = bind_listener(socket)?;
-    serve_loop(l, upstream, path_prefix.to_string(), stop);
+    serve_loop(l, upstream, path_prefix.to_string(), allow, stop);
     let _ = std::fs::remove_file(socket);
     Ok(())
 }
 
 /// Serve one guest connection: read its HTTP request, forward it upstream, relay the response.
-fn serve(mut guest: UnixStream, up: &Upstream, prefix: &str) -> Result<()> {
+fn serve(mut guest: UnixStream, up: &Upstream, prefix: &str, allow: &AllowList) -> Result<()> {
     let mut buf = vec![0u8; 65536];
     let mut head = Vec::new();
     loop {
@@ -172,6 +205,40 @@ fn serve(mut guest: UnixStream, up: &Upstream, prefix: &str) -> Result<()> {
         }
     }
 
+    // Two shapes of request:
+    //   <prefix>/...            the model endpoint (the only thing a task needs)
+    //   /pkg/<host>/<path>      a package download, allowed only for listed hosts
+    if let Some(rest) = path.strip_prefix(PACKAGE_PREFIX) {
+        let rest = rest.trim_start_matches('/');
+        let (host, sub) = match rest.split_once('/') {
+            Some((h, p)) => (h.to_string(), format!("/{}", p)),
+            None => (rest.to_string(), "/".to_string()),
+        };
+        if host.is_empty() || !allow.allows(&host) {
+            let body = format!("refused by the VM proxy: {} is not an allowed package host", if host.is_empty() { "<none>" } else { &host });
+            eprintln!("proxy: refused package request for {:?}", host);
+            let resp = format!("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            guest.write_all(resp.as_bytes())?;
+            let _ = guest.flush();
+            return Ok(());
+        }
+        // A host may carry an explicit port; a package registry is https. Tests point at a local http stub
+        // by naming its port, so the scheme follows the port: 443 means TLS, anything else is plain.
+        let (host_only, port) = match host.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.to_string()),
+            None => (host.clone(), "443".to_string()),
+        };
+        let scheme = if port == "443" { "https" } else { "http" };
+        let pkg_up = Upstream { host: if scheme == "https" { format!("{}:443", host_only) } else { format!("{}:{}", host_only, port) },
+                                scheme: scheme.into(), api_key: String::new() };
+        let mut hdrs = forwarded.clone();
+        // no credential for third-party hosts
+        hdrs.retain(|h| !h.to_ascii_lowercase().starts_with("authorization:"));
+        let response = forward(&pkg_up, &method, &sub, &version, &hdrs, &body)?;
+        guest.write_all(&response)?;
+        let _ = guest.flush();
+        return Ok(());
+    }
     let full_path = format!("{}{}", prefix.trim_end_matches('/'), path);
     let response = forward(up, &method, &full_path, &version, &forwarded, &body)?;
     guest.write_all(&response)?;

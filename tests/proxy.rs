@@ -184,3 +184,45 @@ fn the_guest_host_and_content_length_do_not_duplicate_the_upstream_ones() {
     let _ = h.join();
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Package downloads through the proxy: only allowlisted hosts, and the guest sees a refusal it can read.
+#[test]
+fn only_allowlisted_hosts_are_reachable_through_the_package_prefix() {
+    use selfdb::proxy::{AllowList, PACKAGE_PREFIX};
+    let secret = "model-key";
+    let stub = Stub::start(secret);
+    let d = std::env::temp_dir().join(format!("pkgproxy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let sock = d.join("p.sock");
+    // the "package host" is the same local stub: http, reached through the model upstream only by prefix
+    let (up, pre) = Upstream::from_base_url(&format!("http://{}", stub.addr), secret).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    // allow the stub's host:port by name so the allowlist logic is what decides
+    let allow = AllowList { hosts: vec![stub.addr.clone()] };
+    let (s2, pre2, stop2) = (sock.clone(), pre.clone(), stop.clone());
+    let h = std::thread::spawn(move || { let _ = selfdb::proxy::serve_until_stopped_with(&s2, up, &pre2, allow, stop2); });
+    for _ in 0..50 { if sock.exists() { break; } std::thread::sleep(std::time::Duration::from_millis(50)); }
+
+    use std::io::{Read, Write};
+    let mut ask = |host_port: &str| -> String {
+        let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let req = format!("GET {}/{}/some/package HTTP/1.1\r\nHost: local\r\n\r\n", PACKAGE_PREFIX, host_port);
+        c.write_all(req.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).to_string()
+    };
+    // an allowed host goes through (the stub answers 200)
+    let ok = ask(&stub.addr);
+    assert!(ok.contains("200 OK"), "an allowlisted host is reachable: {}", ok);
+    // an unlisted host is refused, with a readable reason
+    let denied = ask("not-allowed.example:443");
+    assert!(denied.contains("403 Forbidden"), "an unlisted host is refused: {}", denied);
+    assert!(denied.contains("not an allowed package host"), "the refusal explains itself: {}", denied);
+    // the credential is never attached to package requests
+    assert!(!denied.contains(secret) && !ok.contains(secret), "no credential in package traffic");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = h.join();
+    let _ = std::fs::remove_dir_all(&d);
+}

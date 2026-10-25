@@ -406,7 +406,8 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     std::fs::create_dir_all(&proxy_dir)?;
     let sock = proxy_dir.join("proxy.sock");
     let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
-    let proxy = crate::proxy::Proxy::bind(&sock, upstream, &prefix)?;
+    let proxy = crate::proxy::Proxy::bind_with(&sock, upstream, &prefix,
+        crate::proxy::AllowList { hosts: opts.allow_hosts.clone() })?;
     let outcome = run_agent_in(&mnt, &sock, opts, &agent_dir);
     drop(proxy);
     drop(mount);
@@ -486,7 +487,8 @@ pub fn run_agent_on_overlay(db: &Path, opts: &AgentOptions) -> Result<StepResult
     std::fs::create_dir_all(scratch.path().join("tmp"))?;
     let sock = scratch.path().join("tmp/proxy.sock");
     let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
-    let proxy = crate::proxy::Proxy::bind(&sock, upstream, &prefix)?;
+    let proxy = crate::proxy::Proxy::bind_with(&sock, upstream, &prefix,
+        crate::proxy::AllowList { hosts: opts.allow_hosts.clone() })?;
     let outcome = run_agent_in(scratch.path(), &sock, opts, "/opt/piagent");
     drop(proxy);
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome?;
@@ -587,6 +589,8 @@ pub struct AgentOptions {
     /// Mount the VM instead of materialising it: the sandbox binds the mount point, so nothing is unpacked
     /// to /tmp and writes reach the database as they happen.
     pub fuse: bool,
+    /// Hosts the agent may reach for package downloads, through the proxy's `/pkg/<host>/<path>` route.
+    pub allow_hosts: Vec<String>,
 }
 
 /// Resource limits applied inside the sandbox.
@@ -672,7 +676,8 @@ pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     std::fs::create_dir_all(scratch.path().join("tmp"))?;
     let sock = scratch.path().join("tmp/proxy.sock");
     let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
-    let proxy = crate::proxy::Proxy::bind(&sock, upstream, &prefix)?;
+    let proxy = crate::proxy::Proxy::bind_with(&sock, upstream, &prefix,
+        crate::proxy::AllowList { hosts: opts.allow_hosts.clone() })?;
 
     let outcome = run_agent_in(scratch.path(), &sock, opts, "/opt/piagent");
     drop(proxy);
