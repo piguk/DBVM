@@ -309,6 +309,42 @@ pub struct AgentOptions {
     pub forward_port: u16,
     /// The task text handed to the agent.
     pub task: String,
+    /// Resource limits for the sandbox. 0 disables that limit.
+    pub limits: Limits,
+}
+
+/// Resource limits applied inside the sandbox.
+///
+/// Measured on node 26 before choosing them: `RLIMIT_DATA` and small `RLIMIT_AS` make node fail to
+/// start at all (a shared library cannot be mapped), so the address-space limit must be at least
+/// ~1.5 GB and is a guard against runaway allocation, not a tight quota. With 2 GB a 2.5 GB
+/// allocation fails as a catchable `RangeError` instead of an OOM kill.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// `RLIMIT_AS` in mebibytes; 0 = unlimited. Node needs >= ~1536.
+    pub address_space_mb: u32,
+    /// `RLIMIT_CPU` in seconds; 0 = unlimited.
+    pub cpu_secs: u32,
+    /// `RLIMIT_FSIZE` in mebibytes; 0 = unlimited.
+    pub file_size_mb: u32,
+    /// `RLIMIT_NPROC`; 0 = unlimited. Counts processes for the whole user, so it is off by default.
+    pub processes: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self { Limits { address_space_mb: 2048, cpu_secs: 0, file_size_mb: 1024, processes: 0 } }
+}
+
+impl Limits {
+    /// The `ulimit` prelude for the sandbox shell. Kept in one place so the CLI and the library agree.
+    pub fn ulimit_prelude(&self) -> String {
+        let mut out = String::new();
+        if self.address_space_mb > 0 { out.push_str(&format!("ulimit -v {} 2>/dev/null; ", self.address_space_mb as u64 * 1024)); }
+        if self.cpu_secs > 0 { out.push_str(&format!("ulimit -t {} 2>/dev/null; ", self.cpu_secs)); }
+        if self.file_size_mb > 0 { out.push_str(&format!("ulimit -f {} 2>/dev/null; ", self.file_size_mb as u64 * 1024)); }
+        if self.processes > 0 { out.push_str(&format!("ulimit -u {} 2>/dev/null; ", self.processes)); }
+        out
+    }
 }
 
 /// What `provision_agent` put in the database.
@@ -454,7 +490,7 @@ fn run_agent_in(root: &Path, proxy_sock: &Path, opts: &AgentOptions) -> Result<O
         .arg("--die-with-parent")
         .arg("--bind").arg(proxy_sock).arg("/tmp/proxy.sock")
         .arg("--chdir").arg("/")
-        .arg("/bin/sh").arg("/opt/run-agent.sh");
+        .arg("/bin/sh").arg("-c").arg(format!("{}. /opt/run-agent.sh", opts.limits.ulimit_prelude()));
     // a clean environment: nothing from the host leaks in, and the credential is not here at all
     cmd.env_clear();
     cmd.env("PATH", "/usr/bin:/bin");
@@ -479,3 +515,6 @@ fn run_agent_in(root: &Path, proxy_sock: &Path, opts: &AgentOptions) -> Result<O
     let exit_code = if timed_out { 124 } else { status.code().unwrap_or(128) };
     Ok(Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated })
 }
+
+/// The shell prelude that applies `limits`. Public so tests exercise the same code the sandbox runs.
+pub fn limits_prelude(limits: &Limits) -> String { limits.ulimit_prelude() }

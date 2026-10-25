@@ -72,6 +72,9 @@ enum Cmd {
              #[arg(long, default_value="gpt-6.1-sol")] model: String,
              #[arg(long, default_value_t=18081)] port: u16,
              #[arg(long, default_value_t=selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES)] max_output: usize,
+             #[arg(long, default_value_t=2048, help="RLIMIT_AS in MiB for the agent (node needs >= ~1536); 0 = unlimited")] mem_mb: u32,
+             #[arg(long, default_value_t=0, help="RLIMIT_CPU in seconds for the agent; 0 = unlimited")] cpu_secs: u32,
+             #[arg(long, default_value_t=1024, help="RLIMIT_FSIZE in MiB for the agent; 0 = unlimited")] file_mb: u32,
              task: String },
     /// Host-side model proxy: a unix socket the sandboxed agent reaches without network access.
     VmProxy{ #[arg(long)] base: String, #[arg(long)] key_env: String, socket: String,
@@ -501,10 +504,11 @@ fn main() -> anyhow::Result<()> {
             selfdb::vm::snapshot_restore(&c, &name)?;
             println!("rolled back to {}", name);
         },
-        Cmd::VmAgent{db, timeout, rollback_on_fail, model_base, key_env, model, port, max_output, task} => {
+        Cmd::VmAgent{db, timeout, rollback_on_fail, model_base, key_env, model, port, max_output, mem_mb, cpu_secs, file_mb, task} => {
             let opts = selfdb::agent::AgentOptions {
                 rollback_on_fail, timeout_secs: timeout, max_output_bytes: max_output,
                 model_base, key_env, model, forward_port: port, task,
+                limits: selfdb::agent::Limits { address_space_mb: mem_mb, cpu_secs, file_size_mb: file_mb, processes: 0 },
             };
             let r = selfdb::agent::run_agent(std::path::Path::new(&db), &opts)?;
             use std::io::Write;
