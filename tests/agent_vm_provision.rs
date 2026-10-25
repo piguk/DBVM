@@ -77,3 +77,42 @@ fn node_and_pi_run_inside_the_vm() {
     eprintln!("provisioned vm: {} bytes, node objects={}, pi files={}, pi version={:?}", size, rep.objects, rep.files, out.trim());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The dev tool set: a coding agent needs more than a shell. Each command is run inside the VM.
+#[test]
+#[ignore]
+fn the_dev_tool_set_provides_git_python_make_and_gcc() {
+    let (Some(node), Some(pi)) = (node_binary(), pi_dir()) else { eprintln!("skip: node or pi missing"); return; };
+    if !bwrap_ok() { eprintln!("skip: bwrap not available"); return; }
+    let d = std::env::temp_dir().join(format!("provdev-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let db = d.join("v.db");
+    drop(vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap());
+    let started = std::time::Instant::now();
+    let rep = agent::provision_agent_with(&db, &node, &pi, agent::ToolSet::Dev).unwrap();
+    let provision_s = started.elapsed().as_secs();
+    let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+    let v = vm::vm_verify(&c, true).unwrap();
+    assert!(v.contains("deep=ok"), "deep verify: {}", v);
+    drop(c);
+    let root = d.join("mnt");
+    vm::vm_open(db.to_str().unwrap()).and_then(|c| vm::vm_materialize_tree(&c, &root)).unwrap();
+
+    // each tool must actually run, not merely be present
+    let checks: [(&str, &[&str], &str); 4] = [
+        ("/bin/git", &["--version"], "git version"),
+        ("/bin/python3", &["-c", "import json,http.client;print('PY_STDLIB_OK')"], "PY_STDLIB_OK"),
+        ("/bin/make", &["--version"], "GNU Make"),
+        ("/bin/gcc", &["--version"], "gcc"),
+    ];
+    for (prog, args, want) in checks {
+        let (ok, out) = run_in_tree(&root, prog, args);
+        assert!(ok, "{} must run in the VM: {}", prog, out);
+        assert!(out.contains(want), "{} must report {:?}, got {:?}", prog, want, out.lines().next());
+    }
+    let size = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    eprintln!("dev tools: {} bytes, {} node objects, {} pi files, provision {} s",
+        size, rep.objects, rep.files, provision_s);
+    let _ = std::fs::remove_dir_all(&d);
+}

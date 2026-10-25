@@ -84,7 +84,9 @@ enum Cmd {
     VmProxy{ #[arg(long)] base: String, #[arg(long)] key_env: String, socket: String,
              #[arg(long, default_value_t=18081)] port: u16, #[arg(long)] forwarder: Option<String> },
     /// Put node and the pi coding agent into a VM, so `pi` can run inside it.
-    VmProvisionAgent{ db: String, #[arg(long)] node: Option<String>, #[arg(long)] pi: Option<String> },
+    VmProvisionAgent{ db: String, #[arg(long)] node: Option<String>, #[arg(long)] pi: Option<String>,
+                      #[arg(long, default_value="minimal", help="system tools to install: none, minimal or dev (git, coreutils, python3+stdlib, make, gcc)")]
+                      tools: String },
     /// Merge a package VM database (a tool and its libraries) into a target, in one transaction.
     VmInject{ target: String, package: String },
     /// Write policies enforced by the database: list, add, or remove a rule.
@@ -553,7 +555,8 @@ fn main() -> anyhow::Result<()> {
             selfdb::proxy::serve_until_stopped(std::path::Path::new(&socket), up, &prefix, stop)?;
             eprintln!("proxy stopped");
         }
-        Cmd::VmProvisionAgent{db, node, pi} => {
+        Cmd::VmProvisionAgent{db, node, pi, tools} => {
+            let tool_set = selfdb::agent::ToolSet::parse(&tools)?;
             let node = node.map(std::path::PathBuf::from).unwrap_or_else(|| {
                 let out = std::process::Command::new("sh").args(["-c", "readlink -f \"$(command -v node)\" && true"]).output().ok();
                 let s = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
@@ -562,7 +565,7 @@ fn main() -> anyhow::Result<()> {
             let pi = pi.map(std::path::PathBuf::from).unwrap_or_else(default_pi_dir);
             if node.as_os_str().is_empty() || !node.exists() { eprintln!("node not found; pass --node <path>"); std::process::exit(2); }
             if !pi.exists() { eprintln!("pi not found at {}; pass --pi <dir>", pi.display()); std::process::exit(2); }
-            let r = selfdb::agent::provision_agent(std::path::Path::new(&db), &node, &pi)?;
+            let r = selfdb::agent::provision_agent_with(std::path::Path::new(&db), &node, &pi, tool_set)?;
             println!("provisioned {}: node {} ({} objects), pi at /opt/pi ({} files)", db, r.node, r.objects, r.files);
             println!("run it with: vm-agent {} -- \"<task>\"", db);
         }

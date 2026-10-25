@@ -272,17 +272,89 @@ impl StepLock {
 /// The node path is kept as imported (its canonical location) because its shared libraries refer to
 /// each other by absolute path. The well-known names are symlinks on top of that.
 pub fn provision_agent(db: &Path, node: &Path, pi_dir: &Path) -> Result<ProvisionReport> {
+    provision_agent_with(db, node, pi_dir, ToolSet::Minimal)
+}
+
+/// Which system tools to put in the VM besides node and pi.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ToolSet {
+    /// node, pi and a handful of coreutils: enough for shell one-liners.
+    Minimal,
+    /// plus the tools a coding agent reaches for: git, the rest of coreutils, python3 with its standard
+    /// library, make and gcc.
+    Dev,
+    /// node and pi only.
+    None,
+}
+
+impl ToolSet {
+    pub fn parse(s: &str) -> Result<ToolSet> {
+        match s {
+            "minimal" => Ok(ToolSet::Minimal),
+            "dev" => Ok(ToolSet::Dev),
+            "none" => Ok(ToolSet::None),
+            other => Err(anyhow!("unknown tool set {}: expected minimal, dev or none", other)),
+        }
+    }
+    /// Commands imported from the host, as absolute paths.
+    fn commands(self) -> &'static [&'static str] {
+        match self {
+            ToolSet::None => &[],
+            ToolSet::Minimal => &["/bin/sh", "/bin/rm", "/bin/ls", "/bin/cat", "/bin/mv", "/bin/cp",
+                                  "/bin/mkdir", "/bin/sleep", "/bin/grep"],
+            ToolSet::Dev => &["/bin/sh", "/bin/rm", "/bin/ls", "/bin/cat", "/bin/mv", "/bin/cp",
+                              "/bin/mkdir", "/bin/sleep", "/bin/grep", "/bin/sed", "/bin/awk",
+                              "/bin/find", "/bin/tar", "/bin/gzip", "/bin/git", "/bin/python3",
+                              "/bin/make", "/bin/gcc", "/bin/chmod", "/bin/head", "/bin/tail",
+                              "/bin/wc", "/bin/sort", "/bin/uniq", "/bin/diff", "/bin/du", "/bin/df",
+                              "/bin/env", "/bin/ln", "/bin/touch", "/bin/echo", "/bin/true", "/bin/false"],
+        }
+    }
+    /// Whole host directories to pack, for tools whose runtime data is not an ELF dependency.
+    ///
+    /// python3 needs its standard library, and its location is a property of the interpreter, not a fixed
+    /// path: on this host /bin/python3 is a uv build whose stdlib is under ~/.local/share/uv, so packing a
+    /// hard-coded /usr/lib/python3.13 produced a VM where python3 could not start ("Could not find platform
+    /// independent libraries"). The path is asked of the interpreter itself.
+    fn trees(self) -> Vec<(String, String)> {
+        match self {
+            ToolSet::Dev => python_stdlib().map(|p| vec![(p.clone(), p)]).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The standard library directory of the host's python3, as the interpreter reports it.
+fn python_stdlib() -> Option<String> {
+    let out = std::process::Command::new("/bin/python3")
+        .args(["-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"])
+        .output().ok()?;
+    if !out.status.success() { return None; }
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if p.is_empty() || !std::path::Path::new(&p).is_dir() { None } else { Some(p) }
+}
+
+/// Provision with an explicit tool set.
+pub fn provision_agent_with(db: &Path, node: &Path, pi_dir: &Path, tools: ToolSet) -> Result<ProvisionReport> {
     let conn = vm::vm_open(db.to_str().ok_or_else(|| anyhow!("non-utf8 db path"))?)?;
     let node_s = node.to_str().ok_or_else(|| anyhow!("non-utf8 node path"))?;
     let pi_s = pi_dir.to_str().ok_or_else(|| anyhow!("non-utf8 pi path"))?;
     let objects = vm::vm_import_closure(&conn, node_s, "/")?;
     // an agent runs shell commands, so a shell and its libraries must be there too
     let mut shell_objects = 0usize;
-    for prog in ["/bin/sh", "/bin/rm", "/bin/ls", "/bin/cat", "/bin/mv", "/bin/cp", "/bin/mkdir", "/bin/sleep", "/bin/grep"] {
+    for prog in tools.commands() {
         if std::path::Path::new(prog).exists() {
             shell_objects += vm::vm_import_closure(&conn, prog, "/").unwrap_or(0);
         }
     }
+    // python3 refuses to start without its standard library, which the ELF closure does not include
+    let mut tree_files = 0usize;
+    for (host, vm_prefix) in tools.trees() {
+        if std::path::Path::new(&host).exists() {
+            tree_files += vm::vm_pack_host_dir_parallel(&conn, &host, &vm_prefix).unwrap_or(0);
+        }
+    }
+    let _ = tree_files;
     let files = vm::vm_pack_host_dir_parallel(&conn, pi_s, "/opt/pi")?;
     // the names a command line inside the VM uses
     let node_real = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
@@ -364,6 +436,7 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
 }
 
 /// Milliseconds since the epoch, used to give each run its own agent directory.
+#[cfg(feature = "fuse")]
 fn now_millis() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
@@ -375,6 +448,7 @@ fn allows_write(root: &Path) -> bool {
 }
 
 /// A scratch directory that is removed by the caller (the fuse path keeps it until the mount is gone).
+#[cfg(feature = "fuse")]
 fn scratch_base(prefix: &str) -> Result<std::path::PathBuf> { vm::make_tmp_dir(prefix) }
 
 /// Run one task with `db` as a Delta over a read-only `base`.
