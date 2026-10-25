@@ -150,3 +150,31 @@ fn separate_deltas_do_not_need_a_cross_task_lock() {
     assert_eq!(vm::read_range(&bc, "/app/shared.txt", 0, 100).unwrap(), b"BASE-CONTENT");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// An unchanged tree must not white out the entries behind a directory link, and must leave Delta empty.
+///
+/// Found by the acceptance run: `seen` recorded view paths while the deletion pass compared database paths,
+/// so /bin/sh and the other entries behind /bin -> /usr/bin looked deleted and were whited out.
+#[test]
+fn an_unchanged_tree_writes_no_whiteouts() {
+    let (d, base) = setup("nowhiteout");
+    let delta = d.join("delta.db");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    // a Base with a directory link, like a real rootfs: /bin -> /usr/bin
+    {
+        let bc = vm::vm_open(base.to_str().unwrap()).unwrap();
+        vm::vm_add_bytes(&bc, "/usr/bin/tool", b"TOOL", 0o755, 1).unwrap();
+        vm::vm_add_symlink(&bc, "/bin", "/usr/bin").unwrap();
+        vm::vm_add_symlink(&bc, "/bin/tool", "/usr/bin/tool").unwrap();
+    }
+    let tree = d.join("t");
+    ov.materialize(&tree).unwrap();
+    ov.absorb_tree(&tree).unwrap();
+    let dc = rusqlite::Connection::open(&delta).unwrap();
+    let whites: i64 = dc.query_row("SELECT count(*) FROM vm_whiteouts", [], |r| r.get(0)).unwrap();
+    assert_eq!(whites, 0, "an unchanged tree must not white anything out, got {}", whites);
+    // and the view is unchanged
+    assert!(ov.exists("/bin/tool").unwrap(), "/bin/tool is still visible");
+    assert_eq!(ov.read("/bin/tool").unwrap(), b"TOOL");
+    let _ = std::fs::remove_dir_all(&d);
+}

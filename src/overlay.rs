@@ -656,6 +656,10 @@ impl Overlay {
             // tree write-back would create a duplicate in Delta (measured: /usr/bin/gcc, /usr/bin/python3,
             // /usr/bin/sh appearing as created). The view path is translated back to the database path first.
             let db_p = view_to_db.get(&p).cloned().unwrap_or_else(|| p.clone());
+            // Record the database path: the collection below compares against database paths, and a view path
+            // would make every entry behind a directory link look deleted (measured: an unchanged tree wrote
+            // 7 rows into Delta and whited out /bin/sh).
+            seen.insert(db_p.clone());
             let layer_kind = self.kind_in_overlay(&db_p)?;
             let ft = md.file_type();
             let host_kind = if ft.is_symlink() { "symlink" } else if md.is_dir() { "dir" } else { "file" };
