@@ -205,7 +205,7 @@ fn only_allowlisted_hosts_are_reachable_through_the_package_prefix() {
     for _ in 0..50 { if sock.exists() { break; } std::thread::sleep(std::time::Duration::from_millis(50)); }
 
     use std::io::{Read, Write};
-    let mut ask = |host_port: &str| -> String {
+    let ask = |host_port: &str| -> String {
         let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
         let req = format!("GET {}/{}/some/package HTTP/1.1\r\nHost: local\r\n\r\n", PACKAGE_PREFIX, host_port);
         c.write_all(req.as_bytes()).unwrap();
