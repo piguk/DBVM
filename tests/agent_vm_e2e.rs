@@ -157,3 +157,89 @@ fn a_policy_refusal_fails_the_run_and_is_recorded() {
     assert!(v.contains("deep=ok"), "the database still verifies deep: {}", v);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The acceptance run: a real multi-step task (read the tests, fix the source, run the tests again),
+/// verified independently of the agent's own report, then rolled back byte for byte.
+///
+/// The project is packed into the VM with a deliberately broken `add()`. The agent is asked to make the
+/// tests pass without touching them. The test then runs the suite itself inside the sandbox, so the
+/// result does not rest on the agent's word.
+#[test]
+#[ignore]
+fn a_real_multi_step_task_is_audited_and_rolled_back() {
+    if !bwrap_ok() { eprintln!("skip: bwrap not available"); return; }
+    let Some((node, pi)) = node_and_pi() else { eprintln!("skip: node or pi missing"); return; };
+    let base = std::env::var("PIMM_BASE_URL").unwrap_or_default();
+    if base.is_empty() || std::env::var("PIMM_API_KEY").unwrap_or_default().is_empty() {
+        eprintln!("skip: PIMM_BASE_URL / PIMM_API_KEY not set"); return;
+    }
+    let d = std::env::temp_dir().join(format!("vmacc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let app = d.join("app");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    let broken = b"// Small arithmetic helpers used by the app.\nfunction add(a, b) {\n  return a - b; // BUG: subtraction instead of addition\n}\nfunction multiply(a, b) {\n  return a * b;\n}\nmodule.exports = { add, multiply };\n";
+    let tests = b"const assert = require('assert');\nconst { add, multiply } = require('./src/calc');\nlet failed = 0;\nfunction check(name, fn) { try { fn(); console.log('PASS', name); } catch (e) { failed++; console.log('FAIL', name, '-', e.message); } }\ncheck('add 2+3=5', () => assert.strictEqual(add(2, 3), 5));\ncheck('add -1+1=0', () => assert.strictEqual(add(-1, 1), 0));\ncheck('multiply 3*4=12', () => assert.strictEqual(multiply(3, 4), 12));\nif (failed) { console.log(failed + ' test(s) failed'); process.exit(1); }\nconsole.log('all tests passed');\n";
+    std::fs::write(app.join("src/calc.js"), broken).unwrap();
+    std::fs::write(app.join("test.js"), tests).unwrap();
+    std::fs::write(app.join("package.json"), b"{\"name\":\"app\",\"version\":\"1.0.0\"}").unwrap();
+
+    let db = d.join("v.db");
+    drop(vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap());
+    agent::provision_agent(&db, &node, &pi).unwrap();
+    {
+        let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+        vm::vm_pack_host_dir_parallel(&c, app.to_str().unwrap(), "/app").unwrap();
+        vm::snapshot_create(&c, "start", "before the agent").unwrap();
+    }
+    let size_before = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+
+    let opts = agent::AgentOptions {
+        rollback_on_fail: false, timeout_secs: 600, max_output_bytes: 1 << 20,
+        model_base: base, key_env: "PIMM_API_KEY".into(), model: "gpt-6.1-sol".into(),
+        forward_port: 18081, limits: agent::Limits::default(),
+        task: "In /app there is a small node project with failing tests. Run 'cd /app && node test.js' to \
+               see the failures, read /app/src/calc.js and /app/test.js to understand them, fix the bug in \
+               the source (do not change the tests), then run the tests again to confirm they all pass. \
+               Finally reply with the words ALL_FIXED and the final test output.".into(),
+    };
+    let started = std::time::Instant::now();
+    let r = agent::run_agent(&db, &opts).expect("the task must run");
+    let elapsed = started.elapsed();
+    assert_eq!(r.exit_code, 0, "the agent must finish: {}", String::from_utf8_lossy(&r.stderr));
+    // only the source changed; the tests the agent was told not to touch did not
+    assert!(r.changes.modified.contains(&"/app/src/calc.js".to_string()), "the source is the only change: {:?}", r.changes);
+    assert!(!r.changes.modified.contains(&"/app/test.js".to_string()), "the tests must not be modified: {:?}", r.changes);
+    assert!(!r.changes.created.iter().any(|p| p.starts_with("/app/")), "no stray files under /app: {:?}", r.changes);
+
+    let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+    let fixed = vm::vm_cat(&c, "/app/src/calc.js").unwrap();
+    assert!(String::from_utf8_lossy(&fixed).contains("a + b"), "the bug is fixed in the VM: {}", String::from_utf8_lossy(&fixed));
+
+    // Run the suite ourselves inside the sandbox: the agent's own report is not evidence.
+    let root = d.join("mnt");
+    vm::vm_materialize_tree(&c, &root).unwrap();
+    let run = std::process::Command::new("bwrap")
+        .args(["--bind", root.to_str().unwrap(), "/", "--dev", "/dev", "--proc", "/proc",
+               "--unshare-pid", "--unshare-net", "--die-with-parent", "--chdir", "/app"])
+        .arg(node.to_str().unwrap()).arg("test.js").output().expect("run tests in the vm");
+    let out = format!("{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+    assert!(run.status.success(), "the suite must pass in the VM: {}", out);
+    assert!(out.contains("all tests passed"), "the suite reports success: {}", out);
+
+    // the run is auditable
+    let steps: i64 = c.query_row("SELECT count(*) FROM agent_steps", [], |r| r.get(0)).unwrap();
+    assert_eq!(steps, 1, "the run is recorded");
+
+    // and rolling back to the start restores the broken file byte for byte
+    vm::snapshot_restore(&c, "start").unwrap();
+    assert_eq!(vm::vm_cat(&c, "/app/src/calc.js").unwrap(), broken, "rollback restores the original bytes");
+    let v = vm::vm_verify(&c, true).unwrap();
+    assert!(v.contains("deep=ok"), "deep verify after rollback: {}", v);
+
+    let size_after = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    eprintln!("acceptance: {} s, db {} -> {} bytes ({} change), {}",
+        elapsed.as_secs(), size_before, size_after,
+        if size_after >= size_before { format!("+{}", size_after - size_before) } else { format!("-{}", size_before - size_after) },
+        v.lines().last().unwrap_or(""));
+    let _ = std::fs::remove_dir_all(&d);
+}
