@@ -289,45 +289,43 @@ fn a_real_multi_step_task_is_audited_and_rolled_back() {
 
 /// A failed run must not leave its materialised tree behind.
 ///
-/// Measured before the guard existed: three failed runs left 539 MB under /tmp, because the paths after
-/// the proxy was bound returned with `?` and never cleaned up.
+/// Measured before the guard existed: three failed runs left 539 MB under /tmp.
 ///
-/// The count runs in a private temp directory (`TMPDIR` set for this process only), because cargo runs
-/// test binaries in parallel: counting scratch directories under the shared /tmp saw another test's
-/// `agent-step-*` appear mid-run and failed intermittently. With TMPDIR set, `make_tmp_dir` creates its
-/// trees inside it and nothing else touches that directory.
+/// The check runs in a child process with `TMPDIR` set in its environment. Doing it in-process does not
+/// work: `set_var` is process-global, so a test running in parallel reads the same value and its scratch
+/// tree lands in the directory being counted (observed: intermittent failures, 1 in 3).
 #[test]
 fn a_failed_step_leaves_no_scratch_directory() {
     if !bwrap_ok() { eprintln!("skip: bwrap not available"); return; }
-    let base = std::env::temp_dir().join(format!("scrub-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    const CHILD: &str = "SCRATCH_CHECK_CHILD";
+    if std::env::var(CHILD).is_ok() {
+        // child: TMPDIR already points at a private directory, so only this run's trees appear there
+        let tmp = std::env::temp_dir();
+        let db = tmp.join("v.db");
+        {
+            let c = vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap();
+            vm::vm_import_closure(&c, "/bin/sh", "/").unwrap();
+            vm::vm_add_bytes(&c, "/tests/eval.sh", b"PROTECTED", 0o644, 1).unwrap();
+            selfdb::policy::add(&c, &selfdb::policy::Rule::ReadonlyPrefix("/tests".into())).unwrap();
+        }
+        let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "echo X > /tests/eval.sh".into()],
+            &agent::StepOptions { rollback_on_fail: false, timeout_secs: 60, max_output_bytes: 1 << 20 });
+        assert!(r.is_err(), "the run is expected to fail");
+        let left: Vec<String> = std::fs::read_dir(&tmp).unwrap().filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("agent-step-") || n.starts_with("vm-agent-")).collect();
+        assert!(left.is_empty(), "a failed run must leave no scratch tree, found {:?}", left);
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("scrub-{}-{}", std::process::id(), std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
     let private_tmp = base.join("tmp");
     std::fs::create_dir_all(&private_tmp).unwrap();
-    // SAFETY: single-threaded within this test; the value is only read by paths created during it.
-    // Scoped as tightly as possible: it is set, the run happens, the count is taken, then it is cleared.
-    unsafe { std::env::set_var("TMPDIR", &private_tmp); }
-
-    let count = || -> usize {
-        std::fs::read_dir(&private_tmp).map(|it| it.filter_map(|e| e.ok())
-            .filter(|e| {
-                let n = e.file_name().to_string_lossy().to_string();
-                n.starts_with("agent-step-") || n.starts_with("vm-agent-")
-            }).count()).unwrap_or(0)
-    };
-    let db = base.join("v.db");
-    {
-        let c = vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap();
-        vm::vm_import_closure(&c, "/bin/sh", "/").unwrap();
-        vm::vm_add_bytes(&c, "/tests/eval.sh", b"PROTECTED", 0o644, 1).unwrap();
-        selfdb::policy::add(&c, &selfdb::policy::Rule::ReadonlyPrefix("/tests".into())).unwrap();
-    }
-    // this run fails by design: the policy refuses the write on the way back
-    let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "echo X > /tests/eval.sh".into()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 60, max_output_bytes: 1 << 20 });
-    let left = count();
-    unsafe { std::env::remove_var("TMPDIR"); }
-    assert!(r.is_err(), "the run is expected to fail");
-    assert_eq!(left, 0, "a failed run must leave no scratch tree, found {}", left);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "a_failed_step_leaves_no_scratch_directory", "--nocapture"])
+        .env(CHILD, "1").env("TMPDIR", &private_tmp)
+        .output().expect("spawn child");
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "the child check failed:\n{}", text);
     let _ = std::fs::remove_dir_all(&base);
 }
