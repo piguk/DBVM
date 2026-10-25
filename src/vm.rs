@@ -878,7 +878,7 @@ pub fn decompress_bytes_raw(data: &[u8], compressed: i64) -> Result<Vec<u8>> {
     Ok(data.to_vec())
 }
 /// Ensure a blob row exists for `key` (refcnt starts at 0; triggers count references).
-fn blob_ensure(conn: &Connection, key: &BlobKey, data: &[u8]) -> Result<i64> {
+pub fn blob_ensure(conn: &Connection, key: &BlobKey, data: &[u8]) -> Result<i64> {
     if let Some(flag) = conn.prepare_cached("SELECT compressed FROM vm_blobs WHERE hash=?1")?.query_row( params![key.as_slice()], |r| r.get::<_,i64>(0)).optional()? {
         return Ok(flag);
     }
@@ -2677,6 +2677,14 @@ pub fn vm_restore_file(db_path: &str, name: &str) -> Result<()> {
 }
 /// Quick check uses counters; `deep` recomputes every counter and refcount from raw rows
 /// and reports any drift (use after crashes or manual SQL edits).
+/// True when a readable `base` schema with a vm_fs table is attached (an Overlay Delta).
+fn base_has_fs(conn: &Connection) -> bool {
+    conn.query_row("SELECT count(*) FROM pragma_database_list WHERE name='base'", [], |r| r.get::<_, i64>(0))
+        .map(|n| n > 0).unwrap_or(false)
+        && conn.query_row("SELECT count(*) FROM base.sqlite_master WHERE type='table' AND name='vm_fs'", [], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0).unwrap_or(false)
+}
+
 pub fn vm_verify(conn: &Connection, deep: bool) -> Result<String> {
     let page_size: i64 = conn.prepare_cached("PRAGMA page_size")?.query_row( [], |r| r.get(0))?;
     let page_count: i64 = conn.prepare_cached("PRAGMA page_count")?.query_row( [], |r| r.get(0))?;
@@ -2706,12 +2714,32 @@ pub fn vm_verify(conn: &Connection, deep: bool) -> Result<String> {
         // a snapshot's chunk list must be contiguous per file, like the live list
         let snap_gaps: i64 = conn.prepare_cached("SELECT count(*) FROM (SELECT snap_id, path, count(*) AS n, max(idx) AS mx FROM vm_snapshot_chunks GROUP BY snap_id, path) WHERE mx + 1 != n")?.query_row( [], |r| r.get(0))?;
         if snap_gaps > 0 { drift.push(format!("{} snapshot files with chunk index gaps", snap_gaps)); }
-        // chunks must form a contiguous 0..n sequence per file
-        let gaps: i64 = conn.prepare_cached("SELECT count(*) FROM (SELECT path, count(*) AS n, max(idx) AS mx FROM vm_file_chunks GROUP BY path) WHERE mx + 1 != n")?.query_row( [], |r| r.get(0))?;
-        if gaps > 0 { drift.push(format!("{} files with chunk index gaps", gaps)); }
-        // every regular file with bytes must have chunks (size>0 => at least one chunk)
-        let no_chunks: i64 = conn.prepare_cached("SELECT count(*) FROM vm_fs f WHERE f.kind='file' AND f.size>0 AND NOT EXISTS (SELECT 1 FROM vm_file_chunks c WHERE c.path=f.path)")?.query_row( [], |r| r.get(0))?;
-        if no_chunks > 0 { drift.push(format!("{} non-empty files without chunks", no_chunks)); }
+        // Chunks must form a contiguous 0..n sequence, and every non-empty file must have chunks — for a
+        // self-contained database. A Delta with a readable Base attached is a different case: it stores
+        // only the chunks a write touched, and the rest of each file lives in Base. There the check is
+        // that Delta's own chunks exist and each file's total (Delta + Base) covers its size.
+        let has_base = base_has_fs(conn);
+        if !has_base {
+            let gaps: i64 = conn.prepare_cached("SELECT count(*) FROM (SELECT path, count(*) AS n, max(idx) AS mx FROM vm_file_chunks GROUP BY path) WHERE mx + 1 != n")?.query_row( [], |r| r.get(0))?;
+            if gaps > 0 { drift.push(format!("{} files with chunk index gaps", gaps)); }
+            let no_chunks: i64 = conn.prepare_cached("SELECT count(*) FROM vm_fs f WHERE f.kind='file' AND f.size>0 AND NOT EXISTS (SELECT 1 FROM vm_file_chunks c WHERE c.path=f.path)")?.query_row( [], |r| r.get(0))?;
+            if no_chunks > 0 { drift.push(format!("{} non-empty files without chunks", no_chunks)); }
+        } else {
+            // a COW row must not claim bytes neither layer holds
+            let uncovered: i64 = conn.prepare_cached(
+                "SELECT count(*) FROM vm_fs f WHERE f.kind='file' AND f.size>0 AND NOT EXISTS (
+                   SELECT 1 FROM main.vm_file_chunks c WHERE c.path=f.path
+                   UNION ALL
+                   SELECT 1 FROM base.vm_file_chunks c WHERE c.path=f.path)")?.query_row( [], |r| r.get(0))?;
+            if uncovered > 0 { drift.push(format!("{} Delta files with no chunks in either layer", uncovered)); }
+            let short: i64 = conn.prepare_cached(
+                "SELECT count(*) FROM (
+                   SELECT f.path, f.size AS sz,
+                     (SELECT COALESCE(sum(b.raw_size),0) FROM main.vm_file_chunks c JOIN main.vm_blobs b ON b.hash=c.hash WHERE c.path=f.path) AS d,
+                     (SELECT COALESCE(sum(b.raw_size),0) FROM base.vm_file_chunks c JOIN base.vm_blobs b ON b.hash=c.hash WHERE c.path=f.path) AS b
+                   FROM main.vm_fs f WHERE f.kind='file') WHERE d + b < sz")?.query_row( [], |r| r.get(0))?;
+            if short > 0 { drift.push(format!("{} Delta files whose chunks do not cover their size", short)); }
+        }
         out.push_str(if drift.is_empty() { " deep=ok" } else { " deep=DRIFT" });
         for d in drift { out.push_str(&format!("\n  {}", d)); }
     }

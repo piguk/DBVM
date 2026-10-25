@@ -345,7 +345,273 @@ impl Overlay {
 
     /// Assemble a file's bytes from one schema's chunk list. Every chunk is verified against its
     /// key, so a corrupt block is an error rather than wrong data.
+    /// Read a byte range of a file through the overlay, from whichever layer holds each chunk.
+    ///
+    /// Delta first, then Base: a path present in Delta is served entirely from Delta (a write there
+    /// copied the chunks it needed), so a file is never pieced together from two layers at the same
+    /// index. Only a path that exists solely in Base reads from Base.
+    pub fn read_range(&self, vm_path: &str, off: u64, len: usize) -> Result<Vec<u8>> {
+        let p = normalize_vm_path(vm_path);
+        let schema = match self.lookup_file(&p)? {
+            Some(s) => s,
+            None => return Err(anyhow!("not found in overlay: {}", p)),
+        };
+        let size: i64 = self.conn.query_row(
+            &format!("SELECT size FROM {}.vm_fs WHERE path=?1", schema), params![p], |r| r.get(0))?;
+        let size = size as u64;
+        let start = off.min(size);
+        let end = start.saturating_add(len as u64).min(size);
+        if start == end { return Ok(Vec::new()); }
+        let cs = crate::vm::CHUNK_SIZE as u64;
+        let (first, last) = (start / cs, (end - 1) / cs);
+        let mut out: Vec<u8> = Vec::with_capacity((end - start) as usize);
+        for idx in first..=last {
+            let piece = self.read_chunk_layered(schema, &p, idx as i64)?;
+            let base = idx * cs;
+            let from = start.saturating_sub(base).min(piece.len() as u64) as usize;
+            let to = end.saturating_sub(base).min(piece.len() as u64) as usize;
+            if from < to { out.extend_from_slice(&piece[from..to]); }
+        }
+        if out.len() as u64 != end - start {
+            return Err(anyhow!("{}: read {} bytes for range {}..{}", p, out.len(), start, end));
+        }
+        Ok(out)
+    }
+
+    /// One chunk of a file that lives in Delta, falling back to Base for chunks Delta never touched.
+    ///
+    /// This is what makes the write side cheap: Delta stores only the chunks it modified, so a small
+    /// write to a large Base file does not copy the file. `schema` is the layer that holds the file row.
+    fn read_chunk_layered(&self, schema: &str, p: &str, idx: i64) -> Result<Vec<u8>> {
+        if schema == "main" {
+            let in_main: i64 = self.conn.query_row(
+                "SELECT count(*) FROM main.vm_file_chunks WHERE path=?1 AND idx=?2",
+                params![p, idx], |r| r.get(0))?;
+            if in_main == 0 {
+                let in_base: i64 = self.conn.query_row(
+                    "SELECT count(*) FROM base.vm_file_chunks WHERE path=?1 AND idx=?2",
+                    params![p, idx], |r| r.get(0))?;
+                if in_base > 0 { return self.read_chunk("base", p, idx); }
+                return Ok(Vec::new());
+            }
+        }
+        self.read_chunk(schema, p, idx)
+    }
+
+    /// One chunk of a file from `schema`, verified against its stored hash.
+    fn read_chunk(&self, schema: &str, p: &str, idx: i64) -> Result<Vec<u8>> {
+        let (body, comp, dict_id, key): (Vec<u8>, i64, i64, Vec<u8>) = self.conn.query_row(
+            &format!("SELECT b.content, b.compressed, b.dict_id, c.hash FROM {s}.vm_file_chunks c
+                      JOIN {s}.vm_blobs b ON b.hash=c.hash WHERE c.path=?1 AND c.idx=?2", s = schema),
+            params![p, idx], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|e| anyhow!("{}: chunk {}: {}", p, idx, e))?;
+        let piece = crate::vm::decode_block_in(&self.conn, schema, &body, comp, dict_id)?;
+        if crate::vm::blob_key(&piece).as_slice() != key.as_slice() {
+            return Err(anyhow!("{}: chunk {} hash mismatch", p, idx));
+        }
+        Ok(piece)
+    }
+
+    /// Write a byte range, copying only the chunks it touches from Base into Delta.
+    ///
+    /// This is the point of the layering: a small write to a large Base file appends one chunk row to
+    /// Delta instead of copying the whole file. The file's row in Delta is created on first write with
+    /// the Base file's mode and a size that covers the write; every chunk that was not touched is
+    /// materialised into Delta as well, because a Delta file is read entirely from Delta.
+    pub fn write_range(&self, vm_path: &str, off: u64, data: &[u8], mtime: i64) -> Result<()> {
+        let p = normalize_vm_path(vm_path);
+        self.check_base_policy(&p)?;
+        if data.is_empty() { return Ok(()); }
+        self.write_tx(|| {
+            self.clear_whiteouts_for(&p)?;
+            let cs = crate::vm::CHUNK_SIZE as u64;
+            // current view of the file, if any
+            let (size, mode, layer) = match self.lookup_file(&p)? {
+                Some(schema) => {
+                    let (sz, md): (i64, i64) = self.conn.query_row(
+                        &format!("SELECT size, mode FROM {}.vm_fs WHERE path=?1", schema), params![p],
+                        |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    (sz as u64, md, Some(schema))
+                }
+                None => (0, 0o644, None),
+            };
+            let new_size = size.max(off + data.len() as u64);
+            let end = off + data.len() as u64;
+            let first = off.min(size) / cs;   // the old tail chunk may need rewriting too
+            let last = (end - 1) / cs;
+
+            // the Delta row: created on first write, then kept in step with the new size
+            // Delete then insert, never INSERT OR REPLACE: a replace does not fire the DELETE trigger
+            // (recursive_triggers is off), so vm_meta's file counters drift and vm-verify reports DRIFT.
+            self.ensure_delta_file_row(&p, mode, mtime, new_size)?;
+            // Only the chunks this write touches go into Delta. Chunks before and after stay in Base and
+            // are read from there (see read_chunk_layered), so a small write to a large file costs one
+            // chunk, not a copy of the file.
+            for idx in first..=last {
+                let base = idx * cs;
+                let chunk_end = (base + cs).min(new_size);
+                let want = (chunk_end - base) as usize;
+                let mut piece = if base < size {
+                    self.read_chunk_layered(layer.unwrap_or("main"), &p, idx as i64)?
+                } else { Vec::new() };
+                if piece.len() < want { piece.resize(want, 0); }
+                let w_from = off.max(base);
+                let w_to = end.min(chunk_end);
+                if w_from < w_to {
+                    piece[(w_from - base) as usize..(w_to - base) as usize]
+                        .copy_from_slice(&data[(w_from - off) as usize..(w_to - off) as usize]);
+                }
+                let key = crate::vm::blob_key(&piece);
+                crate::vm::blob_ensure(&self.conn, &key, &piece)?;
+                self.conn.prepare_cached("DELETE FROM main.vm_file_chunks WHERE path=?1 AND idx=?2")?
+                    .execute(params![p, idx as i64])?;
+                self.conn.prepare_cached("INSERT INTO main.vm_file_chunks(path, idx, hash) VALUES (?1,?2,?3)")?
+                    .execute(params![p, idx as i64, key.as_slice()])?;
+            }
+            // the whole-file hash and size of the Delta row
+            self.refresh_delta_file(&p, new_size, mtime)?;
+            Ok(())
+        })
+    }
+
+    /// Truncate or extend a file through the overlay, touching only the chunks that change.
+    pub fn truncate_range(&self, vm_path: &str, new_size: u64, mtime: i64) -> Result<()> {
+        let p = normalize_vm_path(vm_path);
+        self.check_base_policy(&p)?;
+        self.write_tx(|| {
+            self.clear_whiteouts_for(&p)?;
+            let cs = crate::vm::CHUNK_SIZE as u64;
+            let (size, mode, layer) = match self.lookup_file(&p)? {
+                Some(schema) => {
+                    let (sz, md): (i64, i64) = self.conn.query_row(
+                        &format!("SELECT size, mode FROM {}.vm_fs WHERE path=?1", schema), params![p],
+                        |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    (sz as u64, md, schema)
+                }
+                None => return Err(anyhow!("not found in overlay: {}", p)),
+            };
+            if new_size == size { return Ok(()); }
+            let keep = if new_size == 0 { 0 } else { (new_size + cs - 1) / cs };
+            // Only chunks that actually change are written into Delta; the rest keep coming from Base.
+            // Shrinking inside a chunk rewrites that one chunk; growing rewrites the old tail chunk (it now
+            // needs zero fill) and adds the new ones.
+            let tail_start = if new_size < size { new_size / cs } else { size / cs };
+            let touched: Vec<u64> = (tail_start..keep).collect();
+            // the Delta row must exist before its chunks are written
+            self.ensure_delta_file_row(&p, mode, mtime, new_size)?;
+            for idx in touched {
+                let base = idx * cs;
+                let want = ((new_size - base).min(cs)) as usize;
+                let mut piece = if base < size { self.read_chunk_layered(layer, &p, idx as i64)? } else { Vec::new() };
+                if piece.len() > want { piece.truncate(want); }
+                if piece.len() < want { piece.resize(want, 0); }
+                let key = crate::vm::blob_key(&piece);
+                crate::vm::blob_ensure(&self.conn, &key, &piece)?;
+                self.conn.prepare_cached("DELETE FROM main.vm_file_chunks WHERE path=?1 AND idx=?2")?
+                    .execute(params![p, idx as i64])?;
+                self.conn.prepare_cached("INSERT INTO main.vm_file_chunks(path, idx, hash) VALUES (?1,?2,?3)")?
+                    .execute(params![p, idx as i64, key.as_slice()])?;
+            }
+            // shrinking: drop the chunks past the new end that Delta happens to hold
+            self.conn.execute("DELETE FROM main.vm_file_chunks WHERE path=?1 AND idx>=?2", params![p, keep as i64])?;
+            self.refresh_delta_file(&p, new_size, mtime)?;
+            Ok(())
+        })
+    }
+
+    /// Make sure the Delta has a file row for `p` with the given size.
+    ///
+    /// Insert only when absent, otherwise update in place. Deleting the row first would cascade to
+    /// `vm_file_chunks` (trigger `vm_fs_del_chunks`) and silently drop the chunks earlier writes put
+    /// there; that was a real bug: a second write to the same file lost the first one's chunk.
+    fn ensure_delta_file_row(&self, p: &str, mode: i64, mtime: i64, size: u64) -> Result<()> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT count(*) FROM main.vm_fs WHERE path=?1", params![p], |r| r.get(0))?;
+        if exists > 0 {
+            self.conn.prepare_cached("UPDATE main.vm_fs SET size=?2, mtime=?3 WHERE path=?1")?
+                .execute(params![p, size as i64, mtime])?;
+        } else {
+            self.conn.prepare_cached(
+                "INSERT INTO main.vm_fs(path, kind, mode, uid, gid, mtime, mtime_ns, size, link_target, hash, compressed)
+                 VALUES (?1, 'file', ?2, 0, 0, ?3, 0, ?4, NULL, X'', 0)")?
+                .execute(params![p, mode, mtime, size as i64])?;
+        }
+        Ok(())
+    }
+
+    /// Write the whole-file hash and size of the Delta row from its chunk list.
+    fn refresh_delta_file(&self, p: &str, size: u64, mtime: i64) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let total = if size == 0 { 0 } else { (size + crate::vm::CHUNK_SIZE as u64 - 1) / crate::vm::CHUNK_SIZE as u64 };
+        for idx in 0..total {
+            let piece = self.read_chunk_layered("main", p, idx as i64)?;
+            h.update(&piece);
+        }
+        let whole: [u8; 32] = h.finalize().into();
+        self.conn.prepare_cached("UPDATE main.vm_fs SET size=?2, hash=?3, mtime=?4 WHERE path=?1")?
+            .execute(params![p, size as i64, whole.as_slice(), mtime])?;
+        Ok(())
+    }
+
+    /// Whole file through the overlay: every chunk comes from the layer that holds it.
+    ///
+    /// A Delta file only stores the chunks it modified, so the chunk list is not contiguous inside Delta.
+    /// Reading index by index through `read_chunk_layered` is what lets a small write to a large Base
+    /// file stay small: the untouched chunks are still read from Base.
+    fn read_file_layered(&self, schema: &str, p: &str) -> Result<Vec<u8>> {
+        // Size and the full chunk list come from ONE statement, so they describe the same version of the
+        // file. Reading them separately let a concurrent rewrite hand back a new size with an older chunk
+        // list, which looked like a short chunk (measured: "chunk 1 has 4464 bytes, expected 65536").
+        let (kind, size): (String, i64) = self.conn.query_row(
+            &format!("SELECT kind, size FROM {}.vm_fs WHERE path=?1", schema), params![p],
+            |r| Ok((r.get(0)?, r.get(1)?))).map_err(|_| anyhow!("not found in overlay: {}", p))?;
+        if kind != "file" { return Err(anyhow!("not a regular file: {}", p)); }
+        let size = size as u64;
+        let cs = crate::vm::CHUNK_SIZE as u64;
+        let total = if size == 0 { 0 } else { (size + cs - 1) / cs };
+        let mut out: Vec<u8> = Vec::with_capacity(size as usize);
+        for idx in 0..total {
+            let piece = self.read_chunk_layered(schema, p, idx as i64)?;
+            // the last chunk is short by design; earlier ones are full. A short earlier chunk means the
+            // chunk list is inconsistent, which is reported instead of returning a truncated file.
+            let want = ((size - idx * cs).min(cs)) as usize;
+            if idx + 1 == total {
+                if piece.len() < want {
+                    return Err(anyhow!("{}: last chunk has {} bytes, expected {}", p, piece.len(), want));
+                }
+            } else if piece.len() != want {
+                return Err(anyhow!("{}: chunk {} has {} bytes, expected {}", p, idx, piece.len(), want));
+            }
+            out.extend_from_slice(&piece[..want]);
+        }
+        if out.len() as u64 != size {
+            return Err(anyhow!("{}: read {} bytes, size is {}", p, out.len(), size));
+        }
+        Ok(out)
+    }
+
     fn read_from(&self, schema: &str, p: &str) -> Result<Vec<u8>> {
+        // A file that owns a contiguous chunk list is read in one statement (same snapshot, no gaps).
+        // A copy-on-write file in Delta does not: it stores only the chunks a write touched and the rest
+        // still lives in Base, so it is read chunk by chunk across the two layers.
+        if self.chunks_are_dense(schema, p)? { return self.read_dense(schema, p); }
+        self.read_file_layered(schema, p)
+    }
+
+    /// True when this layer's chunk list is a gap-free 0..n sequence.
+    ///
+    /// Deliberately independent of `size`: a list that does not match the recorded size is a corrupt row
+    /// and must be reported as one, not routed to the cross-layer reader (which would look for chunks in
+    /// Base). Continuity alone decides which reader applies.
+    fn chunks_are_dense(&self, schema: &str, p: &str) -> Result<bool> {
+        let (n, mx): (i64, Option<i64>) = self.conn.query_row(
+            &format!("SELECT count(*), max(idx) FROM {s}.vm_file_chunks WHERE {s}.vm_file_chunks.path=?1", s = schema),
+            params![p], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(mx.map(|m| m + 1).unwrap_or(0) == n)
+    }
+
+    fn read_dense(&self, schema: &str, p: &str) -> Result<Vec<u8>> {
         // One statement reads the file's kind and size together with its chunks, so all of them come
         // from the same snapshot. Separate statements could straddle a concurrent rewrite and mix a
         // new size with old chunks. The LEFT JOIN returns one row even for an empty file (idx NULL).
