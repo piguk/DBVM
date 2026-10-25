@@ -68,17 +68,13 @@ if(f){console.log(f+' failed');process.exit(1)}console.log('ALL PASS');\n";
     }
     let base_with_app = std::fs::metadata(&base).map(|m| m.len()).unwrap_or(0);
 
-    // Two independent copies of the provisioned VM. Delta-based isolation over one shared Base is
-    // implemented and tested at the overlay level (tests/overlay_parallel.rs), but the tree write-back of a
-    // Delta still re-records Base entries, so an agent run on a Delta is not ready; this acceptance uses the
-    // path that works end to end and says so in the report.
+    // Two Deltas over the one read-only Base: the case this goal is about.
     let (da, db_) = (d.join("a.db"), d.join("b.db"));
-    std::fs::copy(&base, &da).unwrap();
-    std::fs::copy(&base, &db_).unwrap();
+    for p in [&da, &db_] { drop(vm::init_vm_db_with_opts(p.to_str().unwrap(), true, true).unwrap()); }
     let opts = |task: &str, _delta: &Path| agent::AgentOptions {
         rollback_on_fail: false, timeout_secs: 600, max_output_bytes: 1 << 20,
         model_base: base_url.clone(), key_env: "PIMM_API_KEY".into(), model: "gpt-6.1-sol".into(),
-        forward_port: 18081, limits: agent::Limits::default(), base: None, fuse: false,
+        forward_port: 18081, limits: agent::Limits::default(), base: Some(base.clone()), fuse: false,
         allow_hosts: Vec::new(), task: task.to_string(),
     };
     let a_task = "In /app there is a node project with failing tests. Run 'cd /app && node test.js', read \
@@ -91,8 +87,8 @@ if(f){console.log(f+' failed');process.exit(1)}console.log('ALL PASS');\n";
 
     let t0 = std::time::Instant::now();
     let (da_t, db_t) = (da.clone(), db_.clone());
-    let ha = std::thread::spawn(move || agent::run_agent(&da_t, &oa));
-    let hb = std::thread::spawn(move || agent::run_agent(&db_t, &ob));
+    let ha = std::thread::spawn(move || agent::run_agent_on_overlay(&da_t, &oa));
+    let hb = std::thread::spawn(move || agent::run_agent_on_overlay(&db_t, &ob));
     let ra = ha.join().unwrap();
     let rb = hb.join().unwrap();
     let parallel_s = t0.elapsed().as_secs_f64();
@@ -104,24 +100,26 @@ if(f){console.log(f+' failed');process.exit(1)}console.log('ALL PASS');\n";
     eprintln!("B changes: created={:?} modified={:?}", rb.changes.created, rb.changes.modified);
 
     // each Delta has only its own work, and the Base is untouched
+    let ova = selfdb::vm::Overlay::open(&da, &base).unwrap();
+    let ovb = selfdb::vm::Overlay::open(&db_, &base).unwrap();
     let ca = vm::vm_open(da.to_str().unwrap()).unwrap();
     let cb = vm::vm_open(db_.to_str().unwrap()).unwrap();
     let cbase = vm::vm_open(base.to_str().unwrap()).unwrap();
     assert!(vm::vm_cat(&ca,"/app/words.py").is_err(), "A must not see B's script");
     assert!(vm::vm_cat(&cb,"/app/words.py").is_ok(), "B wrote its script");
-    let a_calc = vm::vm_cat(&ca,"/app/src/calc.js").unwrap();
+    let a_calc = ova.read("/app/src/calc.js").unwrap();
     assert!(String::from_utf8_lossy(&a_calc).contains("a + b"), "A fixed the bug");
     let base_calc = vm::vm_cat(&cbase, "/app/src/calc.js").unwrap();
     assert_eq!(base_calc, broken, "Base keeps the original bytes");
     // the tests the two agents did not touch are unchanged in both
-    assert_eq!(vm::vm_cat(&ca,"/app/test.js").unwrap(), tests, "test.js untouched in A");
-    assert_eq!(vm::vm_cat(&cb,"/app/test.js").unwrap(), tests, "test.js untouched in B");
+    assert_eq!(ova.read("/app/test.js").unwrap(), tests, "test.js untouched in A");
+    assert_eq!(ovb.read("/app/test.js").unwrap(), tests, "test.js untouched in B");
 
     // run each Delta's tree in a sandbox: the agent's report is not evidence
     let root_a = d.join("ma");
     let root_b = d.join("mb");
-    vm::vm_materialize_tree(&ca, &root_a).unwrap();
-    vm::vm_materialize_tree(&cb, &root_b).unwrap();
+    ova.materialize(&root_a).unwrap();
+    ovb.materialize(&root_b).unwrap();
     let (ok, out) = run_in_vm(&root_a, "/bin/node", &["test.js"], "/app");
     assert!(ok, "A's tests must pass in the VM: {}", out);
     assert!(out.contains("ALL PASS"), "A's suite reports success: {}", out);
@@ -172,7 +170,7 @@ if(f){console.log(f+' failed');process.exit(1)}console.log('ALL PASS');\n";
     // the Delta's own snapshot: taken before A ran, so restoring it undoes A's edit while Base stays as it is
     let delta_snap: String = ca.query_row("SELECT name FROM vm_snapshots ORDER BY id LIMIT 1", [], |r| r.get(0)).unwrap();
     vm::snapshot_restore(&ca, &delta_snap).unwrap();
-    assert_eq!(vm::vm_cat(&ca, "/app/src/calc.js").unwrap(), broken, "rollback restores the original");
+    assert_eq!(ova.read("/app/src/calc.js").unwrap(), broken, "rollback restores the original");
     let v = vm::vm_verify(&ca, true).unwrap();
     assert!(v.contains("deep=ok"), "Delta verifies deep after rollback: {}", v);
     let vb = vm::vm_verify(&cbase, true).unwrap();
