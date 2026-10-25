@@ -249,3 +249,37 @@ fn renaming_a_file_out_of_a_protected_prefix_is_refused() {
     c.execute("UPDATE vm_fs SET path='/work/b.txt' WHERE path='/work/a.txt'", []).expect("unprotected rename must work");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn disk_quota_refuses_writes_that_would_exceed_the_total() {
+    // Quota on the sum of file bytes, read from the counters the triggers maintain.
+    let (d, c) = make("quota");
+    let base_bytes: i64 = c.query_row("SELECT CAST(value AS INTEGER) FROM vm_meta WHERE key='logical_bytes'", [], |r| r.get(0)).unwrap();
+    // room for exactly 100 more bytes
+    policy::add(&c, &Rule::DiskQuota(base_bytes as u64 + 100)).unwrap();
+
+    // a write that fits is allowed
+    vm::vm_add_bytes(&c, "/work/fits.txt", &vec![7u8; 80], 0o644, 1).expect("80 of the 100 remaining bytes must fit");
+    // 200 more do not: only 20 are left
+    assert!(refused(vm::vm_add_bytes(&c, "/work/nope.txt", &vec![7u8; 200], 0o644, 1).map_err(|e| anyhow::anyhow!(e.to_string()))),
+        "a write past the quota is refused");
+    let exists: i64 = c.query_row("SELECT count(*) FROM vm_fs WHERE path='/work/nope.txt'", [], |r| r.get(0)).unwrap();
+    assert_eq!(exists, 0, "the refused file does not exist");
+
+    // growing an existing file past the quota is refused, and its size does not change
+    let size_before: i64 = c.query_row("SELECT size FROM vm_fs WHERE path='/work/a.txt'", [], |r| r.get(0)).unwrap();
+    assert!(refused(vm::write_range(&c, "/work/a.txt", 0, &vec![9u8; 500], 2).map_err(|e| anyhow::anyhow!(e.to_string()))),
+        "growing a file past the quota is refused");
+    let size_after: i64 = c.query_row("SELECT size FROM vm_fs WHERE path='/work/a.txt'", [], |r| r.get(0)).unwrap();
+    assert_eq!(size_after, size_before, "a refused growth leaves the size alone");
+
+    // deleting the 80-byte file frees room, so a 60-byte write (20 free + 80 freed) now fits
+    c.execute("DELETE FROM vm_fs WHERE path='/work/fits.txt'", []).unwrap();
+    vm::vm_add_bytes(&c, "/work/after-free.txt", &vec![7u8; 60], 0o644, 1).expect("after freeing space the write fits");
+    // and the quota still holds afterwards
+    assert!(refused(vm::vm_add_bytes(&c, "/work/again.txt", &vec![7u8; 100], 0o644, 1).map_err(|e| anyhow::anyhow!(e.to_string()))),
+        "the quota keeps applying after a delete");
+    let v = vm::vm_verify(&c, true).unwrap();
+    assert!(v.contains("deep=ok"), "deep verify: {}", v);
+    let _ = std::fs::remove_dir_all(&d);
+}

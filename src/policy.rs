@@ -76,7 +76,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS vm_policies(
             id INTEGER PRIMARY KEY,
-            rule_type TEXT NOT NULL CHECK(rule_type IN ('readonly_prefix','max_file_size')),
+            rule_type TEXT NOT NULL CHECK(rule_type IN ('readonly_prefix','max_file_size','disk_quota')),
             pattern TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));",
     )?;
@@ -90,6 +90,8 @@ pub enum Rule {
     ReadonlyPrefix(String),
     /// Refuse writes of regular files larger than this many bytes.
     MaxFileSize(u64),
+    /// Refuse writes that would push the VM's total logical file bytes past this limit.
+    DiskQuota(u64),
 }
 
 /// One stored policy.
@@ -112,6 +114,10 @@ pub fn add(conn: &Connection, rule: &Rule) -> Result<i64> {
         Rule::MaxFileSize(n) => {
             if *n == 0 { return Err(anyhow!("max_file_size must be at least 1 byte")); }
             ("max_file_size", n.to_string())
+        }
+        Rule::DiskQuota(n) => {
+            if *n == 0 { return Err(anyhow!("disk_quota must be at least 1 byte")); }
+            ("disk_quota", n.to_string())
         }
     };
     conn.execute("INSERT INTO vm_policies(rule_type, pattern) VALUES (?1, ?2)", params![kind, pattern])?;
@@ -139,6 +145,7 @@ pub fn list(conn: &Connection) -> Result<Vec<Policy>> {
         let rule = match kind.as_str() {
             "readonly_prefix" => Rule::ReadonlyPrefix(pattern),
             "max_file_size" => Rule::MaxFileSize(pattern.parse()?),
+            "disk_quota" => Rule::DiskQuota(pattern.parse()?),
             other => return Err(anyhow!("unknown rule type in vm_policies: {}", other)),
         };
         out.push(Policy { id, rule });
@@ -185,6 +192,7 @@ pub fn rebuild_triggers(conn: &Connection) -> Result<()> {
     }
     let mut prefixes: Vec<String> = Vec::new();
     let mut max_size: Option<u64> = None;
+    let mut quota: Option<u64> = None;
     for (kind, pattern) in &policies {
         match kind.as_str() {
             "readonly_prefix" => prefixes.push(pattern.clone()),
@@ -193,20 +201,37 @@ pub fn rebuild_triggers(conn: &Connection) -> Result<()> {
                 // several limits: the strictest one applies
                 max_size = Some(max_size.map_or(n, |m| m.min(n)));
             }
+            "disk_quota" => {
+                let n: u64 = pattern.parse()?;
+                quota = Some(quota.map_or(n, |m| m.min(n)));
+            }
             other => return Err(anyhow!("unknown rule type in vm_policies: {}", other)),
         }
     }
     // Internal operations bypass the policy on this connection only (see register / BypassFlag).
     let bypass = format!("{}()", BYPASS_FN);
     let refuse = format!("SELECT RAISE(ABORT, '{}')", REFUSAL_MESSAGE);
+    // Disk quota: the total the counters would show once this row exists. Only inserts and updates can
+    // grow it, so the condition uses NEW; a delete only frees space. The row's own previous size is
+    // subtracted, because vm_meta still counts it (an update replaces a row).
+    let quota_cond = || -> Option<String> {
+        let q = quota?;
+        Some(format!(
+            "(NEW.kind = 'file' AND (CAST((SELECT value FROM vm_meta WHERE key='logical_bytes') AS INTEGER)
+               - COALESCE((SELECT CASE WHEN f2.kind='file' THEN f2.size ELSE 0 END FROM vm_fs f2 WHERE f2.path = NEW.path), 0)
+               + NEW.size) > {q})", q = q))
+    };
     let fs_row = |r: &str| -> Option<String> {
-        if prefixes.is_empty() && max_size.is_none() { return None; }
+        if prefixes.is_empty() && max_size.is_none() && quota.is_none() { return None; }
         let mut conds: Vec<String> = prefixes.iter().map(|p| under_prefix(&format!("{}.path", r), p)).collect();
-        if let Some(m) = max_size {
-            // only regular files are size-limited; a directory or symlink row has no content
-            conds.push(format!("({r}.kind = 'file' AND {r}.size > {m})", r = r, m = m));
+        // size and quota apply to the new row only: an old row's size is not what is being written
+        if r == "NEW" {
+            if let Some(m) = max_size {
+                conds.push(format!("({r}.kind = 'file' AND {r}.size > {m})", r = r, m = m));
+            }
+            if let Some(q) = quota_cond() { conds.push(q); }
         }
-        Some(conds.join(" OR "))
+        if conds.is_empty() { None } else { Some(conds.join(" OR ")) }
     };
     // Chunk rows carry content, so the prefix rule applies to them as well (with no size rule: the
     // size is on vm_fs, and the chunk write that goes with a too-large file is refused by its vm_fs row).

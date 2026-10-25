@@ -593,6 +593,7 @@ fn main() -> anyhow::Result<()> {
                         match p.rule {
                             Rule::ReadonlyPrefix(x) => println!("{:>4}  readonly_prefix  {}", p.id, x),
                             Rule::MaxFileSize(n) => println!("{:>4}  max_file_size    {} bytes", p.id, n),
+                            Rule::DiskQuota(n) => println!("{:>4}  disk_quota       {} bytes", p.id, n),
                         }
                     }
                 }
@@ -603,6 +604,10 @@ fn main() -> anyhow::Result<()> {
                 PolicyAction::AddMaxSize { bytes } => {
                     let id = policy::add(&c, &Rule::MaxFileSize(bytes))?;
                     println!("policy {}: max_file_size {} bytes", id, bytes);
+                }
+                PolicyAction::AddDiskQuota { bytes } => {
+                    let id = policy::add(&c, &Rule::DiskQuota(bytes))?;
+                    println!("policy {}: disk_quota {} bytes", id, bytes);
                 }
                 PolicyAction::Remove { id } => {
                     if policy::remove(&c, id)? { println!("removed policy {}", id); }
@@ -887,6 +892,8 @@ enum PolicyAction {
     AddReadonly { prefix: String },
     /// Refuse writes of regular files larger than N bytes.
     AddMaxSize { bytes: u64 },
+    /// Refuse writes that would push the VM's total file bytes past N.
+    AddDiskQuota { bytes: u64 },
     /// Remove a rule by id (see list).
     Remove { id: i64 },
 }
