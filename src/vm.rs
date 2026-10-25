@@ -1927,6 +1927,9 @@ pub(crate) fn is_reserved_vm_path(p: &str) -> bool {
     // - the proxy socket bound into the sandbox: a socket file, not content;
     // - the forwarder's own log and pi's session transcripts.
     if p.starts_with("/tmp/") { return true; }
+    // python writes .pyc into __pycache__ beside its sources at import time; that is a runtime artefact like
+    // node's compile cache, not a change the task made (measured: a python task reported 20 such paths).
+    if p.contains("/__pycache__") { return true; }
     if p.starts_with("/opt/piagent/") { return true; }
     p == "/opt/piagent"
 }

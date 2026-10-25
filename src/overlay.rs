@@ -629,6 +629,21 @@ impl Overlay {
         use std::collections::HashSet;
         let mut seen: HashSet<String> = HashSet::new();
         let mut written = 0usize;
+        // view path -> database path, so an entry reached through a directory link is recognised
+        let links = self.view_links()?;
+        let mut view_to_db: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Two passes so a literal path wins over a translated one. Base has /bin -> /usr/bin and also rows
+        // like /bin/gcc; the tree shows /bin (the link) and usr/bin/gcc. Mapping usr/bin/gcc back is right,
+        // but mapping /bin back to /usr/bin would make the tree's own /bin look unrecorded and re-create it
+        // in Delta (measured: /bin appearing as created in every run).
+        let mut translated: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let paths = self.all_paths()?;
+        for (p, _k) in &paths {
+            let vp = self.resolved_path(p, &links);
+            if vp != *p { translated.insert(vp, p.clone()); }
+        }
+        for (p, _k) in &paths { view_to_db.insert(p.clone(), p.clone()); }
+        for (vp, p) in translated { view_to_db.insert(vp, p); }
         for entry in walkdir::WalkDir::new(tree).follow_links(false).min_depth(1) {
             let e = match entry { Ok(v) => v, Err(_) => continue };
             let rel = e.path().strip_prefix(tree).unwrap_or(e.path()).to_string_lossy().to_string();
@@ -636,29 +651,40 @@ impl Overlay {
             if vm::is_reserved_vm_path(&p) { continue; }
             seen.insert(p.clone());
             let md = match std::fs::symlink_metadata(e.path()) { Ok(m) => m, Err(_) => continue };
-            let layer_kind = self.kind_in_overlay(&p)?;
+            // The path on disk is the *view* path: a Base entry at /bin/gcc (a link under the directory
+            // link /bin -> /usr/bin) appears at usr/bin/gcc. Looking that up literally finds nothing and the
+            // tree write-back would create a duplicate in Delta (measured: /usr/bin/gcc, /usr/bin/python3,
+            // /usr/bin/sh appearing as created). The view path is translated back to the database path first.
+            let db_p = view_to_db.get(&p).cloned().unwrap_or_else(|| p.clone());
+            let layer_kind = self.kind_in_overlay(&db_p)?;
             let ft = md.file_type();
             let host_kind = if ft.is_symlink() { "symlink" } else if md.is_dir() { "dir" } else { "file" };
             // unchanged content is skipped: this is what keeps Delta small
             match (host_kind, layer_kind.as_deref()) {
                 ("dir", Some("dir")) => continue,
                 ("symlink", Some("symlink")) => {
-                    let want = std::fs::read_link(e.path())?.to_string_lossy().to_string();
-                    if self.readlink(&p).map(|t| t == want).unwrap_or(false) { continue; }
-                    self.symlink(&p, &want)?;
+                    // compare the stored target with the one on disk. The disk shows the *mount* form (a
+                    // relative path that stays inside the tree), so the stored absolute target is converted
+                    // the same way before comparing; otherwise every directory link looked changed and was
+                    // re-written into Delta on every run (measured: /bin created in each run).
+                    let stored = self.readlink(&db_p)?;
+                    let disk = std::fs::read_link(e.path())?.to_string_lossy().to_string();
+                    let view = view_to_db.get(&p).cloned().unwrap_or_else(|| p.clone());
+                    if crate::owner::mount_link_text(&self.resolved_path(&view, &links), &stored) == disk { continue; }
+                    self.symlink(&db_p, &disk)?;
                 }
                 ("file", Some("file")) => {
                     let disk = std::fs::read(e.path())?;
                     let now = self.read(&p)?;
                     if disk == now { continue; }
                     // a small change to a large file keeps copy-on-write: only the touched chunks move
-                    self.write_smallest(&p, &disk, &now)?;
+                    self.write_smallest(&db_p, &disk, &now)?;
                 }
                 _ => {
                     match host_kind {
-                        "dir" => { self.mkdir(&p)?; }
-                        "symlink" => { let t = std::fs::read_link(e.path())?.to_string_lossy().to_string(); self.symlink(&p, &t)?; }
-                        _ => { let data = std::fs::read(e.path())?; self.write(&p, &data, 0o644, crate::vm::now_secs())?; }
+                        "dir" => { self.mkdir(&db_p)?; }
+                        "symlink" => { let t = std::fs::read_link(e.path())?.to_string_lossy().to_string(); self.symlink(&db_p, &t)?; }
+                        _ => { let data = std::fs::read(e.path())?; self.write(&db_p, &data, 0o644, crate::vm::now_secs())?; }
                     }
                 }
             }
