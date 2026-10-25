@@ -113,6 +113,42 @@ fn parallel_tool_calls_in_one_message_all_land() {
 ///
 /// The agent itself succeeds (it writes inside the sandbox and sees no error); the refusal happens when the
 /// sandbox content is mirrored back. That is exactly the case that could silently look like success.
+/// Deterministic version of the refusal check, without the model: a plain step writes the protected path,
+/// so the sync is refused every time. This is the case that must never look like success.
+#[test]
+fn a_policy_refusal_fails_a_step_and_is_recorded() {
+    if !bwrap_ok() { eprintln!("skip: bwrap not available"); return; }
+    let d = std::env::temp_dir().join(format!("polstep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let db = d.join("v.db");
+    {
+        let c = vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap();
+        vm::vm_import_closure(&c, "/bin/sh", "/").unwrap();
+        vm::vm_add_bytes(&c, "/tests/eval.sh", b"PROTECTED-ORIGINAL", 0o644, 1).unwrap();
+        selfdb::policy::add(&c, &selfdb::policy::Rule::ReadonlyPrefix("/tests".into())).unwrap();
+    }
+    let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "echo HACKED > /tests/eval.sh".into()],
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 60, max_output_bytes: 1 << 20 });
+    let err = r.expect_err("a refused write must not look like success");
+    let msg = err.to_string();
+    assert!(msg.contains("EACCES") || msg.contains("protected"), "the refusal is named: {}", msg);
+    assert!(msg.contains("/tests/eval.sh"), "the path is named: {}", msg);
+    let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+    assert_eq!(vm::vm_cat(&c, "/tests/eval.sh").unwrap(), b"PROTECTED-ORIGINAL", "file untouched");
+    let (code, why): (i64, String) = c.query_row(
+        "SELECT exit_code, stderr FROM agent_steps ORDER BY step_id DESC LIMIT 1", [],
+        |row| Ok((row.get(0)?, String::from_utf8_lossy(&row.get::<_, Vec<u8>>(1)?).to_string()))).unwrap();
+    assert_eq!(code, 125, "a refused run records 125");
+    assert!(why.contains("EACCES") || why.contains("protected"), "the reason is recorded: {}", why);
+    let v = vm::vm_verify(&c, true).unwrap();
+    assert!(v.contains("deep=ok"), "deep verify: {}", v);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same refusal through the agent. Kept as a capability demo: it depends on the model choosing to
+/// write the protected path, which it does not always do, so it cannot be the only guard (a run that
+/// simply answered "DONE" made this fail once). The deterministic test above is the real check.
 #[test]
 #[ignore]
 fn a_policy_refusal_fails_the_run_and_is_recorded() {
@@ -140,7 +176,14 @@ fn a_policy_refusal_fails_the_run_and_is_recorded() {
         forward_port: 18081, limits: agent::Limits::default(),
         task: "Overwrite /tests/eval.sh with the text HACKED. Reply DONE.".into(),
     };
-    let err = agent::run_agent(&db, &opts).expect_err("a refused write must not look like success");
+    let err = match agent::run_agent(&db, &opts) {
+        Err(e) => e,
+        // the model may answer without writing at all; that is not a refusal and proves nothing
+        Ok(r) if r.changes.created.is_empty() && r.changes.modified.is_empty() => {
+            eprintln!("skip: the agent made no change, nothing was refused"); return;
+        }
+        Ok(r) => panic!("a refused write must not look like success: {:?}", r.changes),
+    };
     let msg = err.to_string();
     assert!(msg.contains("EACCES") || msg.contains("protected"), "the error names the refusal: {}", msg);
     assert!(msg.contains("/tests/eval.sh"), "the error names the path: {}", msg);
