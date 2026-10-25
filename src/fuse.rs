@@ -19,6 +19,10 @@ pub mod fuse_impl {
         /// One connection per mount; fuser dispatches Filesystem callbacks on a single thread.
         conn: rusqlite::Connection,
         ino_to_path: HashMap<u64, String>,
+        /// The path the kernel reaches for this inode, which differs from the database path when an
+        /// ancestor is a symlink (/bin/sh is reached as usr/bin/sh). Relative link targets must be
+        /// computed from this one, or they point outside the tree.
+        ino_to_view: HashMap<u64, String>,
         path_to_ino: HashMap<String, u64>,
         ino_to_kind: HashMap<u64, String>,
         ino_to_attr: HashMap<u64, FileAttr>,
@@ -34,6 +38,7 @@ pub mod fuse_impl {
                 owner: crate::owner::Owner::of_current_process(),
                 conn,
                 ino_to_path: HashMap::new(),
+                ino_to_view: HashMap::new(),
                 path_to_ino: HashMap::new(),
                 ino_to_kind: HashMap::new(),
                 ino_to_attr: HashMap::new(),
@@ -50,6 +55,7 @@ pub mod fuse_impl {
 
         fn rebuild(&mut self) -> Result<()> {
             self.ino_to_path.clear();
+            self.ino_to_view.clear();
             self.path_to_ino.clear();
             self.ino_to_kind.clear();
             self.ino_to_attr.clear();
@@ -72,11 +78,41 @@ pub mod fuse_impl {
                 flags: 0,
             };
             self.ino_to_path.insert(1, "/".to_string());
+            self.ino_to_view.insert(1, "/".to_string());
             self.path_to_ino.insert("/".to_string(), 1);
             self.ino_to_kind.insert(1, "dir".to_string());
             self.ino_to_attr.insert(1, root_attr);
 
             let conn = &self.conn;
+            // A path whose parent is a symlink is not reachable at its literal path: /bin is a link to
+            // /usr/bin, so a child of /bin lives at usr/bin inside the mounted tree. Registering the
+            // literal path made such entries invisible (measured: /bin/sh could not be listed or read at
+            // all). Every entry is therefore registered under the path the kernel would reach, and the
+            // database path stays in ino_to_path for reads and writes.
+            let link_map: std::collections::HashMap<String, String> = {
+                let mut m = std::collections::HashMap::new();
+                let mut ls = conn.prepare("SELECT path, link_target FROM vm_fs WHERE kind='symlink'")?;
+                for r in ls.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+                    let (p, t): (String, String) = r?; m.insert(normalize_vm_path(&p), t);
+                }
+                m
+            };
+            let view_of = |p: &str| -> String {
+                match crate::vm::resolve_parent_in_vm(p, &link_map) {
+                    Some(pv) => {
+                        let name = std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        normalize_vm_path(&format!("{}/{}", pv.trim_end_matches('/'), name))
+                    }
+                    None => p.to_string(),
+                }
+            };
+            let real_paths: std::collections::HashSet<String> = {
+                let mut st = conn.prepare("SELECT path FROM vm_fs WHERE kind <> 'symlink'")?;
+                let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+                let mut set = std::collections::HashSet::new();
+                for r in rows { set.insert(normalize_vm_path(&r?)); }
+                set
+            };
             // uid/gid are read only to be passed to Owner::for_node, which ignores them (see owner.rs)
             let mut stmt = conn.prepare("SELECT path, kind, mode, size, mtime, uid, gid, link_target, compressed FROM vm_fs ORDER BY length(path), path")?;
             let rows = stmt.query_map([], |r| Ok((
@@ -103,11 +139,15 @@ pub mod fuse_impl {
                     }
                     continue;
                 }
-                if self.path_to_ino.contains_key(&norm) { continue; }
+                // an alias link pointing at a real entry has no room in the tree; the real entry serves it
+                let view = view_of(&norm);
+                if view != norm && real_paths.contains(&view) { continue; }
+                if self.path_to_ino.contains_key(&view) { continue; }
                 let ino = self.next_ino;
                 self.next_ino += 1;
-                self.path_to_ino.insert(norm.clone(), ino);
+                self.path_to_ino.insert(view.clone(), ino);
                 self.ino_to_path.insert(ino, norm.clone());
+                self.ino_to_view.insert(ino, view.clone());
                 self.ino_to_kind.insert(ino, kind.clone());
                 let ft = match kind.as_str() {
                     "dir" => FileType::Directory,
@@ -209,7 +249,10 @@ pub mod fuse_impl {
             match target {
                 // the stored target is unchanged; the mount shows absolute targets as paths that stay
                 // inside the mount (see owner::mount_link_text)
-                Ok(t) => reply.data(crate::owner::mount_link_text(&path, &t).as_bytes()),
+                Ok(t) => {
+                    let view = self.ino_to_view.get(&ino).cloned().unwrap_or_else(|| path.clone());
+                    reply.data(crate::owner::mount_link_text(&view, &t).as_bytes())
+                }
                 Err(_) => reply.error(libc::ENOENT),
             }
         }
