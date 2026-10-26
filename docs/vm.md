@@ -152,6 +152,68 @@ self agent-log /tmp/vm.db [--json] [--last N]
 - 超时退出码 124；输出每个流最多保留 `--max-output` 字节，超出部分读取后丢弃，子进程不会因管道写满而阻塞。
 - 变更清单经 JSON 转义，路径中的换行与引号可以正确还原。
 
+## AgentVM：把 agent 装进 VM 跑
+
+```sh
+self vm-init work.db
+self vm-provision-agent work.db --tools dev     # node + pi + git/coreutils/python3/make/gcc
+
+self vm-pack  work.db /path/to/project --prefix /app
+self vm-snap  work.db before
+
+self vm-agent work.db --timeout 300 "修 /app 里失败的测试"        # 一次性任务，可审计可回滚
+self agent-log work.db                                            # 审计
+self vm-rollback work.db before                                    # 整体回滚
+```
+
+`--tools` 三档：`none`（只有 node 与 pi）、`minimal`（默认，加 coreutils）、`dev`（再加
+git、sed/awk/find/tar/gzip、python3 及其标准库、make、gcc）。
+
+- `dev` 会额外打包 gcc 的 cc1/as/ld/collect2、`/usr/include`、libgcc 与 C 库的 crt
+  文件。这些不是 ELF 依赖，`vm-import` 的闭包看不到；缺了它们 gcc 只能打印版本号，
+  任何真实编译都会失败。实测体积 248MB，VM 内可编译并运行 C 程序、`make` 可构建 C 目标。
+- python3 需要标准库，其位置由宿主解释器自己报告（`sysconfig`），不是固定路径。
+
+### 并行：每步一个 Delta
+
+```sh
+self vm-init work.db                       # 或复制一个已装好的库
+self vm-agent work.db --base base.db -- "任务"    # work.db 作为只读 base.db 的 Delta
+```
+
+多个 Delta 可以同时跑，互不影响，Base 只读共享：每个 Delta 只存自己改过的 chunk，
+实测一次只改一个文件的运行产生约 200KB 的 Delta（相对 115MB 的 Base）。
+
+### 资源与配额
+
+```sh
+self vm-policy work.db add-readonly /tests
+self vm-policy work.db add-max-size 1048576
+self vm-policy work.db add-disk-quota 536870912    # 逻辑总字节上限
+self vm-agent work.db --mem-mb 2048 --cpu-secs 120 --file-mb 256 "..."
+```
+
+- `--mem-mb` 是 `RLIMIT_AS`，默认 2048。node 需要 ≥1536 才能启动（低于此共享库映射失败），
+  所以它是防失控的底线，不是紧配额。
+- `disk_quota` 在**单库**和 **Delta** 两种形态下都生效：Delta 没有自己的策略表，
+  叠加层在写前检查 Base 的规则（含只读前缀、单文件上限、总配额）。
+
+### 受控包下载
+
+VM 默认完全断网。需要下载时，宿主代理提供 `/pkg/<host>/<path>` 的白名单通道：
+
+```sh
+self vm-proxy --base "$MODEL_URL" --key-env MODEL_KEY /tmp/proxy.sock \
+              --allow-hosts registry.npmjs.org,files.pythonhosted.org
+self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
+```
+
+- 只有白名单内的主机可达；其余返回 `403` 并在响应体说明原因。
+- 白名单是宿主侧状态，guest 只能通过路径里的主机段表达目标，无法绕过。
+- 包请求不携带模型凭据。
+- guest 侧目前需要自己拼 `http://127.0.0.1:<port>/pkg/<host>/<path>`（VM 内没有
+  `curl`，可用 python3 的 `http.client`）；没有 `HTTP_PROXY` 自动集成。
+
 ## 安全边界
 
 本节说明每一层保证什么、不保证什么。这些是重要的，因为它们决定能把什么样的代码放进哪一层执行。
@@ -216,6 +278,9 @@ self agent-log /tmp/vm.db [--json] [--last N]
 - `vm-chroot` 回落路径会物化整个 rootfs 到临时目录，大镜像慢。
 - FUSE 写入路径未做挂载端到端测试：本机无 root，挂载在用户命名空间内只能把挂载者映射为 uid 0，无法验证以非 0 uid 写入。见「安全边界」§2。
 - 挂载不是隔离边界；`vm-chroot` 的 FUSE 路径与 `agent-step` 的隔离参数不一致，且网络未隔离（已实测）。见「安全边界」§2、§3。
+- `vm-agent --fuse` 是实验性的：能挂载、能启动 agent、/tmp 不留物化树，但 pi 以 `O_EXCL` 打开会话文件时本 FUSE 层报错，因此默认仍走物化路径。
+- Delta 上跑 agent 时，快照 diff 只比较 Delta 自身，所以一个被修改的既有文件会显示为 `created` 而不是 `modified`（内容正确）。
+- 包下载通道没有 guest 侧代理变量集成，VM 内也没有 `curl`；需自行发 `http://127.0.0.1:<port>/pkg/<host>/<path>`。
 - 注入不检查目标是否正在使用；注入与一个正在运行的步骤同时进行时，行为未定义。
 - 计划中的 `deny_exec_outside` 策略规则未实现。
 - NBD 服务未实现（原 `vm-disk-nbd` 已删除）；需 `vm-disk-export` 后用 `qemu-nbd`。
