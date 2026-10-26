@@ -310,6 +310,33 @@ impl ToolSet {
                               "/bin/env", "/bin/ln", "/bin/touch", "/bin/echo", "/bin/true", "/bin/false"],
         }
     }
+    /// Extra programs the compiler forks. `vm_import_closure` follows DT_NEEDED, so gcc's own helpers
+    /// (cc1, as, ld, collect2) are invisible to it: without them gcc only reports its version and every
+    /// real compile fails with "cannot execute 'cc1'" (measured).
+    fn compiler_helpers(self) -> &'static [&'static str] {
+        match self {
+            ToolSet::Dev => &[
+                "/usr/libexec/gcc/x86_64-linux-gnu/14/cc1",
+                "/usr/libexec/gcc/x86_64-linux-gnu/14/cc1plus",
+                "/usr/libexec/gcc/x86_64-linux-gnu/14/collect2",
+                "/usr/libexec/gcc/x86_64-linux-gnu/14/lto1",
+                "/usr/libexec/gcc/x86_64-linux-gnu/14/lto-wrapper",
+                "/usr/libexec/gcc/x86_64-linux-gnu/14/liblto_plugin.so",
+                "/usr/bin/as",
+                "/usr/bin/ld",
+                "/usr/bin/ld.bfd",
+            ],
+            _ => &[],
+        }
+    }
+
+    /// Individual files the linker needs from the C library directory (crt objects, linker scripts, the
+    /// static pieces libc.so pulls in). They are not DT_NEEDED, so the closure import misses them.
+    fn linker_inputs(self) -> Vec<String> {
+        if self != ToolSet::Dev { return Vec::new(); }
+        compiler_linker_inputs()
+    }
+
     /// Whole host directories to pack, for tools whose runtime data is not an ELF dependency.
     ///
     /// python3 needs its standard library, and its location is a property of the interpreter, not a fixed
@@ -318,10 +345,41 @@ impl ToolSet {
     /// independent libraries"). The path is asked of the interpreter itself.
     fn trees(self) -> Vec<(String, String)> {
         match self {
-            ToolSet::Dev => python_stdlib().map(|p| vec![(p.clone(), p)]).unwrap_or_default(),
+            ToolSet::Dev => {
+                let mut v: Vec<(String, String)> = Vec::new();
+                if let Some(p) = python_stdlib() { v.push((p.clone(), p)); }
+                // gcc's build-time data: headers, its own runtime objects, the C library's crt files and
+                // static libs. None of these are DT_NEEDED, so the closure import misses them and a compile
+                // fails on a missing stdio.h or crt1.o.
+                // Only what a compile actually reads. Packing the whole of /usr/lib/x86_64-linux-gnu put 4 GB
+                // of static libraries into the database (measured: a 1.5 GB VM); the C library's crt files,
+                // its linker scripts and libgcc are enough for ordinary C.
+                for d in ["/usr/include", "/usr/lib/gcc/x86_64-linux-gnu/14"] {
+                    if std::path::Path::new(d).is_dir() { v.push((d.to_string(), d.to_string())); }
+                }
+                v
+            }
             _ => Vec::new(),
         }
     }
+}
+
+/// Files the linker needs from the C library directory: startup objects, linker scripts and the static
+/// pieces `libc.so`/`libm.so` pull in. Directories are not returned here; this is a file list.
+fn compiler_linker_inputs() -> Vec<String> {
+    let mut out = Vec::new();
+    let dir = std::path::Path::new("/usr/lib/x86_64-linux-gnu");
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd.filter_map(|e| e.ok()) {
+        let name = e.file_name().to_string_lossy().to_string();
+        let keep = name.ends_with(".o")
+            || name == "libc.so" || name == "libm.so" || name == "libpthread.so"
+            || name == "libc_nonshared.a" || name == "libm.a" || name == "libpthread.a"
+            || name == "libmvec.so" || name == "libmvec.a" || name == "libgcc_s.so.1"
+            || name == "libresolv.so" || name.starts_with("libc.so.");
+        if keep { out.push(e.path().to_string_lossy().to_string()); }
+    }
+    out
 }
 
 /// The standard library directory of the host's python3, as the interpreter reports it.
@@ -342,6 +400,24 @@ pub fn provision_agent_with(db: &Path, node: &Path, pi_dir: &Path, tools: ToolSe
     let objects = vm::vm_import_closure(&conn, node_s, "/")?;
     // an agent runs shell commands, so a shell and its libraries must be there too
     let mut shell_objects = 0usize;
+    // Single files the linker needs. `vm_pack_host_dir_parallel` only walks directories, so these are added
+    // one by one; passing them as trees silently skipped every crt object (measured: ld could not find
+    // Scrt1.o while gcc reported its version fine).
+    let mut single_files = 0usize;
+    for f in tools.linker_inputs() {
+        // Never touch a path the import already recorded: /usr/bin/as and /usr/bin/ld may already exist as
+        // symlinks, and writing them as regular files made the binary unusable (measured: /bin/git gave
+        // "Exec format error" because it had been overwritten with another file's bytes).
+        let taken: i64 = conn.query_row("SELECT count(*) FROM vm_fs WHERE path=?1", params![f], |r| r.get(0))?;
+        if taken > 0 { continue; }
+        if std::path::Path::new(&f).is_file() && vm::vm_add_file(&conn, &f, &f).is_ok() { single_files += 1; }
+    }
+    let _ = single_files;
+    for prog in tools.compiler_helpers() {
+        if std::path::Path::new(prog).exists() {
+            shell_objects += vm::vm_import_closure(&conn, prog, "/").unwrap_or(0);
+        }
+    }
     for prog in tools.commands() {
         if std::path::Path::new(prog).exists() {
             shell_objects += vm::vm_import_closure(&conn, prog, "/").unwrap_or(0);

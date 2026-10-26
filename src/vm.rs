@@ -51,15 +51,36 @@ pub fn cache_path_for_hash(hash: &str) -> PathBuf {
     let a = &hash[0..2.min(hash.len())];
     dir.join(a).join(hash)
 }
+/// Place a cached file into a materialised tree without letting the tree write back into the cache.
+///
+/// A hard link makes the tree entry and the cache entry the same inode, so an in-place write in the tree
+/// (an editor, `sed`-style rewrite, an agent's script) changes the cached bytes. The next materialise then
+/// hands those edited bytes to a database that still holds the originals — measured: after editing a tree,
+/// materialising the same unmodified database returned the edited text, and the repository's own
+/// `reused_scratch_dir_reflects_db_not_stale_host_edits` failed from then on.
+///
+/// A reflink (copy-on-write clone) keeps the sharing cheap and isolates writes, so it is tried first. When
+/// the filesystem has no reflink support the file is copied: slower, but the cache can never be corrupted by
+/// a tree.
 fn try_hardlink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(par)=dst.parent(){ let _ = std::fs::create_dir_all(par); }
-    if src.exists() {
-        let _ = std::fs::remove_file(dst);
-        if std::fs::hard_link(src, dst).is_ok() { return Ok(()); }
-        std::fs::copy(src, dst).map(|_|())
-    } else {
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cache miss"))
+    if !src.exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cache miss"));
     }
+    let _ = std::fs::remove_file(dst);
+    if reflink(src, dst).is_ok() { return Ok(()); }
+    std::fs::copy(src, dst).map(|_|())
+}
+
+/// Clone `src` to `dst` with FICLONE (copy-on-write on btrfs/xfs, a full copy elsewhere but still isolated).
+/// Writes to either file stay private, unlike a hard link.
+fn reflink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let s = std::fs::File::open(src)?;
+    let d = std::fs::File::create(dst)?;
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 // LRU for decompressed blobs: hash -> raw bytes

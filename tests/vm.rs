@@ -924,3 +924,43 @@ fn v9_agent_steps_gains_truncation_columns_and_keeps_rows() {
     c.execute("INSERT INTO agent_steps(cmd, exit_code, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, fs_diff_json)
         VALUES ('new', 0, 1, x'', x'', 1, 0, 'b', '{}')", []).unwrap();
 }
+
+#[test]
+fn editing_a_materialised_tree_cannot_change_what_the_next_materialise_returns() {
+    // Regression: cached files were hard-linked into the tree, so an in-place edit in the tree changed the
+    // cached bytes and the next materialise of the same unmodified database returned them.
+    //
+    // The tree and the cache must be on one filesystem for that sharing to happen at all: /tmp is usually a
+    // separate tmpfs, so this test uses /var/tmp and its own cache root.
+    let root = PathBuf::from(format!("/var/tmp/cache-isolation-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let c = open(&root.join("v.db"));
+    let body = format!("origin-bytes-{}", std::process::id());
+    vm::vm_add_bytes(&c, "/f.txt", body.as_bytes(), 0o644, 1).unwrap();
+
+    // warm the cache, then materialise again: only the second tree shares the cached entry
+    let warm = root.join("t0");
+    vm::vm_materialize_tree_with_cache(&c, &warm, &cache).unwrap();
+    let first = root.join("t1");
+    vm::vm_materialize_tree_with_cache(&c, &first, &cache).unwrap();
+    assert_eq!(std::fs::read(first.join("f.txt")).unwrap(), body.as_bytes());
+
+    // an agent rewrites the file in the tree, in place
+    std::fs::write(first.join("f.txt"), b"EDITED-IN-THE-TREE").unwrap();
+
+    // the database never changed, so a fresh materialise must still produce the original bytes
+    let second = root.join("t2");
+    vm::vm_materialize_tree_with_cache(&c, &second, &cache).unwrap();
+    assert_eq!(std::fs::read(second.join("f.txt")).unwrap(), body.as_bytes(),
+        "a tree edit must not reach the content cache");
+    // and no cached entry was damaged
+    let damaged = walkdir::WalkDir::new(&cache).into_iter().filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| std::fs::read(e.path()).map(|b| b == b"EDITED-IN-THE-TREE").unwrap_or(false))
+        .count();
+    assert_eq!(damaged, 0, "no cache entry may hold the tree edit");
+    let _ = std::fs::remove_dir_all(&root);
+}

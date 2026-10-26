@@ -29,9 +29,13 @@ fn bwrap_ok() -> bool {
 
 /// Run a command inside the materialised tree, returning its stdout.
 fn run_in_tree(root: &Path, prog: &str, args: &[&str]) -> (bool, String) {
+    run_in_tree_at(root, prog, args, "/")
+}
+
+fn run_in_tree_at(root: &Path, prog: &str, args: &[&str], cwd: &str) -> (bool, String) {
     let out = std::process::Command::new("bwrap")
         .args(["--bind", root.to_str().unwrap(), "/", "--dev", "/dev", "--proc", "/proc",
-               "--unshare-pid", "--die-with-parent", "--chdir", "/",
+               "--unshare-pid", "--die-with-parent", "--chdir", cwd,
                "--setenv", "HOME", "/root", "--setenv", "PATH", "/usr/bin:/bin"])
         .arg(prog).args(args).output().expect("bwrap");
     (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
@@ -100,10 +104,11 @@ fn the_dev_tool_set_provides_git_python_make_and_gcc() {
     vm::vm_open(db.to_str().unwrap()).and_then(|c| vm::vm_materialize_tree(&c, &root)).unwrap();
 
     // each tool must actually run, not merely be present
-    let checks: [(&str, &[&str], &str); 4] = [
+    // Versions only prove the binary starts. gcc and make are checked by compiling and running real code,
+    // because a gcc missing its cc1/as/ld helpers passes `--version` and fails every compile (measured).
+    let checks: [(&str, &[&str], &str); 3] = [
         ("/bin/git", &["--version"], "git version"),
-        ("/bin/python3", &["-c", "import json,http.client;print('PY_STDLIB_OK')"], "PY_STDLIB_OK"),
-        ("/bin/make", &["--version"], "GNU Make"),
+        ("/bin/python3", &["-c", "import json,http.client,ssl,sqlite3;print('PY_STDLIB_OK')"], "PY_STDLIB_OK"),
         ("/bin/gcc", &["--version"], "gcc"),
     ];
     for (prog, args, want) in checks {
@@ -111,6 +116,23 @@ fn the_dev_tool_set_provides_git_python_make_and_gcc() {
         assert!(ok, "{} must run in the VM: {}", prog, out);
         assert!(out.contains(want), "{} must report {:?}, got {:?}", prog, want, out.lines().next());
     }
+
+    // a real C program, built and run inside the VM
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("h.c"), b"#include <stdio.h>\nint main(){printf(\"CC_OK\\n\");return 0;}\n").unwrap();
+    let (ok, out) = run_in_tree_at(&root, "/bin/gcc", &["-o", "h", "h.c"], "/work");
+    assert!(ok, "gcc must compile a program that includes stdio.h: {}", out);
+    let (ok, out) = run_in_tree_at(&root, "/work/h", &[], "/work");
+    assert!(ok && out.contains("CC_OK"), "the compiled program must run: {}", out);
+
+    // and make must drive that same compiler, not just print its version
+    std::fs::write(work.join("Makefile"), b"all: m\nm: m.c\n\tgcc -o m m.c\n").unwrap();
+    std::fs::write(work.join("m.c"), b"#include <stdio.h>\nint main(){puts(\"MAKE_OK\");return 0;}\n").unwrap();
+    let (ok, out) = run_in_tree_at(&root, "/bin/make", &[], "/work");
+    assert!(ok, "make must build a C target: {}", out);
+    let (ok, out) = run_in_tree_at(&root, "/work/m", &[], "/work");
+    assert!(ok && out.contains("MAKE_OK"), "the program make built must run: {}", out);
     let size = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
     eprintln!("dev tools: {} bytes, {} node objects, {} pi files, provision {} s",
         size, rep.objects, rep.files, provision_s);

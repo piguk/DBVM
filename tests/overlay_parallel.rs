@@ -180,3 +180,51 @@ fn an_unchanged_tree_writes_no_whiteouts() {
     assert_eq!(ov.read("/usr/bin/tool").unwrap(), b"TOOL");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The Base's write policies apply through the overlay: readonly prefixes, a per-file limit and a total
+/// quota. Only the prefix rule used to be checked, so a quota set on the Base was ignored by every overlay
+/// write (measured: a 10 MiB write succeeded with a 1 KiB quota in force).
+#[test]
+fn base_policies_apply_to_overlay_writes() {
+    let (d, base) = setup("policies");
+    {
+        let bc = vm::vm_open(base.to_str().unwrap()).unwrap();
+        selfdb::policy::add(&bc, &selfdb::policy::Rule::ReadonlyPrefix("/ro".into())).unwrap();
+        selfdb::policy::add(&bc, &selfdb::policy::Rule::MaxFileSize(4096)).unwrap();
+    }
+    let delta = d.join("delta.db");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+
+    // readonly prefix
+    let e = ov.write("/ro/x", b"nope", 0o644, 1).expect_err("a readonly prefix must be refused");
+    assert!(selfdb::policy::is_refusal(&e), "the refusal is the policy's: {}", e);
+
+    // per-file limit: 4096 bytes allowed, one more not
+    ov.write("/app/fits.bin", &vec![1u8; 4096], 0o644, 1).expect("a file at the limit is allowed");
+    let e = ov.write("/app/big.bin", &vec![1u8; 4097], 0o644, 1).expect_err("a file over the limit must be refused");
+    assert!(selfdb::policy::is_refusal(&e), "the refusal is the policy's: {}", e);
+    // growing an existing file past the limit is refused too
+    let e = ov.write_range("/app/fits.bin", 4000, &vec![2u8; 500], 2).expect_err("growing past the limit must be refused");
+    assert!(selfdb::policy::is_refusal(&e), "the refusal is the policy's: {}", e);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_base_disk_quota_applies_to_overlay_writes() {
+    let (d, base) = setup("quota");
+    let bytes: i64 = {
+        let bc = vm::vm_open(base.to_str().unwrap()).unwrap();
+        let held: i64 = bc.query_row("SELECT COALESCE(sum(size),0) FROM vm_fs WHERE kind='file'", [], |r| r.get(0)).unwrap();
+        selfdb::policy::add(&bc, &selfdb::policy::Rule::DiskQuota(held as u64 + 1024)).unwrap();
+        held
+    };
+    let delta = d.join("delta.db");
+    let ov = vm::Overlay::open(&delta, &base).unwrap();
+    // 1 KiB of room: a small write fits, a larger one does not
+    ov.write("/app/small.bin", &vec![1u8; 512], 0o644, 1).expect("512 bytes fit the remaining 1 KiB");
+    let e = ov.write("/app/large.bin", &vec![1u8; 1024], 0o644, 1).expect_err("1024 more bytes exceed the quota");
+    assert!(selfdb::policy::is_refusal(&e), "the refusal is the policy's: {}", e);
+    let total = ov.view_file_bytes().unwrap();
+    assert!(total <= bytes as u64 + 1024 + 4096, "the view stays near the quota: {} vs {}", total, bytes);
+    let _ = std::fs::remove_dir_all(&d);
+}

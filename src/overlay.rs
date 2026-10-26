@@ -103,25 +103,116 @@ impl Overlay {
     /// for its own schema), so the overlay checks them itself, on every write, from the live table. A
     /// rule cannot go stale, and the same refusal the database gives is returned, so callers map it the
     /// same way (see policy::is_refusal).
+    /// Check the Base's write policies before touching a path.
+    ///
+    /// The Delta's own triggers enforce policies for a standalone VM, but a Delta has no policy table of its
+    /// own and its counters do not include Base bytes, so the rules have to be applied here. All three kinds
+    /// are checked: an earlier version looked only at `readonly_prefix`, so a quota or a per-file limit set
+    /// on the Base was ignored by every write through the overlay (measured: a 10 MiB write succeeded with a
+    /// 1 KiB quota in force).
     fn check_base_policy(&self, p: &str) -> Result<()> {
         let has_table: i64 = self.conn.query_row(
             "SELECT count(*) FROM base.sqlite_master WHERE type='table' AND name='vm_policies'", [], |r| r.get(0))?;
         if has_table == 0 { return Ok(()); }
-        let mut st = self.conn.prepare(
-            "SELECT pattern FROM base.vm_policies WHERE rule_type='readonly_prefix'")?;
-        let prefixes = st.query_map([], |r| r.get::<_, String>(0))?;
-        for pref in prefixes {
-            let pref = pref?;
-            if crate::policy::covers(&pref, p) {
-                return Err(anyhow!(crate::policy::REFUSAL_MESSAGE));
+        let rules: Vec<(String, String)> = {
+            let mut st = self.conn.prepare("SELECT rule_type, pattern FROM base.vm_policies")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut max_file: Option<u64> = None;
+        let mut quota: Option<u64> = None;
+        for (kind, pattern) in rules {
+            match kind.as_str() {
+                "readonly_prefix" => {
+                    if crate::policy::covers(&pattern, p) { return Err(anyhow!(crate::policy::REFUSAL_MESSAGE)); }
+                }
+                "max_file_size" => {
+                    let n: u64 = pattern.parse()?;
+                    max_file = Some(max_file.map_or(n, |m| m.min(n)));
+                }
+                "disk_quota" => {
+                    let n: u64 = pattern.parse()?;
+                    quota = Some(quota.map_or(n, |m| m.min(n)));
+                }
+                _ => {}
+            }
+        }
+        // the view's total file bytes: Base plus Delta, counted the way vm_meta counts a standalone VM
+        if let Some(q) = quota {
+            let total = self.view_file_bytes()?;
+            if total > q {
+                return Err(anyhow!("{} ({} bytes in the view, quota {})", crate::policy::REFUSAL_MESSAGE, total, q));
+            }
+        }
+        let _ = max_file;   // enforced per write, where the incoming size is known
+        Ok(())
+    }
+
+    /// Total logical bytes of regular files in the merged view.
+    pub fn view_file_bytes(&self) -> Result<u64> {
+        let b: i64 = self.conn.query_row("SELECT COALESCE(sum(size),0) FROM base.vm_fs WHERE kind='file'", [], |r| r.get(0))?;
+        // Delta rows shadow Base rows: only count the ones Base does not hold
+        let d: i64 = self.conn.query_row(
+            "SELECT COALESCE(sum(f.size),0) FROM main.vm_fs f WHERE f.kind='file'
+             AND NOT EXISTS (SELECT 1 FROM base.vm_fs b WHERE b.path = f.path)", [], |r| r.get(0))?;
+        Ok((b + d) as u64)
+    }
+
+    /// Refuse a write that would push the view past the Base's disk quota.
+    ///
+    /// `delta_growth` is the change this write makes to the Delta side: the new file's bytes minus whatever
+    /// the Delta already held for that path. The check has to be prospective, because the row does not exist
+    /// yet when it runs.
+    fn check_base_quota(&self, delta_growth: i64) -> Result<()> {
+        let has_table: i64 = self.conn.query_row(
+            "SELECT count(*) FROM base.sqlite_master WHERE type='table' AND name='vm_policies'", [], |r| r.get(0))?;
+        if has_table == 0 { return Ok(()); }
+        let mut st = self.conn.prepare("SELECT pattern FROM base.vm_policies WHERE rule_type='disk_quota'")?;
+        let mut quota: Option<i64> = None;
+        for r in st.query_map([], |r| r.get::<_, String>(0))? {
+            let n: i64 = r?.parse()?;
+            quota = Some(quota.map_or(n, |m| m.min(n)));
+        }
+        if let Some(q) = quota {
+            let after = self.view_file_bytes()? as i64 + delta_growth;
+            if after > q {
+                return Err(anyhow!("{} ({} bytes after this write, quota {})", crate::policy::REFUSAL_MESSAGE, after, q));
             }
         }
         Ok(())
     }
 
+    /// Refuse a file of `size` bytes when the Base sets a per-file limit.
+    fn check_base_max_file(&self, size: u64) -> Result<()> {
+        if let Some(limit) = self.base_max_file()? {
+            if size > limit {
+                return Err(anyhow!("{} ({} bytes, limit {})", crate::policy::REFUSAL_MESSAGE, size, limit));
+            }
+        }
+        Ok(())
+    }
+
+    /// The largest file size the Base's policies allow, if any.
+    fn base_max_file(&self) -> Result<Option<u64>> {
+        let has_table: i64 = self.conn.query_row(
+            "SELECT count(*) FROM base.sqlite_master WHERE type='table' AND name='vm_policies'", [], |r| r.get(0))?;
+        if has_table == 0 { return Ok(None); }
+        let mut st = self.conn.prepare("SELECT pattern FROM base.vm_policies WHERE rule_type='max_file_size'")?;
+        let mut out: Option<u64> = None;
+        for r in st.query_map([], |r| r.get::<_, String>(0))? {
+            let n: u64 = r?.parse()?;
+            out = Some(out.map_or(n, |m| m.min(n)));
+        }
+        Ok(out)
+    }
+
     pub fn write(&self, vm_path: &str, data: &[u8], mode: i64, mtime: i64) -> Result<()> {
         let p = normalize_vm_path(vm_path);
         self.check_base_policy(&p)?;
+        self.check_base_max_file(data.len() as u64)?;
+        let held: i64 = self.conn.query_row(
+            "SELECT COALESCE(size,0) FROM main.vm_fs WHERE path=?1", params![p], |r| r.get(0)).optional()?.unwrap_or(0);
+        self.check_base_quota(data.len() as i64 - held)?;
         self.write_tx(|| {
             self.clear_whiteouts_for(&p)?;
             crate::vm::vm_add_bytes(&self.conn, &p, data, mode, mtime)?;
@@ -423,6 +514,20 @@ impl Overlay {
         let p = normalize_vm_path(vm_path);
         self.check_base_policy(&p)?;
         if data.is_empty() { return Ok(()); }
+        // the limit is on the file's resulting size, not on the length of this write
+        let current = match self.lookup_file(&p)? {
+            Some(schema) => self.conn.query_row(&format!("SELECT size FROM {}.vm_fs WHERE path=?1", schema),
+                params![p], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64,
+            None => 0,
+        };
+        self.check_base_max_file(current.max(off + data.len() as u64))?;
+        {
+            let in_delta: i64 = self.conn.query_row(
+                "SELECT COALESCE(size,0) FROM main.vm_fs WHERE path=?1", params![p], |r| r.get(0)).optional()?.unwrap_or(0);
+            let after = current.max(off + data.len() as u64) as i64;
+            // in a Delta the file's bytes already counted only when the Delta holds the row
+            self.check_base_quota(if in_delta > 0 { after - in_delta } else { after })?;
+        }
         self.write_tx(|| {
             self.clear_whiteouts_for(&p)?;
             let cs = crate::vm::CHUNK_SIZE as u64;
