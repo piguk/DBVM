@@ -32,19 +32,30 @@ self vm-status /tmp/alpine.vm.db
 ```sh
 self vm-chroot /tmp/alpine.vm.db                              # 交互 shell
 self vm-chroot /tmp/alpine.vm.db /bin/sh -c 'cat /etc/alpine-release; ls /'
-self vm-chroot /tmp/alpine.vm.db --ephemeral /bin/sh -c 'echo tmp-only'   # 不回写、不保存 history
-self vm-exec   /tmp/alpine.vm.db /bin/busybox -- --help                  # 单文件：仅 materialize 所需文件
+self vm-chroot /tmp/alpine.vm.db --ephemeral /bin/sh -c 'echo tmp-only'   # 丢弃本次会话的全部改动
+self vm-exec   /tmp/alpine.vm.db /bin/busybox -- --help                  # 单文件：root 只含该程序与库
 self vm-mount  /tmp/alpine.vm.db /tmp/mnt                                 # FUSE 挂载（需 /dev/fuse，--features fuse）
 ```
 
-`vm-chroot` 选择顺序：
+`vm-chroot`、`vm-exec`、`vm-step`、`vm-agent` 都通过同一个 sandbox（`src/sandbox.rs`）运行 VM 内容，隔离参数、syscall 过滤、资源限制与环境变量一致，见「安全边界」§1。无法建立 sandbox 时拒绝运行，不会退化为无隔离执行。
 
-1. 构建含 `fuse` 且 `/dev/fuse` 存在 → FUSE 挂载 `vm_fs`，再 `bwrap --bind <mnt> /`，不落盘到 `/tmp`。
-2. 否则 → `vm_materialize_tree` 到 `$TMPDIR/self-vm-XXXXXX`，`bwrap` 或 `unshare` 进入；退出后 `vm_sync_from_host` 把改动写回 DB。
+`vm-chroot` 的根：
 
-`bwrap` 缺失 → `unshare`；再缺失 → `chroot`（需 root）。
+1. 默认（持久）：构建含 `fuse` 且 `/dev/fuse` 存在 → FUSE 挂载 `vm_fs` 作为 sandbox 的根，写入当场落库。
+2. 否则或 `--ephemeral` → `vm_materialize_tree` 到临时目录作为根；持久会话退出后 `vm_sync_from_host` 回写，`--ephemeral` 不回写并删除目录。
 
-`--persist`（默认）：history 存 `<cache>/history/<db_hash>/.ash_history`。`--ephemeral`：不回写、不保存 history，删除临时目录。
+shell history 为 VM 内的 `/.ash_history`，随 VM 内容保存；`--ephemeral` 会话不保留。
+
+sandbox 参数（四个命令通用）：
+
+```sh
+--isolation bwrap|gvisor      # 隔离后端，默认 bwrap；也可用 $SELF_SANDBOX_ISOLATION
+--memory-mb N --pids N --cpu-percent N        # 整个 sandbox 的 cgroup 限制
+--address-space-mb N --cpu-secs N --file-mb N # 每个进程的 rlimit
+--no-limits                   # 不设任何限制，仅用于可信代码
+```
+
+默认值：内存 2048 MiB（`vm-agent` 为 4096）、进程数 1024、CPU 200%（两个核）、单文件 1024 MiB；`vm-agent` 另设地址空间 2048 MiB。
 
 ## 快照与维护
 
@@ -191,11 +202,13 @@ self vm-agent work.db --base base.db -- "任务"    # work.db 作为只读 base.
 self vm-policy work.db add-readonly /tests
 self vm-policy work.db add-max-size 1048576
 self vm-policy work.db add-disk-quota 536870912    # 逻辑总字节上限
-self vm-agent work.db --mem-mb 2048 --cpu-secs 120 --file-mb 256 "..."
+self vm-agent work.db --memory-mb 4096 --pids 512 --cpu-percent 200 --cpu-secs 120 --file-mb 256 "..."
 ```
 
-- `--mem-mb` 是 `RLIMIT_AS`，默认 2048。node 需要 ≥1536 才能启动（低于此共享库映射失败），
-  所以它是防失控的底线，不是紧配额。
+- `--memory-mb` 是整个 sandbox 的 cgroup `memory.max`（禁用 swap），超出时内核 OOM 结束 sandbox 内的进程。
+- `--address-space-mb` 是每个进程的 `RLIMIT_AS`，`vm-agent` 默认 2048：超出时 node 得到可捕获的 `RangeError`，
+  而不是被 kill。node 需要 ≥1536 才能启动（低于此共享库映射失败）。
+- 此前的 `--mem-mb`（即 `RLIMIT_AS`）已改名为 `--address-space-mb`。
 - `disk_quota` 在**单库**和 **Delta** 两种形态下都生效：Delta 没有自己的策略表，
   叠加层在写前检查 Base 的规则（含只读前缀、单文件上限、总配额）。
 
@@ -219,12 +232,52 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
 
 本节说明每一层保证什么、不保证什么。这些是重要的，因为它们决定能把什么样的代码放进哪一层执行。
 
-### 1. 沙箱（bwrap，`agent-step`）
+### 1. 沙箱（`src/sandbox.rs`，所有运行 VM 内容的命令）
 
-- 隔离：独立 PID 命名空间（`--unshare-pid`）、独立网络命名空间（`--unshare-net`，只剩未启用的 `lo`）、`--die-with-parent`，根为物化树。
-- 验证：从沙箱内读取 `/proc/net/dev`，只看到 `lo`；去掉 `--unshare-net` 后看到宿主全部网卡（测试守护）。在宿主 `127.0.0.1` 与局域网地址上各放置一个服务，无隔离时可连通，隔离后不可连通。
-- 不保证：文件系统层面的 uid 隔离（沙箱内仍以调用者身份运行）；`/proc` 与 `/dev` 为宿主挂载，只是 bwrap 的默认提供。
-- 不保证：资源限制（CPU、内存、磁盘写量）。超时是唯一的时间限制。
+隔离后端二选一：
+
+| 后端 | 边界 | 状态 |
+|---|---|---|
+| bwrap（默认） | Linux 命名空间 + seccomp，与宿主共享内核 | 已测试 |
+| gVisor（`--isolation gvisor`） | 用户态内核 `runsc`，sandbox 的 syscall 由它处理 | 已测试（runsc release-20261019.0，rootless） |
+
+bwrap 后端的隔离：
+
+- 命名空间：user、pid、net、ipc、uts、cgroup（`--unshare-all --unshare-user`），`--disable-userns` 禁止在 sandbox 内再建 user namespace；网络命名空间只有未启用的 `lo`。
+- syscall 过滤：x86_64 seccomp 拒绝列表，包括模块加载、mount 系列、keyring、bpf、perf、userfaultfd、io_uring、namespace 创建（`unshare`、`setns`、带 `CLONE_NEW*` 的 `clone`）、时钟与系统状态修改；非 x86_64 的 syscall 表直接 kill。编号与内核头文件的一致性由测试检查。
+- 环境变量：只有调用方显式给出的变量（`--clearenv`），宿主环境（含凭据）不进入 sandbox。
+- 非交互运行使用 `--new-session`，sandbox 无法向调用方终端注入输入。
+- `--die-with-parent`；超时或结束时整个 cgroup 内的进程都被结束，包括后台进程。
+
+资源限制：
+
+- 每个 sandbox 一个 cgroup v2：`memory.max`（禁用 swap）、`pids.max`、`cpu.max`。来源二选一：`$SELF_SANDBOX_CGROUP` 指向的委托 cgroup（服务以 `Delegate=yes` 运行时；本进程会移入其下的 `supervisor` 子组），或 systemd 用户会话的临时 scope。两者都没有时，设置了限制的 sandbox 拒绝启动。
+- 每个进程的 rlimit：`RLIMIT_AS`、`RLIMIT_CPU`、`RLIMIT_FSIZE`。
+
+不保证：
+
+- bwrap 后端与宿主共享内核：seccomp 允许范围内的内核漏洞可越过边界。不可信的多租户场景应使用 gVisor 后端。
+
+gVisor 后端：
+
+- `runsc` 路径由 `$SELF_RUNSC` 指定，否则在 PATH 中查找。以 rootless 方式运行：`--network=none`、`--overlay2=none`（根目录的写入直接落到物化树，供回写）、`--host-uds=open`（agent 经绑定进来的 unix socket 访问宿主代理）。cgroup 限制与 bwrap 相同，施加在 runsc 外层；rlimit 写入 OCI 配置，由 gVisor 内核执行。
+- OCI 配置中不声明 user namespace：`--rootless` 自行建立，在配置中声明会使 gofer 启动失败。
+- 兼容性：git、python3（含 ssl/sqlite3）、gcc 编译运行、make、node、pi 均可运行（`tests/gvisor.rs`）。
+- 实测耗时（物化树为根，dev 工具集，每项取 3 次最小值）：
+
+  | 负载 | bwrap | gVisor | 倍数 |
+  |---|---|---|---|
+  | 启动 sandbox 并执行 `true` | 38 ms | 61 ms | 1.6 |
+  | python3 启动 ×20 | 189 ms | 319 ms | 1.7 |
+  | node 启动 ×20 | 1065 ms | 1698 ms | 1.6 |
+  | gcc 编译 ×20 | 461 ms | 882 ms | 1.9 |
+  | 复制 2k 文件的目录树 | 59 ms | 251 ms | 4.3 |
+  | git add + commit 该树 | 190 ms | 581 ms | 3.0 |
+  | tar 打包并解包 | 88 ms | 319 ms | 3.6 |
+  | 遍历 2k 文件 ×20 | 88 ms | 310 ms | 3.5 |
+
+  计算密集负载约慢 1.6–1.9 倍，文件密集负载约慢 3–4 倍。以 FUSE 挂载为根时的 gVisor 性能未测。
+- 文件系统层面的 uid 隔离：sandbox 内仍以调用者身份访问其根目录。
 
 ### 2. 挂载（FUSE，`vm-mount`、`vm-chroot` 的 FUSE 路径）
 
@@ -235,20 +288,17 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
   - 符号链接改写只作用于 `readlink` 返回的文本。其他读取链接目标的接口未做改写，也未做测试。
   - 挂载内再挂载（嵌套挂载）未测试，其行为不作保证。
   - 进程仍可访问宿主的网络、进程表与其他文件。
-- 结论：挂载用于检视与人工操作。**不可信代码应只在 bwrap 沙箱中运行**，并以物化树为根，不应以挂载为根。
+- 结论：挂载本身不隔离任何东西。`vm-chroot` 以挂载为根时，进程运行在 §1 的 sandbox 内，隔离由 sandbox 提供；直接在宿主上访问挂载点的进程不受任何限制。
 
-### 3. 不一致之处（需要注意）
+### 3. 数据库文件
 
-`vm-chroot` 的 FUSE 路径与 `agent-step` 的隔离参数不同：
+VM 数据库、Base、vm-inject 的包都可能来自他人。所有连接都启用 SQLite 的防御设置：
 
-| 项 | `agent-step`（bwrap） | `vm-chroot`（FUSE 路径） |
-|---|---|---|
-| PID 命名空间 | 是 | 是 |
-| 网络命名空间 | 是（`--unshare-net`） | **否** |
-| `--die-with-parent` | 是 | **否** |
-| 根 | 物化树 | FUSE 挂载 |
+- `SQLITE_DBCONFIG_DEFENSIVE`：禁止 `writable_schema` 与直接改写影子表。
+- `trusted_schema=OFF`：文件中的触发器与视图只能调用标记为无副作用的函数。
+- `cell_size_check=ON`：读取时检查页内 cell 边界。
 
-因此经 `vm-chroot` 运行的程序仍与宿主共享网络。在它上面运行不可信代码是不安全的，应改用 `agent-step`。
+`vm-inject` 以只读方式挂接包，合并前运行 `quick_check`，损坏的包被拒绝。
 
 ### 4. 策略与数据完整性
 
@@ -290,7 +340,7 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
 - `vm-mem-trace` 依赖宿主 `strace`，仅 Linux。
 - `vm-chroot` 回落路径会物化整个 rootfs 到临时目录，大镜像慢。
 - FUSE 写入路径未做挂载端到端测试：本机无 root，挂载在用户命名空间内只能把挂载者映射为 uid 0，无法验证以非 0 uid 写入。见「安全边界」§2。
-- 挂载不是隔离边界；`vm-chroot` 的 FUSE 路径与 `agent-step` 的隔离参数不一致，且网络未隔离（已实测）。见「安全边界」§2、§3。
+- gVisor 后端以 FUSE 挂载为根的组合未测试；`tests/gvisor.rs` 的兼容性与性能测试为 `#[ignore]`，需设置 `SELF_RUNSC` 后运行。
 - `vm-agent --fuse` 是实验性的：能挂载、能启动 agent、/tmp 不留物化树。此前 pi 以 `O_EXCL` 打开会话文件失败，原因是 `create` 把 open(2) 的 flags 当作回复的 `FOPEN_*` flags 返回（`O_EXCL` 与 `FOPEN_PASSTHROUGH` 同为 bit 7），已修复；完整的 agent 运行尚未在挂载上验证，因此默认仍走物化路径。
 - Delta 上跑 agent 时，快照 diff 只比较 Delta 自身，所以一个被修改的既有文件会显示为 `created` 而不是 `modified`（内容正确）。
 - 包下载通道没有 guest 侧代理变量集成，VM 内也没有 `curl`；需自行发 `http://127.0.0.1:<port>/pkg/<host>/<path>`。

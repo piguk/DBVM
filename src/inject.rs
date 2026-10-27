@@ -41,11 +41,17 @@ pub fn inject(target: &Connection, pkg: &Path) -> Result<InjectReport> {
     {
         let ro = Connection::open_with_flags(pkg, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| anyhow!("open package {}: {}", pkg_str, e))?;
+        crate::vm::harden(&ro)?;
         let has_fs: i64 = ro.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='vm_fs'", [], |r| r.get(0))?;
         if has_fs == 0 { return Err(anyhow!("{} is not a VM database", pkg_str)); }
+        // a package may come from anyone: a damaged or crafted file is refused before anything reads it
+        let check: String = ro.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if check != "ok" { return Err(anyhow!("{} failed quick_check: {}", pkg_str, check)); }
     }
-    target.execute("ATTACH DATABASE ?1 AS pkg", params![pkg_str])
+    // read-only: SQLite refuses every write to the package, whatever the merge does
+    if pkg_str.contains('?') || pkg_str.contains('#') { return Err(anyhow!("package path must not contain '?' or '#'")); }
+    target.execute("ATTACH DATABASE ?1 AS pkg", params![format!("file:{}?mode=ro", pkg_str)])
         .map_err(|e| anyhow!("attach {}: {}", pkg_str, e))?;
     // the package's hashes are copied as they are, and a package is never written, so stale ones
     // cannot be finalized here

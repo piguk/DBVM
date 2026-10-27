@@ -1,6 +1,7 @@
 use super::*;
 
 pub fn vm_apply_pragmas(conn: &Connection) -> Result<()> {
+    harden(conn)?;
     // Every VM connection must know the policy bypass function: the policy triggers call it, and a
     // trigger whose function is missing fails with "no such function" instead of the policy's refusal.
     // The flag is dropped here; a caller that needs a bypass registers its own (see policy::register).
@@ -15,6 +16,21 @@ pub fn vm_apply_pragmas(conn: &Connection) -> Result<()> {
          PRAGMA busy_timeout=5000;
          PRAGMA journal_size_limit=67108864;"
     );
+    Ok(())
+}
+
+/// SQLite's defenses for database files that may come from someone else (a package, a Base, an uploaded
+/// VM). Applied to every connection this crate opens:
+/// - DEFENSIVE: no `writable_schema`, no direct writes to shadow tables, so SQL cannot corrupt the file;
+/// - trusted_schema=OFF: triggers and views stored in a file may call only functions marked innocuous, so a
+///   hostile schema cannot reach functions with side effects;
+/// - cell_size_check: page cells are bounds-checked on read, so a crafted page is an error, not an
+///   out-of-bounds read.
+pub fn harden(conn: &Connection) -> Result<()> {
+    use rusqlite::config::DbConfig;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    conn.execute_batch("PRAGMA cell_size_check=ON;")?;
     Ok(())
 }
 
@@ -370,7 +386,7 @@ pub fn vm_counter(conn: &Connection, key: &str) -> Result<i64> {
 
 pub fn vm_open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    let _ = vm_apply_pragmas(&conn);
+    vm_apply_pragmas(&conn)?;
     // Brand-new DBs get the current schema directly; existing ones are upgraded in order.
     let fresh = conn.prepare_cached("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='vm_fs'")?.query_row( [], |r| r.get::<_,i64>(0))? == 0;
     if fresh { return Err(anyhow!("not a VM database: {}", path)); }
@@ -496,7 +512,7 @@ pub fn init_vm_db_with_opts(path: &str, overwrite: bool, vm_only: bool) -> Resul
     let conn = Connection::open(path)?;
     let _ = conn.execute_batch("PRAGMA page_size=8192; PRAGMA auto_vacuum=INCREMENTAL;");
     conn.execute_batch(&vm_schema_sql())?;
-    let _ = vm_apply_pragmas(&conn);
+    vm_apply_pragmas(&conn)?;
     if !vm_only {
         conn.execute_batch(r#"
     CREATE TABLE IF NOT EXISTS self_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -524,7 +540,7 @@ pub fn init_vm_db(path: &str, overwrite: bool) -> Result<Connection> {
     // page params must be set before any table
     let _ = conn.execute_batch("PRAGMA page_size=8192; PRAGMA auto_vacuum=INCREMENTAL;");
     conn.execute_batch(&vm_schema_sql())?;
-    let _ = vm_apply_pragmas(&conn);
+    vm_apply_pragmas(&conn)?;
     conn.execute_batch(r#"
     CREATE TABLE IF NOT EXISTS self_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS self_blob(content BLOB NOT NULL);

@@ -32,7 +32,7 @@ fn two_steps_on_one_database_both_succeed() {
             // the slow one overlaps the other for certain
             let script = if i == 0 { "sleep 2; echo 0 > /out0.txt".to_string() } else { "echo 1 > /out1.txt".to_string() };
             agent::run_step(&db, &["/bin/sh".into(), "-c".into(), script],
-                &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES })
+                &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES, ..agent::StepOptions::new(0) })
         }));
     }
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();

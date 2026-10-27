@@ -249,6 +249,7 @@ fn main() -> anyhow::Result<()> {
         Ok(c) => c,
         Err(_) => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?,
     };
+    selfdb::vm::harden(&conn)?;
     let _ = conn.execute_batch("PRAGMA query_only=ON; PRAGMA mmap_size=268435456; PRAGMA cache_size=-262144; PRAGMA temp_store=MEMORY;");
     run_via_memfd(conn, args[1..].to_vec());
 }

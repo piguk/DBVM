@@ -122,7 +122,12 @@ pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root
     // One read connection per worker, opened for this database by this call. A thread-local connection
     // opened once per thread was reused for whatever database the thread materialized next, so a second
     // VM in the same process was read from the first: its /usr/bin/git came out empty (measured).
-    tasks.par_iter().for_each_init(|| Connection::open(&db_path), |worker, t| {
+    let open_worker = || -> Result<Connection> {
+        let c = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        harden(&c)?;
+        Ok(c)
+    };
+    tasks.par_iter().for_each_init(open_worker, |worker, t| {
         let host = dest_buf.join(t.path.trim_start_matches('/'));
         let mut need = true;
         if let Ok(md) = std::fs::metadata(&host) {

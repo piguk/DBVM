@@ -74,7 +74,7 @@ if(f){console.log(f+' failed');process.exit(1)}console.log('ALL PASS');\n";
     let opts = |task: &str, _delta: &Path| agent::AgentOptions {
         rollback_on_fail: false, timeout_secs: 600, max_output_bytes: 1 << 20,
         model_base: base_url.clone(), key_env: "PIMM_API_KEY".into(), model: "gpt-6.1-sol".into(),
-        forward_port: 18081, limits: agent::Limits::default(), base: Some(base.clone()), fuse: false,
+        forward_port: 18081, limits: agent::agent_limits(), isolation: selfdb::sandbox::Isolation::Bwrap, base: Some(base.clone()), fuse: false,
         allow_hosts: Vec::new(), task: task.to_string(),
     };
     let a_task = "In /app there is a node project with failing tests. Run 'cd /app && node test.js', read \
@@ -150,7 +150,7 @@ if(f){console.log(f+' failed');process.exit(1)}console.log('ALL PASS');\n";
     }
     let before_quota = std::fs::metadata(&dc).map(|m| m.len()).unwrap_or(0);
     let rc = agent::run_step(&dc, &["/bin/sh".into(), "-c".into(), "echo Q > /app/quota.txt".into()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 60, max_output_bytes: 1 << 20 });
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 60, max_output_bytes: 1 << 20, ..agent::StepOptions::new(0) });
     let cc = vm::vm_open(dc.to_str().unwrap()).unwrap();
     let created: i64 = cc.query_row("SELECT count(*) FROM vm_fs WHERE path='/app/quota.txt'", [], |r| r.get(0)).unwrap();
     match rc {

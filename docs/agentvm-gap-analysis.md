@@ -53,7 +53,12 @@ Error: UNIQUE constraint failed: vm_snapshots.name
 
 **修法**：名字由数据库分配（例如用 `vm_snapshots` 的自增 id，或插入后回填），而不是先查后插。
 
-### 3. 没有资源限制
+### 3. 没有资源限制（已修复）
+
+**现状**：每个 sandbox 一个 cgroup v2（`memory.max` 禁 swap、`pids.max`、`cpu.max`），另有每进程 rlimit；无法建立 cgroup 时拒绝启动。见 `src/sandbox.rs`、`tests/sandbox.rs`、`docs/vm.md`「安全边界」§1。
+
+以下为修复前的记录。
+
 
 `run_step` 只有 `timeout_secs` 和 `max_output_bytes`（已核对 `StepOptions`）。没有：
 
@@ -65,7 +70,12 @@ Error: UNIQUE constraint failed: vm_snapshots.name
 
 **证据**：`grep -rn "cgroup\|setrlimit\|RLIMIT" src/` 无结果。
 
-### 4. `vm-chroot` 与 `agent-step` 隔离不一致（已实测）
+### 4. `vm-chroot` 与 `agent-step` 隔离不一致（已修复）
+
+**现状**：`vm-chroot`、`vm-exec`、`vm-step`、`vm-agent` 共用 `src/sandbox.rs`，网络隔离、seccomp、环境变量清空一致；没有 bwrap 时拒绝运行。另外修复了 `vm-chroot` 把宿主环境变量（含凭据）传入 sandbox、`vm-exec` 直接在宿主上运行 VM 程序两个问题（`tests/cli_isolation.rs`）。
+
+以下为修复前的记录。
+
 
 `vm-chroot` 的 FUSE 路径**没有 `--unshare-net`**，沙箱内可见宿主全部五个网卡。已在 `docs/vm.md` 记录，代码未改。
 

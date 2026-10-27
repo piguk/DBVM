@@ -4,18 +4,19 @@
 //! under bwrap with that directory as its root -> sync the directory back -> diff against the
 //! snapshot -> record the step -> restore the snapshot if the step failed and rollback was asked.
 //!
-//! Isolation is bwrap's: a new PID namespace, a new network namespace (only a down loopback, so no
-//! outbound or inbound traffic, no host or tailnet services), /dev and /proc, and the materialized
-//! tree as root. A step is refused (not run unisolated) if bwrap is missing.
+//! The command runs in `sandbox` (bwrap or gVisor, no network, a cgroup with resource limits, a clean
+//! environment) with the materialized tree as root. A step is refused, not run unisolated, when the
+//! sandbox cannot be set up.
 
 use anyhow::{anyhow, Result};
 use rusqlite::params;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::sandbox::{self, Isolation, Outcome};
 use crate::vm;
+
+pub use crate::sandbox::Limits;
 
 #[derive(Debug, Clone)]
 pub struct StepOptions {
@@ -24,6 +25,15 @@ pub struct StepOptions {
     pub timeout_secs: u64,
     /// Keep at most this many bytes of each of stdout and stderr; the rest is read and dropped.
     pub max_output_bytes: usize,
+    pub limits: Limits,
+    pub isolation: Isolation,
+}
+
+impl StepOptions {
+    pub fn new(timeout_secs: u64) -> StepOptions {
+        StepOptions { rollback_on_fail: false, timeout_secs, max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+                      limits: Limits::default(), isolation: Isolation::Bwrap }
+    }
 }
 
 /// Default output cap per stream (1 MiB).
@@ -43,13 +53,8 @@ pub struct StepResult {
     pub duration_ms: u128,
 }
 
-fn bwrap_available() -> bool {
-    Command::new("bwrap").arg("--help").output().map(|o| o.status.success()).unwrap_or(false)
-}
-
 pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepResult> {
     if argv.is_empty() { return Err(anyhow!("empty command")); }
-    if !bwrap_available() { return Err(anyhow!("bwrap is required for agent-step; refusing to run unisolated")); }
     // one step at a time per database: the tree mirror would otherwise delete a concurrent step's writes
     let _lock = StepLock::acquire(db)?;
     let conn = vm::vm_open(db.to_str().ok_or_else(|| anyhow!("non-utf8 db path"))?)?;
@@ -60,7 +65,9 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
     let scratch = ScratchDir::create("agent-step-")?;
     let started = Instant::now();
     vm::vm_materialize_tree(&conn, scratch.path()).map_err(|e| anyhow!("materialize failed: {}", e))?;
-    let outcome = run_in(scratch.path(), argv, opts.timeout_secs, opts.max_output_bytes)?;
+    let mut spec = sandbox::Spec::new(scratch.path(), argv.to_vec());
+    spec.limits = opts.limits;
+    let outcome = sandbox::run_captured(&spec, opts.isolation, Duration::from_secs(opts.timeout_secs), opts.max_output_bytes)?;
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
 
     // Sync the scratch tree back, then diff against the snapshot taken before the step. A sync that
@@ -96,67 +103,6 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
                 &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
     let step_id = conn.last_insert_rowid();
     Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
-}
-
-/// Result of one sandboxed run.
-struct Outcome { exit_code: i32, timed_out: bool, stdout: Vec<u8>, stderr: Vec<u8>, stdout_truncated: bool, stderr_truncated: bool }
-
-/// Read a pipe to EOF, keeping the first `cap` bytes. Bytes past the cap are still read and dropped,
-/// so the child never blocks on a full pipe. Returns (kept bytes, truncated).
-fn drain_capped<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
-    let mut kept = Vec::new();
-    let mut truncated = false;
-    let mut buf = [0u8; 8192];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let room = cap.saturating_sub(kept.len());
-                if room > 0 { kept.extend_from_slice(&buf[..n.min(room)]); }
-                if n > room { truncated = true; }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        }
-    }
-    (kept, truncated)
-}
-
-/// Run argv under bwrap with `root` as /.
-fn run_in(root: &Path, argv: &[String], timeout_secs: u64, max_output: usize) -> Result<Outcome> {
-    let mut cmd = Command::new("bwrap");
-    cmd.arg("--bind").arg(root).arg("/")
-        .arg("--dev").arg("/dev")
-        .arg("--proc").arg("/proc")
-        .arg("--unshare-pid")
-        .arg("--unshare-net")
-        .arg("--die-with-parent")
-        .arg("--chdir").arg("/");
-    for a in argv { cmd.arg(a); }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| anyhow!("spawn bwrap: {}", e))?;
-
-    // drain both pipes on their own threads so a chatty command cannot block on a full pipe
-    let mut out_pipe = child.stdout.take().unwrap();
-    let mut err_pipe = child.stderr.take().unwrap();
-    let out_t = std::thread::spawn(move || drain_capped(&mut out_pipe, max_output));
-    let err_t = std::thread::spawn(move || drain_capped(&mut err_pipe, max_output));
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(st) = child.try_wait()? { break st; }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            let _ = child.kill();
-            break child.wait()?;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let (stdout, stdout_truncated) = out_t.join().unwrap_or_default();
-    let (stderr, stderr_truncated) = err_t.join().unwrap_or_default();
-    let exit_code = if timed_out { 124 } else { status.code().unwrap_or(128) };
-    Ok(Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated })
 }
 
 /// Compact JSON for the change list, written with stable key order.
@@ -442,7 +388,6 @@ pub fn provision_agent_with(db: &Path, node: &Path, pi_dir: &Path, tools: ToolSe
 #[cfg(feature = "fuse")]
 pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     if opts.task.trim().is_empty() { return Err(anyhow!("empty task")); }
-    if !bwrap_available() { return Err(anyhow!("bwrap is required for vm-agent; refusing to run unisolated")); }
     let api_key = std::env::var(&opts.key_env)
         .map_err(|_| anyhow!("{} is not set; the proxy needs the model credential", opts.key_env))?;
     if api_key.is_empty() { return Err(anyhow!("{} is empty", opts.key_env)); }
@@ -530,7 +475,6 @@ fn scratch_base(prefix: &str) -> Result<std::path::PathBuf> { vm::make_tmp_dir(p
 pub fn run_agent_on_overlay(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     let base = opts.base.clone().ok_or_else(|| anyhow!("run_agent_on_overlay needs a base"))?;
     if opts.task.trim().is_empty() { return Err(anyhow!("empty task")); }
-    if !bwrap_available() { return Err(anyhow!("bwrap is required for vm-agent; refusing to run unisolated")); }
     let api_key = std::env::var(&opts.key_env)
         .map_err(|_| anyhow!("{} is not set; the proxy needs the model credential", opts.key_env))?;
     if api_key.is_empty() { return Err(anyhow!("{} is empty", opts.key_env)); }
@@ -653,6 +597,7 @@ pub struct AgentOptions {
     pub task: String,
     /// Resource limits for the sandbox. 0 disables that limit.
     pub limits: Limits,
+    pub isolation: Isolation,
     /// Run against a read-only Base with `db` as its Delta (one Delta per task). Empty means the database
     /// is standalone.
     pub base: Option<std::path::PathBuf>,
@@ -663,38 +608,13 @@ pub struct AgentOptions {
     pub allow_hosts: Vec<String>,
 }
 
-/// Resource limits applied inside the sandbox.
+/// Limits for an agent run: the sandbox defaults, plus an address-space limit for node.
 ///
-/// Measured on node 26 before choosing them: `RLIMIT_DATA` and small `RLIMIT_AS` make node fail to
-/// start at all (a shared library cannot be mapped), so the address-space limit must be at least
-/// ~1.5 GB and is a guard against runaway allocation, not a tight quota. With 2 GB a 2.5 GB
-/// allocation fails as a catchable `RangeError` instead of an OOM kill.
-#[derive(Debug, Clone, Copy)]
-pub struct Limits {
-    /// `RLIMIT_AS` in mebibytes; 0 = unlimited. Node needs >= ~1536.
-    pub address_space_mb: u32,
-    /// `RLIMIT_CPU` in seconds; 0 = unlimited.
-    pub cpu_secs: u32,
-    /// `RLIMIT_FSIZE` in mebibytes; 0 = unlimited.
-    pub file_size_mb: u32,
-    /// `RLIMIT_NPROC`; 0 = unlimited. Counts processes for the whole user, so it is off by default.
-    pub processes: u32,
-}
-
-impl Default for Limits {
-    fn default() -> Self { Limits { address_space_mb: 2048, cpu_secs: 0, file_size_mb: 1024, processes: 0 } }
-}
-
-impl Limits {
-    /// The `ulimit` prelude for the sandbox shell. Kept in one place so the CLI and the library agree.
-    pub fn ulimit_prelude(&self) -> String {
-        let mut out = String::new();
-        if self.address_space_mb > 0 { out.push_str(&format!("ulimit -v {} 2>/dev/null; ", self.address_space_mb as u64 * 1024)); }
-        if self.cpu_secs > 0 { out.push_str(&format!("ulimit -t {} 2>/dev/null; ", self.cpu_secs)); }
-        if self.file_size_mb > 0 { out.push_str(&format!("ulimit -f {} 2>/dev/null; ", self.file_size_mb as u64 * 1024)); }
-        if self.processes > 0 { out.push_str(&format!("ulimit -u {} 2>/dev/null; ", self.processes)); }
-        out
-    }
+/// Measured on node 26: with RLIMIT_AS at 2 GB a 2.5 GB allocation fails as a catchable RangeError instead
+/// of an OOM kill, so the agent sees memory pressure as an error it can report. Node needs at least
+/// ~1.5 GB of address space to start. The cgroup's memory.max is the hard limit for the whole sandbox.
+pub fn agent_limits() -> Limits {
+    Limits { memory_mb: 4096, address_space_mb: 2048, ..Limits::default() }
 }
 
 /// What `provision_agent` put in the database.
@@ -720,7 +640,6 @@ pub struct ProvisionReport {
 /// - mirror the tree back, diff it, and record the run in `agent_steps`.
 pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     if opts.task.trim().is_empty() { return Err(anyhow!("empty task")); }
-    if !bwrap_available() { return Err(anyhow!("bwrap is required for vm-agent; refusing to run unisolated")); }
     let api_key = std::env::var(&opts.key_env)
         .map_err(|_| anyhow!("{} is not set; the proxy needs the model credential", opts.key_env))?;
     if api_key.is_empty() { return Err(anyhow!("{} is empty", opts.key_env)); }
@@ -837,53 +756,25 @@ HOME=/opt/home PI_CODING_AGENT_DIR="$VM_AGENT_DIR" /usr/bin/node /opt/pi/dist/bu
 
 /// Run the agent in the sandbox: bind the proxy socket in, then run the script above.
 fn run_agent_in(root: &Path, proxy_sock: &Path, opts: &AgentOptions, agent_dir: &str) -> Result<Outcome> {
-    // The script must not be written into a FUSE-mounted root: bwrap cannot create files there (measured:
-    // "Can't create file /tmp/proxy.sock: Input/output error"). It is passed through the environment and
-    // written into /tmp by the shell instead, which works for both a mount and a materialised tree.
-    // The script is passed in through the environment (see below); a copy in the tree is only written
-    // when the tree accepts writes, which keeps the older materialised path unchanged.
+    // The script is passed through the environment and written into /tmp by the shell: it must not be
+    // written into a FUSE-mounted root, where bwrap could not create files (measured: "Can't create file
+    // /tmp/proxy.sock: Input/output error"). A copy in the tree is written only when the tree accepts
+    // writes, which keeps the materialised path unchanged.
     if allows_write(root) && root.join("opt").is_dir() { let _ = std::fs::write(root.join("opt/run-agent.sh"), RUN_AGENT_SH); }
-    let mut cmd = Command::new("bwrap");
-    cmd.arg("--bind").arg(root).arg("/")
-        .arg("--dev").arg("/dev")
-        .arg("--proc").arg("/proc")
-        .arg("--unshare-pid")
-        .arg("--unshare-net")
-        .arg("--die-with-parent")
-        // Bind the directory that holds the socket, not the socket itself: bwrap must create the mount
-        // point, and it cannot create files on a FUSE-mounted root (measured: "Can't create file
-        // /tmp/proxy.sock: Input/output error"). /tmp inside the sandbox is the proxy's own directory.
-        .arg("--bind").arg(proxy_sock.parent().unwrap_or(Path::new("/tmp"))).arg("/tmp")
-        .arg("--chdir").arg("/")
-        .arg("/bin/sh").arg("-c")
-        .arg(format!("printf '%s' \"$VM_AGENT_SCRIPT\" > /tmp/run-agent.sh; {}. /tmp/run-agent.sh",
-            opts.limits.ulimit_prelude()));
-    // a clean environment: nothing from the host leaks in, and the credential is not here at all
-    cmd.env_clear();
-    cmd.env("PATH", "/usr/bin:/bin");
-    cmd.env("VM_AGENT_TASK", &opts.task);
-    cmd.env("VM_AGENT_SCRIPT", RUN_AGENT_SH);
-    cmd.env("VM_AGENT_DIR", agent_dir);
-    cmd.env("VM_AGENT_PORT", opts.forward_port.to_string());
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| anyhow!("spawn bwrap: {}", e))?;
-    let mut out_pipe = child.stdout.take().unwrap();
-    let mut err_pipe = child.stderr.take().unwrap();
-    let max = opts.max_output_bytes;
-    let out_t = std::thread::spawn(move || drain_capped(&mut out_pipe, max));
-    let err_t = std::thread::spawn(move || drain_capped(&mut err_pipe, max));
-    let deadline = Instant::now() + Duration::from_secs(opts.timeout_secs);
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(st) = child.try_wait()? { break st; }
-        if Instant::now() >= deadline { timed_out = true; let _ = child.kill(); break child.wait()?; }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let (stdout, stdout_truncated) = out_t.join().unwrap_or_default();
-    let (stderr, stderr_truncated) = err_t.join().unwrap_or_default();
-    let exit_code = if timed_out { 124 } else { status.code().unwrap_or(128) };
-    Ok(Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated })
+    let mut spec = sandbox::Spec::new(root, vec!["/bin/sh".into(), "-c".into(),
+        "printf '%s' \"$VM_AGENT_SCRIPT\" > /tmp/run-agent.sh; . /tmp/run-agent.sh".into()]);
+    // Bind the directory that holds the socket, not the socket itself: the sandbox must create the mount
+    // point, and it cannot create files on a FUSE-mounted root. /tmp inside the sandbox is the proxy's
+    // own directory.
+    spec.binds.push(sandbox::Bind { host: proxy_sock.parent().unwrap_or(Path::new("/tmp")).to_path_buf(), dest: "/tmp".into(), writable: true });
+    // the environment is exactly this; the credential is not part of it
+    spec.env = vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("VM_AGENT_TASK".into(), opts.task.clone()),
+        ("VM_AGENT_SCRIPT".into(), RUN_AGENT_SH.into()),
+        ("VM_AGENT_DIR".into(), agent_dir.into()),
+        ("VM_AGENT_PORT".into(), opts.forward_port.to_string()),
+    ];
+    spec.limits = opts.limits;
+    sandbox::run_captured(&spec, opts.isolation, Duration::from_secs(opts.timeout_secs), opts.max_output_bytes)
 }
-
-/// The shell prelude that applies `limits`. Public so tests exercise the same code the sandbox runs.
-pub fn limits_prelude(limits: &Limits) -> String { limits.ulimit_prelude() }

@@ -9,5 +9,6 @@ pub mod policy;
 pub mod inject;
 pub mod owner;
 pub mod proxy;
+pub mod sandbox;
 #[cfg(feature = "fuse")]
 pub mod fuse;
