@@ -8,7 +8,8 @@
 - `vm_meta`：O(1) 计数器（文件数、逻辑字节、blob 字节），由触发器维护，`vm-verify --deep` 可逐项对账
 - `vm_mem`：内存镜像；`vm_snapshots` / `vm_log`：checkpoint 与变更日志
 - `vm_disk_blocks(block_id PK, content, compressed, raw_size)`：4K 稀疏分页块设备；`vm_meta.disk_size` 记录逻辑大小
-- 库 `application_id = 0x564D5351 ("VMSQ")`，`user_version = 11`（当前 schema）。旧库在打开时按序迁移，每步一个事务；历史版本见 `src/vm.rs` 顶部注释。v8 起有快照表，v9 起有 `agent_steps`，v10 补截断列，v11 起有 `vm_policies`
+- `vm_dirty(path)`：整文件 hash 尚未更新的文件。经挂载的写入（`write_range_deferred`）只改 chunk、size、mtime，路径记入此表；读取 `vm_fs.hash` 的操作（快照、diff、物化、sync、verify、ls/stat）先调用 `finalize_dirty` 补算，`vm_open` 与卸载时也会补算。只读挂接的 Base 或 vm-inject 包若有未补算的行会被拒绝
+- 库 `application_id = 0x564D5351 ("VMSQ")`，`user_version = 12`（当前 schema）。旧库在打开时按序迁移，每步一个事务；历史版本见 `src/vm/mod.rs` 顶部注释。v8 起有快照表，v9 起有 `agent_steps`，v10 补截断列，v11 起有 `vm_policies`，v12 起有 `vm_dirty`
 
 新库 `page_size 8192`, `auto_vacuum=INCREMENTAL`；`--vm-only` 跳过 SELF 专用表（`segments/symbols/self_blob/bundle_*` 等）。连接 PRAGMA：`journal_mode=WAL synchronous=NORMAL mmap_size=256M busy_timeout=5000 journal_size_limit=64M`。
 
@@ -260,10 +261,22 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
 - `compress_bytes` 按大小选 zstd 级别（≤16K:3，≤100K:6，其余:19），仅对 >1K 且有收益者压缩；小文件可走字典（`compressed=3`）。
 - 实测 Alpine minirootfs：7.79M logical → 3.09M blob（lvl19）→ 3.2M db 文件。
 - FUSE `statfs` 报告 `blocks = sum(blob)/4096`，因此 VM 内 `df` 显示压缩后大小。
+- 经挂载的写入按 zstd level 3 压缩，不写宿主内容缓存（每次 write 都会重写所触及的 chunk）；`vm-recompress` 之后可把这些 blob 提到 level 19。
+- FUSE 挂载实测（`/usr/include`，30,700 条目，312 MB；与原生文件系统对比）：
+
+  | 操作 | 原生 | 挂载 |
+  |---|---|---|
+  | `find` 遍历 | 29 ms | 107 ms |
+  | 读全部文件，首次 / 第二次 | 419 ms | 1.9 s / 1.0 s |
+  | 写 2000 个小文件 | 28 ms | 401 ms |
+  | 写一个 200 MB 文件 | 68 ms | 0.66 s |
+  | 解包 30k 文件（tar） | 379 ms | 15 s |
+
+  解包每个文件约 0.5 ms，其中数据库操作约 0.1 ms，其余是 FUSE 请求往返（守护进程单线程处理请求）。
 
 ## 实现位置
 
-- `src/vm.rs`：存储层、导入导出、压缩、快照、磁盘块
+- `src/vm/`：存储层，按职责分为 `schema`/`codec`/`store`/`read`/`import`/`tree`/`snapshot`/`maint`/`cache`/`mem`/`disk`（模块说明见 `src/vm/mod.rs`）
 - `src/fuse.rs`：`VmFuse`（fuser，`--features fuse`）
 - `src/owner.rs`：挂载所有者、符号链接的挂载视图改写
 - `src/policy.rs`：写入策略（触发器与叠加层检查）
@@ -278,7 +291,7 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
 - `vm-chroot` 回落路径会物化整个 rootfs 到临时目录，大镜像慢。
 - FUSE 写入路径未做挂载端到端测试：本机无 root，挂载在用户命名空间内只能把挂载者映射为 uid 0，无法验证以非 0 uid 写入。见「安全边界」§2。
 - 挂载不是隔离边界；`vm-chroot` 的 FUSE 路径与 `agent-step` 的隔离参数不一致，且网络未隔离（已实测）。见「安全边界」§2、§3。
-- `vm-agent --fuse` 是实验性的：能挂载、能启动 agent、/tmp 不留物化树，但 pi 以 `O_EXCL` 打开会话文件时本 FUSE 层报错，因此默认仍走物化路径。
+- `vm-agent --fuse` 是实验性的：能挂载、能启动 agent、/tmp 不留物化树。此前 pi 以 `O_EXCL` 打开会话文件失败，原因是 `create` 把 open(2) 的 flags 当作回复的 `FOPEN_*` flags 返回（`O_EXCL` 与 `FOPEN_PASSTHROUGH` 同为 bit 7），已修复；完整的 agent 运行尚未在挂载上验证，因此默认仍走物化路径。
 - Delta 上跑 agent 时，快照 diff 只比较 Delta 自身，所以一个被修改的既有文件会显示为 `created` 而不是 `modified`（内容正确）。
 - 包下载通道没有 guest 侧代理变量集成，VM 内也没有 `curl`；需自行发 `http://127.0.0.1:<port>/pkg/<host>/<path>`。
 - 注入不检查目标是否正在使用；注入与一个正在运行的步骤同时进行时，行为未定义。

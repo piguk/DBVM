@@ -165,7 +165,7 @@ fn build_env(bundle_dir: Option<&PathBuf>) -> (Vec<CString>, Vec<*const libc::c_
                 let mut i=0;
                 while !(*environ.offset(i)).is_null() {
                     let cstr=CStr::from_ptr(*environ.offset(i));
-                    if let Ok(s)=cstr.to_str() { if s.starts_with("LD_LIBRARY_PATH=") { ld_val=Some(s["LD_LIBRARY_PATH=".len()..].to_string()); break; } }
+                    if let Some(v)=cstr.to_str().ok().and_then(|s| s.strip_prefix("LD_LIBRARY_PATH=")) { ld_val=Some(v.to_string()); break; }
                     i+=1;
                 }
             }
@@ -227,7 +227,7 @@ fn run_via_memfd(db: Connection, guest: Vec<String>) -> ! {
     if pid < 0 { eprintln!("fork: {}", std::io::Error::last_os_error()); std::process::exit(2); }
     if pid == 0 {
         unsafe {
-            libc::execve(fdpath_c.as_ptr(), argv_ptrs.as_ptr() as *const *const libc::c_char, env_ptrs.as_ptr() as *const *const libc::c_char);
+            libc::execve(fdpath_c.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
             eprintln!("execve {}: {}", fdpath, std::io::Error::last_os_error());
             libc::_exit(127);
         }

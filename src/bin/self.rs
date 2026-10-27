@@ -79,7 +79,7 @@ enum Cmd {
              base: Option<String>,
              #[arg(long, default_value="", help="comma-separated hosts the agent may fetch packages from via /pkg/<host>/<path>")]
              allow_hosts: String,
-             #[arg(long, help="EXPERIMENTAL: bind the sandbox to a FUSE mount instead of unpacking to /tmp. The mount serves the whole VM and the agent starts, but pi's session file is opened with O_EXCL, which this FUSE layer answers with an error, so the run fails. Kept for further work; the materialised path stays the default.")]
+             #[arg(long, help="EXPERIMENTAL: bind the sandbox to a FUSE mount instead of unpacking to /tmp. The O_EXCL create failure that stopped pi is fixed, but a full agent run over the mount has not been verified yet; the materialised path stays the default.")]
              fuse: bool,
              task: String },
     /// Host-side model proxy: a unix socket the sandboxed agent reaches without network access.
@@ -154,11 +154,11 @@ fn main() -> anyhow::Result<()> {
         },
         Cmd::VmInit{db, force, vm_only} => { let _c=selfdb::vm::init_vm_db_with_opts(&db, force, vm_only)?; println!("vm init -> {} (WAL+mmap+compress vm_only={})", db, vm_only); },
         Cmd::VmAdd{db, host, vm_path} => { let c=selfdb::vm::vm_open(&db)?; selfdb::vm::vm_add_file(&c, &host, &vm_path)?; println!("add {} -> {}:{}", host, db, vm_path); },
-        Cmd::VmPack{db, host_dir, prefix, serial} => { let c=selfdb::vm::vm_open(&db)?; let n=if serial { selfdb::vm::vm_pack_host_dir(&c, &host_dir, &prefix)? } else { selfdb::vm::vm_pack_host_dir_parallel(&c, &host_dir, &prefix)? }; println!("pack {} -> {}:{} ({} files)", host_dir, db, prefix, n); },
+        Cmd::VmPack{db, host_dir, prefix, serial} => { let c=selfdb::vm::vm_open(&db)?; let n=if serial { selfdb::vm::vm_pack_host_dir(&c, &host_dir, &prefix)? } else { selfdb::vm::vm_pack_host_dir_parallel(&c, &host_dir, &prefix)? }; println!("pack {} -> {}:{} ({} entries)", host_dir, db, prefix, n); },
         Cmd::VmImport{db, elf, prefix} => { let c=selfdb::vm::vm_open(&db)?; let n=selfdb::vm::vm_import_closure(&c, &elf, &prefix)?; println!("import {} -> {} ({} objects)", elf, db, n); },
         Cmd::VmImportRootfs{db, tar, strip, whitelist, exclude} => { let c=selfdb::vm::vm_open(&db)?; let wl: Option<&[String]> = if whitelist.is_empty() { None } else { Some(&whitelist) }; let ex: Option<&[String]> = if exclude.is_empty() { None } else { Some(&exclude) }; let n=selfdb::vm::vm_import_tar_filtered(&c, &tar, &strip, wl, ex)?; println!("import-tar {} -> {} ({} entries) whitelist={:?} exclude={:?}", tar, db, n, whitelist, exclude); if n>50 { let _ = selfdb::vm::vm_train_dict(&c, 16384); } },
         Cmd::VmMaterialize{db, dest} => { let c=selfdb::vm::vm_open(&db)?; let n=selfdb::vm::vm_materialize_tree(&c, std::path::Path::new(&dest))?; println!("materialize {} -> {} ({} files)", db, dest, n); },
-        Cmd::VmLs{db, path} => { let c=selfdb::vm::vm_open(&db)?; for (p,k,m,sz,_) in selfdb::vm::vm_ls(&c, &path)? { println!("{:8} {:4} {:>10}  {}", k, format!("{:o}", m), sz, p);} },
+        Cmd::VmLs{db, path} => { let c=selfdb::vm::vm_open(&db)?; for e in selfdb::vm::vm_ls(&c, &path)? { println!("{:8} {:4} {:>10}  {}", e.kind, format!("{:o}", e.mode), e.size, e.path);} },
         Cmd::VmCat{db, path} => { let c=selfdb::vm::vm_open(&db)?; let data=selfdb::vm::vm_cat(&c, &path)?; use std::io::Write; std::io::stdout().write_all(&data)?; },
         Cmd::VmStat{db, path} => { let c=selfdb::vm::vm_open(&db)?; let (p,k,m,sz,mtime,hash)=selfdb::vm::vm_stat(&c, &path)?; println!("path={} kind={} mode={:o} size={} mtime={} hash={}", p,k,m,sz,mtime,hash); },
         Cmd::VmExec{db, vm_path, rest} => {
@@ -181,7 +181,7 @@ fn main() -> anyhow::Result<()> {
                     if let Some(p)=cand { to_mat.push(p); }
                     else {
                         let mut st=c.prepare("SELECT path FROM vm_fs WHERE (kind='file' OR kind='symlink') AND (path LIKE '/lib/%' OR path LIKE '/usr/lib/%')")?;
-                        for r in st.query_map([], |r| r.get::<_,String>(0))? { if let Ok(pp)=r { if pp.ends_with(&soname) { to_mat.push(pp); break; } } }
+                        for r in st.query_map([], |r| r.get::<_,String>(0))? { let pp=r?; if pp.ends_with(&soname) { to_mat.push(pp); break; } }
                     }
                 }
                 // eagerly materialize libs + their symlink aliases
@@ -189,24 +189,15 @@ fn main() -> anyhow::Result<()> {
                 {
                     let mut st=c.prepare("SELECT path, kind, link_target FROM vm_fs WHERE (path LIKE '/lib/%' OR path LIKE '/usr/lib/%' OR path LIKE '/usr/lib64/%')")?;
                     for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<String>>(2)?)))? {
-                        if let Ok((path,kind,link))=r {
-                            if kind=="symlink" {
-                                let host = tmp.join(path.trim_start_matches('/'));
-                                if host.exists() || std::fs::symlink_metadata(&host).is_ok() { continue; }
-                                if let Some(par)=host.parent(){ std::fs::create_dir_all(par)?; }
-                                let target = link.unwrap_or_default();
-                                let _ = std::os::unix::fs::symlink(&target, &host);
-                                // also ensure target file materialized
-                                if let Ok((_,_,content,_,_)) = selfdb::vm::vm_resolve(&c, &path) {
-                                    if let Some(_d)=content {
-                                        // materialize resolved target at its real path if missing
-                                        // vm_resolve already guarantees file exists at resolved path, ensure it is present on host
-                                        // find resolved path by re-querying
-                                    }
-                                }
-                            } else {
-                                all_libs.push(path);
-                            }
+                        let (path,kind,link)=r?;
+                        if kind=="symlink" {
+                            let host = tmp.join(path.trim_start_matches('/'));
+                            if host.exists() || std::fs::symlink_metadata(&host).is_ok() { continue; }
+                            if let Some(par)=host.parent(){ std::fs::create_dir_all(par)?; }
+                            let target = link.unwrap_or_default();
+                            let _ = std::os::unix::fs::symlink(&target, &host);
+                        } else {
+                            all_libs.push(path);
                         }
                     }
                 }
@@ -222,8 +213,8 @@ fn main() -> anyhow::Result<()> {
                     // if entry is symlink, recreate symlink; vm_materialize will resolve and write file, so handle symlink case
                     let kind: Option<String> = c.query_row("SELECT kind FROM vm_fs WHERE path=?1", rusqlite::params![lp.clone()], |r| r.get(0)).ok();
                     if kind.as_deref()==Some("symlink") {
-                        if let Ok(target) = c.query_row("SELECT link_target FROM vm_fs WHERE path=?1", rusqlite::params![lp.clone()], |r| r.get::<_,Option<String>>(0)) {
-                            if let Some(t)=target { let _ = std::os::unix::fs::symlink(&t, &host); continue; }
+                        if let Ok(Some(t)) = c.query_row("SELECT link_target FROM vm_fs WHERE path=?1", rusqlite::params![lp.clone()], |r| r.get::<_,Option<String>>(0)) {
+                            let _ = std::os::unix::fs::symlink(&t, &host); continue;
                         }
                     }
                     let _ = selfdb::vm::vm_materialize(&c, &lp, &host);
@@ -428,16 +419,14 @@ fn main() -> anyhow::Result<()> {
         Cmd::VmResolve{db, vm_path} => {
             let c=selfdb::vm::vm_open(&db)?;
             match selfdb::vm::vm_resolve(&c, &vm_path) {
-                Ok((real, kind, content, link, mode)) => {
-                    println!("resolve {} -> {} (kind={} mode={:o} link={:?} size={})", vm_path, real, kind, mode, link, content.as_ref().map(|v| v.len()).unwrap_or(0));
-                    if let Some(t) = link { println!("  symlink -> {}", t); }
-                    if kind=="symlink" { println!("  (symlink hops resolved via 40-step vm_resolve)"); }
+                Ok(r) => {
+                    println!("resolve {} -> {} (kind={} mode={:o} size={})", vm_path, r.path, r.kind, r.mode, r.content.as_ref().map(|v| v.len()).unwrap_or(0));
                 },
                 Err(e) => { eprintln!("vm-resolve {}: {}", vm_path, e); std::process::exit(1); }
             }
         },
         Cmd::VmCheckpoint{db, name, note} => { let c=selfdb::vm::vm_open(&db)?; selfdb::vm::vm_checkpoint(&c, &name, &note)?; println!("checkpoint {} @ {}", name, db); },
-        Cmd::VmSnapshots{db} => { let c=selfdb::vm::vm_open(&db)?; for (id,name,ts,pc,bytes,note) in selfdb::vm::vm_list_snapshots(&c)? { println!("[{}] {} ts={} pc={} bytes={} note={}", id, name, ts, pc, bytes, note);} },
+        Cmd::VmSnapshots{db} => { let c=selfdb::vm::vm_open(&db)?; for s in selfdb::vm::vm_list_snapshots(&c)? { println!("[{}] {} ts={} pc={} bytes={} note={}", s.id, s.name, s.created_at, s.page_count, s.bytes, s.note);} },
         Cmd::VmRechunk{db} => { let c=selfdb::vm::vm_open(&db)?; let (done,skipped,failed)=selfdb::vm::vm_rechunk(&c)?; println!("rechunk {}: rechunked={} already_chunked={} failed={}", db, done, skipped, failed); if failed>0 { anyhow::bail!("{} files failed to rechunk", failed); } },
         Cmd::VmVerify{db, deep} => { let c=selfdb::vm::vm_open(&db)?; println!("{}", selfdb::vm::vm_verify(&c, deep)?); },
         Cmd::VmExtract{db, vm_path, out} => { let c=selfdb::vm::vm_open(&db)?; let data=selfdb::vm::vm_cat(&c, &vm_path)?; std::fs::write(&out, &data)?; println!("extract {} -> {} ({} bytes)", vm_path, out, data.len()); },
@@ -573,7 +562,7 @@ fn main() -> anyhow::Result<()> {
             if node.as_os_str().is_empty() || !node.exists() { eprintln!("node not found; pass --node <path>"); std::process::exit(2); }
             if !pi.exists() { eprintln!("pi not found at {}; pass --pi <dir>", pi.display()); std::process::exit(2); }
             let r = selfdb::agent::provision_agent_with(std::path::Path::new(&db), &node, &pi, tool_set)?;
-            println!("provisioned {}: node {} ({} objects), pi at /opt/pi ({} files)", db, r.node, r.objects, r.files);
+            println!("provisioned {}: node {} ({} objects), pi at /opt/pi ({} entries), tool data ({} entries)", db, r.node, r.objects, r.files, r.tool_files);
             println!("run it with: vm-agent {} -- \"<task>\"", db);
         }
         Cmd::VmInject{target, package} => {
@@ -840,10 +829,10 @@ fn selfdb_scan(db: &str, dir: &str) -> anyhow::Result<()> {
     let mut next_id: i64 = conn.query_row("SELECT max(id) FROM objects", [], |r| r.get::<_,Option<i64>>(0)).unwrap_or(None).unwrap_or(0)+1;
     for exe in &exes {
         let rp=exe.clone();
-        if !seen.contains_key(&rp) {
-            let son=selfdb::elf::soname_for_path_cached(&rp, &mut meta_cache);
-            conn.execute("INSERT INTO objects VALUES (?1,?2,?3,?4,?5)", rusqlite::params![next_id, rp.to_string_lossy().to_string(), son, "exe", 1])?;
-            seen.insert(rp, next_id); next_id+=1;
+        if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(rp) {
+            let son=selfdb::elf::soname_for_path_cached(slot.key(), &mut meta_cache);
+            conn.execute("INSERT INTO objects VALUES (?1,?2,?3,?4,?5)", rusqlite::params![next_id, slot.key().to_string_lossy().to_string(), son, "exe", 1])?;
+            slot.insert(next_id); next_id+=1;
         }
     }
     let mut queue: Vec<PathBuf> = seen.keys().cloned().collect();
@@ -900,7 +889,7 @@ enum PolicyAction {
 
 /// Dispatch to the FUSE path when the binary was built with it, with a clear error otherwise.
 fn run_fused(db: &std::path::Path, opts: &selfdb::agent::AgentOptions) -> anyhow::Result<selfdb::agent::StepResult> {
-    #[cfg(feature = "fuse")] { return selfdb::agent::run_agent_fused(db, opts); }
+    #[cfg(feature = "fuse")] { selfdb::agent::run_agent_fused(db, opts)}
     #[cfg(not(feature = "fuse"))] {
         let _ = (db, opts);
         anyhow::bail!("--fuse needs a binary built with --features fuse")

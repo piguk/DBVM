@@ -61,7 +61,7 @@ fn whiteout_hides_a_base_path() {
     assert!(ov.read("/data/big").is_ok());
     ov.remove("/data/big").unwrap();
     assert!(ov.read("/data/big").is_err(), "deleted base path reads as not found");
-    assert!(ov.exists("/data/big").unwrap() == false);
+    assert!(!ov.exists("/data/big").unwrap());
     // base still has it: the deletion is a whiteout, not an edit to base
     let b = rusqlite::Connection::open(&base).unwrap();
     let n: i64 = b.query_row("SELECT count(*) FROM vm_fs WHERE path='/data/big'", [], |r| r.get(0)).unwrap();

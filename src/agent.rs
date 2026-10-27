@@ -398,45 +398,39 @@ pub fn provision_agent_with(db: &Path, node: &Path, pi_dir: &Path, tools: ToolSe
     let node_s = node.to_str().ok_or_else(|| anyhow!("non-utf8 node path"))?;
     let pi_s = pi_dir.to_str().ok_or_else(|| anyhow!("non-utf8 pi path"))?;
     let objects = vm::vm_import_closure(&conn, node_s, "/")?;
-    // an agent runs shell commands, so a shell and its libraries must be there too
-    let mut shell_objects = 0usize;
+    // A tool that is present on the host but fails to import is an error, not a skip: skipping left
+    // VMs where the tool was missing or half-installed (gcc without its headers) and nothing said so.
+    // Tools absent from the host are skipped; the tool set lists what a typical host has.
+    let mut tool_objects = 0usize;
+    let mut tool_files = 0usize;
     // Single files the linker needs. `vm_pack_host_dir_parallel` only walks directories, so these are added
     // one by one; passing them as trees silently skipped every crt object (measured: ld could not find
     // Scrt1.o while gcc reported its version fine).
-    let mut single_files = 0usize;
     for f in tools.linker_inputs() {
         // Never touch a path the import already recorded: /usr/bin/as and /usr/bin/ld may already exist as
         // symlinks, and writing them as regular files made the binary unusable (measured: /bin/git gave
         // "Exec format error" because it had been overwritten with another file's bytes).
         let taken: i64 = conn.query_row("SELECT count(*) FROM vm_fs WHERE path=?1", params![f], |r| r.get(0))?;
-        if taken > 0 { continue; }
-        if std::path::Path::new(&f).is_file() && vm::vm_add_file(&conn, &f, &f).is_ok() { single_files += 1; }
+        if taken > 0 || !std::path::Path::new(&f).is_file() { continue; }
+        vm::vm_add_file(&conn, &f, &f).map_err(|e| anyhow!("provision linker input {}: {}", f, e))?;
+        tool_files += 1;
     }
-    let _ = single_files;
-    for prog in tools.compiler_helpers() {
-        if std::path::Path::new(prog).exists() {
-            shell_objects += vm::vm_import_closure(&conn, prog, "/").unwrap_or(0);
-        }
-    }
-    for prog in tools.commands() {
-        if std::path::Path::new(prog).exists() {
-            shell_objects += vm::vm_import_closure(&conn, prog, "/").unwrap_or(0);
-        }
+    // an agent runs shell commands, so a shell and its libraries must be there too
+    for prog in tools.compiler_helpers().iter().chain(tools.commands()) {
+        if !std::path::Path::new(prog).exists() { continue; }
+        tool_objects += vm::vm_import_closure(&conn, prog, "/").map_err(|e| anyhow!("provision {}: {}", prog, e))?;
     }
     // python3 refuses to start without its standard library, which the ELF closure does not include
-    let mut tree_files = 0usize;
     for (host, vm_prefix) in tools.trees() {
-        if std::path::Path::new(&host).exists() {
-            tree_files += vm::vm_pack_host_dir_parallel(&conn, &host, &vm_prefix).unwrap_or(0);
-        }
+        if !std::path::Path::new(&host).exists() { continue; }
+        tool_files += vm::vm_pack_host_dir_parallel(&conn, &host, &vm_prefix).map_err(|e| anyhow!("provision tree {}: {}", host, e))?;
     }
-    let _ = tree_files;
     let files = vm::vm_pack_host_dir_parallel(&conn, pi_s, "/opt/pi")?;
     // the names a command line inside the VM uses
     let node_real = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
     vm::vm_add_symlink(&conn, "/usr/bin/node", &node_real.to_string_lossy())?;
     vm::vm_add_symlink(&conn, "/usr/bin/pi", "/opt/pi/dist/bundle/cli.js")?;
-    Ok(ProvisionReport { objects: objects + shell_objects, files, node: node_real.to_string_lossy().to_string() })
+    Ok(ProvisionReport { objects: objects + tool_objects, files, tool_files, node: node_real.to_string_lossy().to_string() })
 }
 
 
@@ -705,7 +699,15 @@ impl Limits {
 
 /// What `provision_agent` put in the database.
 #[derive(Debug)]
-pub struct ProvisionReport { pub objects: usize, pub files: usize, pub node: String }
+pub struct ProvisionReport {
+    /// ELF objects imported: node's closure plus every tool's closure.
+    pub objects: usize,
+    /// Entries packed from the pi tree at `/opt/pi`.
+    pub files: usize,
+    /// Tool data outside the ELF closures: linker inputs and packed trees (python stdlib, gcc headers).
+    pub tool_files: usize,
+    pub node: String,
+}
 
 /// Run one task with the pi agent inside the VM, recorded like a step.
 ///

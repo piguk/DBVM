@@ -133,7 +133,7 @@ fn base_rewrites_never_show_a_torn_file_to_a_reader() {
             let w = vm::vm_open(base.to_str().unwrap()).unwrap();
             let mut round = 0u32;
             while !stop.load(std::sync::atomic::Ordering::SeqCst) && round < 120 {
-                let v = if round % 2 == 0 { &b_bytes } else { &a };
+                let v = if round.is_multiple_of(2) { &b_bytes } else { &a };
                 let _ = vm::vm_add_bytes(&w, "/t", v, 0o644, round as i64);
                 round += 1;
             }

@@ -44,21 +44,18 @@ impl Overlay {
         if app as u32 != crate::vm::VM_APP_ID {
             return Err(anyhow!("base is not a VM database (application_id {:#x})", app));
         }
+        // Base hashes are copied into the Delta and compared with it; a read-only Base cannot finalize
+        // stale ones, so it must have none
+        let pending = crate::vm::pending_hashes(&conn, "base")?;
+        if pending > 0 {
+            return Err(anyhow!("base has {} files with pending hashes; open it read-write once (e.g. vm-verify) to finalize them", pending));
+        }
         Ok(Overlay { conn })
     }
 
     pub fn conn(&self) -> &Connection { &self.conn }
 
-    /// Run `f` in an immediate write transaction. The write lock is taken up front, so a
-    /// competing writer makes this wait (up to the busy timeout) instead of failing mid-way with
-    /// "database is locked", which a deferred savepoint does when it must upgrade its lock.
-    fn write_tx<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        match f() {
-            Ok(v) => { self.conn.execute_batch("COMMIT;")?; Ok(v) }
-            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK;"); Err(e) }
-        }
-    }
+    fn write_tx<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> { vm::write_tx(&self.conn, f) }
 
     /// Where a path currently resolves.
     pub fn locate(&self, vm_path: &str) -> Result<Layer> {
@@ -245,12 +242,11 @@ impl Overlay {
     /// Target of a symlink as seen through the overlay.
     pub fn readlink(&self, vm_path: &str) -> Result<String> {
         let p = normalize_vm_path(vm_path);
-        let (schema, layer) = match self.locate(&p)? {
-            Layer::Delta => ("main", ()),
-            Layer::Base => ("base", ()),
+        let schema = match self.locate(&p)? {
+            Layer::Delta => "main",
+            Layer::Base => "base",
             Layer::Missing => return Err(anyhow!("not found in overlay: {}", p)),
         };
-        let _ = layer;
         let target: Option<String> = self.conn.query_row(
             &format!("SELECT link_target FROM {}.vm_fs WHERE path=?1 AND kind='symlink'", schema),
             params![p], |r| r.get(0)).optional()?.flatten();
@@ -597,7 +593,7 @@ impl Overlay {
                 None => return Err(anyhow!("not found in overlay: {}", p)),
             };
             if new_size == size { return Ok(()); }
-            let keep = if new_size == 0 { 0 } else { (new_size + cs - 1) / cs };
+            let keep = if new_size == 0 { 0 } else { new_size.div_ceil(cs) };
             // Only chunks that actually change are written into Delta; the rest keep coming from Base.
             // Shrinking inside a chunk rewrites that one chunk; growing rewrites the old tail chunk (it now
             // needs zero fill) and adds the new ones.
@@ -926,7 +922,7 @@ impl Overlay {
     fn refresh_delta_file(&self, p: &str, size: u64, mtime: i64) -> Result<()> {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        let total = if size == 0 { 0 } else { (size + crate::vm::CHUNK_SIZE as u64 - 1) / crate::vm::CHUNK_SIZE as u64 };
+        let total = if size == 0 { 0 } else { size.div_ceil(crate::vm::CHUNK_SIZE as u64) };
         for idx in 0..total {
             let piece = self.read_chunk_layered("main", p, idx as i64)?;
             h.update(&piece);
@@ -952,7 +948,7 @@ impl Overlay {
         if kind != "file" { return Err(anyhow!("not a regular file: {}", p)); }
         let size = size as u64;
         let cs = crate::vm::CHUNK_SIZE as u64;
-        let total = if size == 0 { 0 } else { (size + cs - 1) / cs };
+        let total = if size == 0 { 0 } else { size.div_ceil(cs) };
         let mut out: Vec<u8> = Vec::with_capacity(size as usize);
         for idx in 0..total {
             let piece = self.read_chunk_layered(schema, p, idx as i64)?;

@@ -138,7 +138,7 @@ fn max_file_size_also_refuses_growing_an_existing_file() {
     // The limit is on the resulting size, so a write that grows a small file past it is refused and
     // the file keeps its old content and size.
     let (d, c) = make("grow");
-    vm::vm_add_bytes(&c, "/work/s.txt", &vec![1u8; 100], 0o644, 1).unwrap();
+    vm::vm_add_bytes(&c, "/work/s.txt", &[1u8; 100], 0o644, 1).unwrap();
     policy::add(&c, &Rule::MaxFileSize(1000)).unwrap();
     assert!(refused(vm::write_range(&c, "/work/s.txt", 0, &vec![2u8; 5000], 3)), "growing past the limit is refused");
     let size: i64 = c.query_row("SELECT size FROM vm_fs WHERE path='/work/s.txt'", [], |r| r.get(0)).unwrap();
@@ -155,7 +155,7 @@ fn strictest_size_limit_applies_when_several_are_set() {
     // the stricter limit is added FIRST, so a "last rule wins" bug would pick the looser one
     policy::add(&c, &Rule::MaxFileSize(50)).unwrap();
     policy::add(&c, &Rule::MaxFileSize(10_000)).unwrap();
-    assert!(refused(vm::vm_add_bytes(&c, "/w/x", &vec![0u8; 60], 0o644, 1).map_err(|e| anyhow::anyhow!(e.to_string()))),
+    assert!(refused(vm::vm_add_bytes(&c, "/w/x", &[0u8; 60], 0o644, 1).map_err(|e| anyhow::anyhow!(e.to_string()))),
         "60 bytes is over the stricter 50-byte limit");
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -259,9 +259,9 @@ fn disk_quota_refuses_writes_that_would_exceed_the_total() {
     policy::add(&c, &Rule::DiskQuota(base_bytes as u64 + 100)).unwrap();
 
     // a write that fits is allowed
-    vm::vm_add_bytes(&c, "/work/fits.txt", &vec![7u8; 80], 0o644, 1).expect("80 of the 100 remaining bytes must fit");
+    vm::vm_add_bytes(&c, "/work/fits.txt", &[7u8; 80], 0o644, 1).expect("80 of the 100 remaining bytes must fit");
     // 200 more do not: only 20 are left
-    assert!(refused(vm::vm_add_bytes(&c, "/work/nope.txt", &vec![7u8; 200], 0o644, 1).map_err(|e| anyhow::anyhow!(e.to_string()))),
+    assert!(refused(vm::vm_add_bytes(&c, "/work/nope.txt", &[7u8; 200], 0o644, 1).map_err(|e| anyhow::anyhow!(e.to_string()))),
         "a write past the quota is refused");
     let exists: i64 = c.query_row("SELECT count(*) FROM vm_fs WHERE path='/work/nope.txt'", [], |r| r.get(0)).unwrap();
     assert_eq!(exists, 0, "the refused file does not exist");
@@ -275,9 +275,9 @@ fn disk_quota_refuses_writes_that_would_exceed_the_total() {
 
     // deleting the 80-byte file frees room, so a 60-byte write (20 free + 80 freed) now fits
     c.execute("DELETE FROM vm_fs WHERE path='/work/fits.txt'", []).unwrap();
-    vm::vm_add_bytes(&c, "/work/after-free.txt", &vec![7u8; 60], 0o644, 1).expect("after freeing space the write fits");
+    vm::vm_add_bytes(&c, "/work/after-free.txt", &[7u8; 60], 0o644, 1).expect("after freeing space the write fits");
     // and the quota still holds afterwards
-    assert!(refused(vm::vm_add_bytes(&c, "/work/again.txt", &vec![7u8; 100], 0o644, 1).map_err(|e| anyhow::anyhow!(e.to_string()))),
+    assert!(refused(vm::vm_add_bytes(&c, "/work/again.txt", &[7u8; 100], 0o644, 1).map_err(|e| anyhow::anyhow!(e.to_string()))),
         "the quota keeps applying after a delete");
     let v = vm::vm_verify(&c, true).unwrap();
     assert!(v.contains("deep=ok"), "deep verify: {}", v);

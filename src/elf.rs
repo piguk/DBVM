@@ -223,8 +223,8 @@ pub fn meta_for_bytes(data: &[u8]) -> ElfMeta {
     ElfMeta{
         needed: elf.libraries.iter().map(|s| s.to_string()).collect(),
         soname: elf.soname.map(|s| s.to_string()),
-        runpath: elf.runpaths.get(0).map(|s| s.to_string()),
-        rpath: elf.rpaths.get(0).map(|s| s.to_string()),
+        runpath: elf.runpaths.first().map(|s| s.to_string()),
+        rpath: elf.rpaths.first().map(|s| s.to_string()),
     }
 }
 

@@ -34,7 +34,7 @@ fn classify(r: anyhow::Result<Vec<u8>>) -> Option<String> {
 const VERSION_LENS: &[usize] = &[SIZE, 70_000, 200_000, 3_000];
 
 fn version(round: u8) -> (u8, usize) {
-    let fill = if round % 2 == 0 { b'b' } else { b'c' };
+    let fill = if round.is_multiple_of(2) { b'b' } else { b'c' };
     (fill, VERSION_LENS[(round as usize) % VERSION_LENS.len()])
 }
 

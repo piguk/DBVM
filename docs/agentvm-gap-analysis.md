@@ -91,10 +91,16 @@ Error: UNIQUE constraint failed: vm_snapshots.name
 
 **这是"Base+Delta 分支"从 API 到可用产品的最后一段**。
 
-### 7. 硬链接被转成符号链接，导致数据丢失语义（已实测）
+### 7. 硬链接被转成符号链接，导致数据丢失语义（已修复）
 
-导入 tar 时 `is_hard_link()` 的条目直接存成符号链接（`vm.rs:1713`），与目标是两个独立条目，
-不共享内容。
+**现状**：tar 导入把硬链接存为一个独立的常规文件，内容与目标相同（`vm_fs` 两行同 hash，共享 blob），
+见 `src/vm/import.rs` 的 `vm_import_tar_filtered` 与测试 `tar_hard_link_is_a_copy_of_its_target`。
+删除任一名字不影响另一个。仍不共享 inode：对一个名字的后续写入不会反映到另一个名字。
+
+以下为修复前的记录。
+
+导入 tar 时 `is_hard_link()` 的条目直接存成符号链接，与目标是两个独立条目，
+不共享内容。另外 tar 中硬链接的目标是相对归档根的路径，按符号链接解析时以链接所在目录为基准，指向错误路径。
 
 实测（`a.txt` 与 `b.txt` 是同一 inode 的硬链接）：
 
