@@ -103,6 +103,10 @@ pub struct Spec {
     /// The sandbox's `/`.
     pub root: PathBuf,
     pub root_writable: bool,
+    /// The root may be changed from outside while the sandbox runs (a session restores it after a
+    /// rollback). gVisor otherwise assumes exclusive access and keeps serving its cached view (measured:
+    /// a file removed on the host was still visible inside).
+    pub root_shared: bool,
     pub argv: Vec<String>,
     /// The complete environment of the sandboxed process. Nothing from the host is added.
     pub env: Vec<(String, String)>,
@@ -119,6 +123,7 @@ impl Spec {
         Spec {
             root: root.to_path_buf(),
             root_writable: true,
+            root_shared: false,
             argv,
             env: vec![("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()), ("HOME".into(), "/root".into())],
             binds: Vec::new(),
@@ -153,7 +158,7 @@ pub const EXIT_TIMEOUT: i32 = 124;
 /// rest is read and dropped, so the process never blocks on a full pipe). The sandbox is killed after
 /// `timeout`.
 pub fn run_captured(spec: &Spec, isolation: Isolation, timeout: Duration, max_output: usize) -> Result<Outcome> {
-    let mut sb = Sandbox::spawn(spec, isolation, Stdio::piped())?;
+    let mut sb = Sandbox::spawn(spec, isolation, Stdio::piped(), Stdio::piped())?;
     let mut out_pipe = sb.child.stdout.take().ok_or_else(|| anyhow!("no stdout pipe"))?;
     let mut err_pipe = sb.child.stderr.take().ok_or_else(|| anyhow!("no stderr pipe"))?;
     let out_t = std::thread::spawn(move || drain_capped(&mut out_pipe, max_output));
@@ -180,7 +185,7 @@ pub fn run_captured(spec: &Spec, isolation: Isolation, timeout: Duration, max_ou
 
 /// Run `spec` attached to the caller's terminal and return its exit code.
 pub fn run_interactive(spec: &Spec, isolation: Isolation) -> Result<i32> {
-    let mut sb = Sandbox::spawn(spec, isolation, Stdio::inherit())?;
+    let mut sb = Sandbox::spawn(spec, isolation, Stdio::inherit(), Stdio::inherit())?;
     let status = sb.child.wait()?;
     sb.kill_all();
     Ok(exit_code(status))
@@ -216,7 +221,7 @@ pub struct Sandbox {
     child: Child,
     cgroup: Option<SandboxCgroup>,
     /// gVisor keeps per-container state in this directory; it is removed with the sandbox.
-    runsc_state: Option<PathBuf>,
+    _runsc_state: Option<crate::vm::WorkDir>,
     _keep: Vec<OwnedFd>,
 }
 
@@ -235,7 +240,8 @@ fn unique_name(prefix: &str) -> String {
 }
 
 impl Sandbox {
-    pub fn spawn(spec: &Spec, isolation: Isolation, stdio: Stdio) -> Result<Sandbox> {
+    /// Start `spec`. A non-interactive sandbox gets /dev/null as stdin and the given stdout and stderr.
+    pub fn spawn(spec: &Spec, isolation: Isolation, stdout: Stdio, stderr: Stdio) -> Result<Sandbox> {
         if spec.argv.is_empty() { return Err(anyhow!("empty command")); }
         let mut keep: Vec<OwnedFd> = Vec::new();
         let mut runsc_state = None;
@@ -305,12 +311,15 @@ impl Sandbox {
         if spec.interactive {
             cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
         } else {
-            cmd.stdin(Stdio::null()).stdout(stdio).stderr(Stdio::piped());
+            cmd.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
         }
         let child = cmd.spawn().map_err(|e| anyhow!("start sandbox ({:?}): {}", cmd.get_program(), e))?;
         if let Some(f) = join_fd { keep.push(f); }
-        Ok(Sandbox { child, cgroup, runsc_state, _keep: keep })
+        Ok(Sandbox { child, cgroup, _runsc_state: runsc_state, _keep: keep })
     }
+
+    /// Whether the sandbox's top process is still running.
+    pub fn is_running(&mut self) -> bool { matches!(self.child.try_wait(), Ok(None)) }
 
     /// Stop every process of the sandbox, including ones that left the process group.
     pub fn kill_all(&mut self) {
@@ -337,7 +346,7 @@ impl Drop for Sandbox {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        if let Some(state) = &self.runsc_state { let _ = std::fs::remove_dir_all(state); }
+        // _runsc_state is removed when the field drops, after the processes above have ended
     }
 }
 
@@ -593,13 +602,15 @@ pub mod gvisor {
     }
 
     /// The command that runs `spec` in gVisor, and the state directory to remove afterwards.
-    pub(super) fn command(spec: &Spec) -> Result<(Command, PathBuf)> {
+    pub(super) fn command(spec: &Spec) -> Result<(Command, crate::vm::WorkDir)> {
         let runsc = runsc().ok_or_else(|| anyhow!("gVisor isolation needs runsc (set SELF_RUNSC or put it on PATH)"))?;
-        let state = crate::vm::make_tmp_dir("selfdb-runsc-")?;
+        let work = crate::vm::WorkDir::create("selfdb-runsc-")?;
+        let state = work.path();
         let bundle = state.join("bundle");
         std::fs::create_dir_all(&bundle)?;
         std::fs::write(bundle.join("config.json"), oci_config(spec))?;
         let mut cmd = Command::new(runsc);
+        if spec.root_shared { cmd.arg("--file-access=shared"); }
         cmd.arg("--rootless")
             .arg("--network=none")
             // cgroups are applied around runsc by the caller (one cgroup per sandbox, as for bwrap)
@@ -609,11 +620,13 @@ pub mod gvisor {
             .arg("--overlay2=none")
             // the agent reaches the host proxy through a unix socket bound into the sandbox
             .arg("--host-uds=open")
+            // a session's supervisor takes requests through a FIFO in its bound control directory
+            .arg("--host-fifo=open")
             .arg("--root").arg(state.join("runsc-root"))
             .arg("run")
             .arg("--bundle").arg(&bundle)
             .arg(unique_name("selfdb"));
-        Ok((cmd, state))
+        Ok((cmd, work))
     }
 
     fn json_list(items: &[String]) -> String {

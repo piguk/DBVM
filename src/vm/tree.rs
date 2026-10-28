@@ -14,8 +14,10 @@ fn prune_scratch(conn: &Connection, dest: &Path) -> Result<usize> {
         let e = match e { Ok(v) => v, Err(_) => continue };
         let rel = e.path().strip_prefix(dest).unwrap_or(e.path()).to_string_lossy().to_string();
         let vm_p = normalize_vm_path(&format!("/{}", rel));
-        if vm_p == "/dev" || vm_p.starts_with("/dev/") || vm_p == "/proc" || vm_p.starts_with("/proc/")
-            || vm_p == "/sys" || vm_p.starts_with("/sys/") || vm_p == "/tmp" || vm_p.starts_with("/tmp/") { continue; }
+        // The same reserved set the sync uses: these entries are never in the database, so pruning them would
+        // delete runtime state. A session's bind-mount points are among them, and removing one on the host
+        // detaches the mount inside the sandbox (measured: the supervisor stopped receiving requests).
+        if is_reserved_vm_path(&vm_p) { continue; }
         if !keep.contains(&vm_p) { victims.push(e.path().to_path_buf()); }
     }
     let mut removed = 0usize;
@@ -197,6 +199,8 @@ pub(crate) fn is_reserved_vm_path(p: &str) -> bool {
     // node's compile cache, not a change the task made (measured: a python task reported 20 such paths).
     if p.contains("/__pycache__") { return true; }
     if p.starts_with("/opt/piagent/") { return true; }
+    // a session's supervisor and control directory, bound into the sandbox
+    if p == "/.selfdb" || p.starts_with("/.selfdb/") { return true; }
     p == "/opt/piagent"
 }
 

@@ -21,6 +21,56 @@ pub fn make_tmp_dir(prefix: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(String::from_utf8_lossy(&buf).to_string()))
 }
 
+/// A private working directory under $TMPDIR, removed when dropped.
+///
+/// A process that is killed cannot remove its directories, and materialized trees are large: killed runs
+/// filled /tmp (measured). So each directory has an owner lock beside it (`<dir>.lock`, never inside: the
+/// directory may be a VM's root, and its content is synced into the database). The lock is held for the
+/// directory's lifetime; a lock nobody holds means the owner is gone, and `create` removes that directory
+/// before making a new one with the same prefix.
+pub struct WorkDir { path: PathBuf, lock: PathBuf, _owner: std::fs::File }
+
+impl WorkDir {
+    pub fn create(prefix: &str) -> Result<WorkDir> {
+        reclaim_abandoned(prefix);
+        let path = make_tmp_dir(prefix)?;
+        let lock = PathBuf::from(format!("{}.lock", path.display()));
+        // locked under a temporary name and then renamed, so no unlocked `.lock` is ever visible
+        let staging = PathBuf::from(format!("{}.lock-{}", path.display(), std::process::id()));
+        let owner = std::fs::OpenOptions::new().write(true).create_new(true).open(&staging)
+            .map_err(|e| anyhow!("create {}: {}", staging.display(), e))?;
+        if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&owner), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(anyhow!("lock {}: {}", staging.display(), std::io::Error::last_os_error()));
+        }
+        std::fs::rename(&staging, &lock)?;
+        Ok(WorkDir { path, lock, _owner: owner })
+    }
+
+    pub fn path(&self) -> &Path { &self.path }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_file(&self.lock);
+    }
+}
+
+/// Remove `<prefix>*` directories under $TMPDIR whose owner lock is free.
+fn reclaim_abandoned(prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(dir_name) = name.strip_suffix(".lock") else { continue };
+        if !dir_name.starts_with(prefix) { continue; }
+        let Ok(f) = std::fs::OpenOptions::new().write(true).open(e.path()) else { continue };
+        if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&f), libc::LOCK_EX | libc::LOCK_NB) } != 0 { continue; }
+        // the owner is gone: remove its directory, then the lock, while holding the lock
+        let _ = std::fs::remove_dir_all(e.path().with_file_name(dir_name));
+        let _ = std::fs::remove_file(e.path());
+    }
+}
+
 pub fn cache_path_for_hash(hash: &str) -> PathBuf {
     let dir = cache_dir();
     let a = &hash[0..2.min(hash.len())];

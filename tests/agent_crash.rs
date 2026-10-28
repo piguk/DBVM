@@ -21,6 +21,7 @@ fn a_killed_step_leaves_a_usable_database_and_an_orphan_snapshot() {
     drop(c);
 
     // start a step that would take 10 s and kill it after 2.5 s
+    let existing = scratch_dirs();
     child_runner::kill_mid_step(&db).unwrap();
     let c = vm::vm_open(db.to_str().unwrap()).unwrap();
     // the database is intact and the untouched file survived
@@ -36,7 +37,36 @@ fn a_killed_step_leaves_a_usable_database_and_an_orphan_snapshot() {
     // retaining nothing reclaims both kinds
     let removed = vm::snapshot_retain(&c, 0).unwrap();
     assert_eq!(removed.len(), 1, "the orphan is reclaimed by retain");
+    drop(c);
+    // the killed step could not remove its materialized tree; the next step reclaims it
+    // only the killed step's own tree: other runs may have left directories that predate owner locks
+    let left: Vec<_> = scratch_dirs().into_iter().filter(|p| !existing.contains(p)).collect();
+    assert_eq!(left.len(), 1, "the killed step left its tree (this is what the next step reclaims)");
+    let r = selfdb::agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "true".into()], &selfdb::agent::StepOptions::new(30)).unwrap();
+    assert_eq!(r.exit_code, 0);
+    let still: Vec<_> = scratch_dirs().into_iter().filter(|p| left.contains(p)).collect();
+    assert!(still.is_empty(), "abandoned trees are reclaimed: {:?}", still);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+fn scratch_dirs() -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(std::env::temp_dir()).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("agent-step-") && e.path().is_dir())
+        .map(|e| e.path()).collect()
+}
+
+#[test]
+fn a_live_work_dir_is_never_reclaimed_and_a_dropped_one_is_gone() {
+    let a = vm::WorkDir::create("workdir-test-").unwrap();
+    std::fs::write(a.path().join("f"), b"x").unwrap();
+    // another directory with the same prefix runs the reclaim pass; `a` is locked by its owner
+    let b = vm::WorkDir::create("workdir-test-").unwrap();
+    assert!(a.path().join("f").exists(), "a live directory is kept");
+    let (pa, pb) = (a.path().to_path_buf(), b.path().to_path_buf());
+    drop(a);
+    drop(b);
+    assert!(!pa.exists() && !pb.exists(), "dropping removes the directory");
+    assert!(!std::path::Path::new(&format!("{}.lock", pa.display())).exists(), "and its lock");
 }
 
 mod child_runner {

@@ -228,6 +228,23 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
 - guest 侧目前需要自己拼 `http://127.0.0.1:<port>/pkg/<host>/<path>`（VM 内没有
   `curl`，可用 python3 的 `http.client`）；没有 `HTTP_PROXY` 自动集成。
 
+## 长期 session
+
+一个 session 只物化一次树，并让一个 sandbox 在整个 session 期间常驻；sandbox 内的 supervisor（`src/session/init.c`，构建时静态链接）执行宿主发来的每条命令。命令留下的后台进程（dev server、watcher）在命令之间继续运行。
+
+```rust
+let mut s = selfdb::session::Session::start(&db, &SessionOptions { isolation, ..Default::default() })?;
+let r = s.exec(&argv, &ExecOptions { timeout_secs: 60, rollback_on_fail: true, ..Default::default() })?;
+s.close();
+```
+
+- 每条命令仍是一个记录在 `agent_steps` 的 step：命令结束后回写树、与上一条命令后的快照比较、保留（新快照）或回滚（库与树都恢复）。
+- 命令在独立的 session 中运行，超时结束其整个进程组；输出写入文件，后台进程持有输出不会阻塞请求。
+- session 持有数据库的 step 锁，期间其他 step 与 session 等待。
+- gVisor 下以 `--file-access=shared` 运行：回滚时宿主恢复树，独占模式下 gVisor 看不到这一改动（已实测）。
+- 根为物化树而非 FUSE 挂载（挂载上文件密集负载慢 5–12 倍）。
+- 实测（dev 工具集，49,328 个条目，3 次最小值）：session 启动 2.76 s；空命令 1.25–1.28 s，其中主要是回写时对全部文件的 stat、全量快照与 diff，它们与总文件数成正比，与命令改动的文件数无关。这是当前 session 的主要开销。
+
 ## 安全边界
 
 本节说明每一层保证什么、不保证什么。这些是重要的，因为它们决定能把什么样的代码放进哪一层执行。

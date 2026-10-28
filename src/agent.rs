@@ -55,6 +55,46 @@ pub struct StepResult {
     /// of `duration_ms` is the sandbox, the tools and the agent's own work. Zero for a plain step.
     pub model_ms: u128,
     pub model_requests: u64,
+    /// Snapshot taken before the run, and after it (None when the run was rolled back).
+    pub snap_before: String,
+    pub snap_after: Option<String>,
+}
+
+/// How a run is recorded once its sandbox has finished.
+pub(crate) struct Finish<'a> {
+    pub cmd: String,
+    pub before: &'a str,
+    pub rollback_on_fail: bool,
+    /// Name prefix and note of the snapshot taken after a run that is kept.
+    pub after_prefix: &'a str,
+    pub note: &'a str,
+    pub started: Instant,
+    /// (model wait in ms, model requests), zero for a plain step.
+    pub model: (u128, u64),
+}
+
+/// The common end of every run: diff against the snapshot taken before, roll back or snapshot the result,
+/// and record the run in agent_steps.
+pub(crate) fn finish_run(conn: &rusqlite::Connection, o: Outcome, f: Finish) -> Result<StepResult> {
+    let changes = vm::snapshot_diff_live(conn, f.before)?;
+    let rolled_back = (o.exit_code != 0 || o.timed_out) && f.rollback_on_fail;
+    let snap_after = if rolled_back {
+        vm::snapshot_restore(conn, f.before)?;
+        None
+    } else {
+        Some(vm::snapshot_create_named(conn, f.after_prefix, f.note)?.1)
+    };
+    let duration_ms = f.started.elapsed().as_millis();
+    conn.execute(
+        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![f.cmd, o.exit_code, o.timed_out as i64, rolled_back as i64, duration_ms as i64,
+                &o.stdout, &o.stderr, o.stdout_truncated as i64, o.stderr_truncated as i64, f.before, snap_after, diff_to_json(&changes)])?;
+    Ok(StepResult {
+        step_id: conn.last_insert_rowid(), exit_code: o.exit_code, timed_out: o.timed_out, rolled_back,
+        stdout: o.stdout, stderr: o.stderr, stdout_truncated: o.stdout_truncated, stderr_truncated: o.stderr_truncated,
+        changes, duration_ms, model_ms: f.model.0, model_requests: f.model.1, snap_before: f.before.to_string(), snap_after,
+    })
 }
 
 pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepResult> {
@@ -85,28 +125,9 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
         return Err(record_and_fail(&conn, &cmd, &stdout, &stderr, stdout_truncated, exit_code, timed_out,
             &before, &why, duration_ms));
     }
-    let changes = vm::snapshot_diff_live(&conn, &before)?;
-    // the guard removes the tree when this function returns
-
-    let failed = exit_code != 0 || timed_out;
-    let rolled_back = failed && opts.rollback_on_fail;
-    let after_name = if rolled_back {
-        vm::snapshot_restore(&conn, &before)?;
-        None
-    } else {
-        let (_, a) = vm::snapshot_create_named(&conn, "step-after", "agent-step")?;
-        Some(a)
-    };
-    let duration_ms = started.elapsed().as_millis();
-
-    let diff_json = diff_to_json(&changes);
-    conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![argv.join(" "), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
-    let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms, model_ms: 0, model_requests: 0 })
+    finish_run(&conn, Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated },
+               Finish { cmd: argv.join(" "), before: &before, rollback_on_fail: opts.rollback_on_fail, after_prefix: "step-after",
+                        note: "agent-step", started, model: (0, 0) })
 }
 
 /// Compact JSON for the change list, written with stable key order.
@@ -406,8 +427,9 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     let started = Instant::now();
 
     // A mount point and a working directory for the proxy socket: both outside the VM.
-    let work = scratch_base("vm-agent-fuse-")?;
-    let mnt = work.join("mnt");
+    // the mount point and the proxy's directory, both outside the VM; removed when this function returns
+    let work = ScratchDir::create("vm-agent-fuse-")?;
+    let mnt = work.path().join("mnt");
     std::fs::create_dir_all(&mnt)?;
     let mount = crate::fuse::fuse_impl::mount_vm_background(db.to_str().unwrap(), mnt.to_str().unwrap())?;
     // A fresh agent directory per run: pi writes its session transcript there, and a leftover transcript
@@ -421,7 +443,7 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         if let Some(par) = host.parent() { let _ = std::fs::create_dir_all(par); }
         std::fs::write(&host, body)?;
     }
-    let proxy_dir = work.join("proxy");
+    let proxy_dir = work.path().join("proxy");
     std::fs::create_dir_all(&proxy_dir)?;
     let sock = proxy_dir.join("proxy.sock");
     let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
@@ -439,22 +461,10 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         let _ = std::fs::remove_dir_all(&host);
     }
     let outcome = outcome?;
-    let _ = std::fs::remove_dir_all(&work);
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
-    let changes = vm::snapshot_diff_live(&conn, &before)?;
-    let failed = exit_code != 0 || timed_out;
-    let rolled_back = failed && opts.rollback_on_fail;
-    let after_name = if rolled_back { vm::snapshot_restore(&conn, &before)?; None }
-        else { let (_, a) = vm::snapshot_create_named(&conn, "agent-after", "vm-agent")?; Some(a) };
-    let duration_ms = started.elapsed().as_millis();
-    let diff_json = diff_to_json(&changes);
-    conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![format!("vm-agent --fuse: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
-    let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms, model_ms, model_requests })
+    finish_run(&conn, Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated },
+               Finish { cmd: format!("vm-agent --fuse: {}", opts.task), before: &before, rollback_on_fail: opts.rollback_on_fail, after_prefix: "agent-after",
+                        note: "vm-agent", started, model: (model_ms, model_requests) })
 }
 
 /// Milliseconds since the epoch, used to give each run its own agent directory.
@@ -469,9 +479,6 @@ fn allows_write(root: &Path) -> bool {
     match std::fs::write(&probe, b"x") { Ok(()) => { let _ = std::fs::remove_file(&probe); true } Err(_) => false }
 }
 
-/// A scratch directory that is removed by the caller (the fuse path keeps it until the mount is gone).
-#[cfg(feature = "fuse")]
-fn scratch_base(prefix: &str) -> Result<std::path::PathBuf> { vm::make_tmp_dir(prefix) }
 
 /// Run one task with `db` as a Delta over a read-only `base`.
 ///
@@ -518,20 +525,9 @@ pub fn run_agent_on_overlay(db: &Path, opts: &AgentOptions) -> Result<StepResult
         scratch.remove(rel);
     }
     ov.absorb_tree(scratch.path())?;
-    let changes = vm::snapshot_diff_live(conn, &before)?;
-    let failed = exit_code != 0 || timed_out;
-    let rolled_back = failed && opts.rollback_on_fail;
-    let after_name = if rolled_back { vm::snapshot_restore(conn, &before)?; None }
-        else { let (_, a) = vm::snapshot_create_named(conn, "agent-after", "vm-agent")?; Some(a) };
-    let duration_ms = started.elapsed().as_millis();
-    let diff_json = diff_to_json(&changes);
-    conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![format!("vm-agent: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
-    let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms, model_ms, model_requests })
+    finish_run(conn, Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated },
+               Finish { cmd: format!("vm-agent: {}", opts.task), before: &before, rollback_on_fail: opts.rollback_on_fail, after_prefix: "agent-after",
+                        note: "vm-agent", started, model: (model_ms, model_requests) })
 }
 
 /// Record a run whose synced content could not be applied, then report the failure.
@@ -563,26 +559,19 @@ fn record_and_fail(conn: &rusqlite::Connection, cmd: &str, stdout: &[u8], stderr
 }
 
 
-/// Removes a scratch directory when it goes out of scope.
+/// A run's scratch directory: removed when it goes out of scope, and reclaimed by a later run if this
+/// process is killed (see `vm::WorkDir`).
 ///
 /// Every early return in a run must clean up. Writing `remove_dir_all` on each error path is easy to
 /// forget: measured, three failed agent runs left 539 MB of materialised trees under /tmp because the
 /// paths after the proxy was bound returned with `?` and never cleaned up.
-struct ScratchDir { path: std::path::PathBuf }
+struct ScratchDir { dir: vm::WorkDir }
 
 impl ScratchDir {
-    fn create(prefix: &str) -> Result<ScratchDir> {
-        Ok(ScratchDir { path: vm::make_tmp_dir(prefix)? })
-    }
-    fn path(&self) -> &Path { &self.path }
-    /// Keep a file that lives inside the tree: used before syncing, so the guard still removes it.
-    fn remove(&self, rel: &str) { let _ = std::fs::remove_file(self.path.join(rel)); }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        if !self.path.as_os_str().is_empty() { let _ = std::fs::remove_dir_all(&self.path); }
-    }
+    fn create(prefix: &str) -> Result<ScratchDir> { Ok(ScratchDir { dir: vm::WorkDir::create(prefix)? }) }
+    fn path(&self) -> &Path { self.dir.path() }
+    /// Remove a file the run itself created inside the tree, before the tree is synced.
+    fn remove(&self, rel: &str) { let _ = std::fs::remove_file(self.path().join(rel)); }
 }
 
 /// Options for one agent task.
@@ -702,27 +691,9 @@ pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         return Err(record_and_fail(&conn, &cmd, &stdout, &stderr, stdout_truncated, exit_code, timed_out,
             &before, &why, duration_ms));
     }
-    let changes = vm::snapshot_diff_live(&conn, &before)?;
-    // the guard removes the tree when this function returns
-
-    let failed = exit_code != 0 || timed_out;
-    let rolled_back = failed && opts.rollback_on_fail;
-    let after_name = if rolled_back {
-        vm::snapshot_restore(&conn, &before)?;
-        None
-    } else {
-        let (_, a) = vm::snapshot_create_named(&conn, "agent-after", "vm-agent")?;
-        Some(a)
-    };
-    let duration_ms = started.elapsed().as_millis();
-    let diff_json = diff_to_json(&changes);
-    conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![format!("vm-agent: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
-    let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms, model_ms, model_requests })
+    finish_run(&conn, Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated },
+               Finish { cmd: format!("vm-agent: {}", opts.task), before: &before, rollback_on_fail: opts.rollback_on_fail, after_prefix: "agent-after",
+                        note: "vm-agent", started, model: (model_ms, model_requests) })
 }
 
 /// pi's provider config: a local endpoint that the forwarder serves, with a placeholder key. The real

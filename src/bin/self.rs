@@ -201,7 +201,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::VmStat{db, path} => { let c=selfdb::vm::vm_open(&db)?; let (p,k,m,sz,mtime,hash)=selfdb::vm::vm_stat(&c, &path)?; println!("path={} kind={} mode={:o} size={} mtime={} hash={}", p,k,m,sz,mtime,hash); },
         Cmd::VmExec{db, vm_path, sandbox, rest} => {
             let c=selfdb::vm::vm_open(&db)?;
-            let tmp = selfdb::vm::make_tmp_dir("self-vm-")?;
+            // removed on return, and reclaimed by a later run if this process is killed
+            let work = selfdb::vm::WorkDir::create("self-vm-")?;
+            let tmp = work.path().to_path_buf();
             let host_bin = tmp.join(vm_path.trim_start_matches('/'));
             if let Some(parent)=host_bin.parent(){ std::fs::create_dir_all(parent)?; }
             // resolve symlink via vm_resolve and materialize (symlinks become regular file with target content)
@@ -260,16 +262,14 @@ fn main() -> anyhow::Result<()> {
             }
             // The binary runs in a sandbox rooted at the partial tree: never on the host, where it would
             // see the host's files, network and environment.
-            struct RemoveOnDrop(PathBuf);
-            impl Drop for RemoveOnDrop { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-            let _cleanup = RemoveOnDrop(tmp.clone());
             let mut argv = vec![vm_path.clone()];
             argv.extend(rest);
             let mut spec = selfdb::sandbox::Spec::new(&tmp, argv);
             spec.interactive = true;
             spec.limits = sandbox.limits(selfdb::sandbox::Limits::default());
             let code = selfdb::sandbox::run_interactive(&spec, sandbox.isolation()?)?;
-            drop(_cleanup);
+            // process::exit skips destructors: remove the tree first
+            drop(work);
             std::process::exit(code);
         },
         Cmd::VmChroot{db, cmd, persist, ephemeral, sandbox, rest} => {
@@ -295,30 +295,37 @@ fn main() -> anyhow::Result<()> {
             #[cfg(feature = "fuse")]
             {
                 if !ephemeral && Path::new("/dev/fuse").exists() {
-                    let mnt = selfdb::vm::make_tmp_dir("vm-fuse-")?;
+                    let mnt_dir = selfdb::vm::WorkDir::create("vm-fuse-")?;
+                    let mnt = mnt_dir.path().to_path_buf();
                     let session = selfdb::fuse::fuse_impl::mount_vm_background(&db, &mnt.to_string_lossy());
                     if let Ok(session) = session {
                         let code = selfdb::sandbox::run_interactive(&spec_for(&mnt), isolation);
+                        // unmount before the mount point is removed; process::exit skips destructors
                         drop(session);
-                        let _ = std::fs::remove_dir(&mnt);
+                        drop(mnt_dir);
                         std::process::exit(code?);
                     }
-                    let _ = std::fs::remove_dir(&mnt);
+                    drop(mnt_dir);
                     eprintln!("FUSE mount failed; using a materialized tree");
                 }
             }
             // A persistent session reuses a stable scratch directory per database: materialize only rewrites
             // files whose size or mtime differ and prunes entries the database no longer has, so a repeat
             // run costs a metadata walk. An ephemeral one gets its own directory, removed afterwards.
-            let tmp = if ephemeral { selfdb::vm::make_tmp_dir("vm-chroot-")? } else {
-                let d = selfdb::vm::cache_dir().join("scratch").join(selfdb::vm::path_key(&db));
-                std::fs::create_dir_all(&d)?;
-                d
+            let ephemeral_dir = if ephemeral { Some(selfdb::vm::WorkDir::create("vm-chroot-")?) } else { None };
+            let tmp = match &ephemeral_dir {
+                Some(w) => w.path().to_path_buf(),
+                None => {
+                    let d = selfdb::vm::cache_dir().join("scratch").join(selfdb::vm::path_key(&db));
+                    std::fs::create_dir_all(&d)?;
+                    d
+                }
             };
             selfdb::vm::vm_materialize_tree(&c, &tmp)?;
             let code = selfdb::sandbox::run_interactive(&spec_for(&tmp), isolation);
             if ephemeral {
-                let _ = std::fs::remove_dir_all(&tmp);
+                // process::exit skips destructors
+                drop(ephemeral_dir);
             } else {
                 let (cr, up, del) = selfdb::vm::vm_sync_from_host(&c, &tmp)?;
                 if cr + up + del > 0 { eprintln!("-> sync {} -> {}: +{} ~{} -{}", tmp.display(), db, cr, up, del); }
