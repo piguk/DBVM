@@ -265,7 +265,7 @@ impl Overlay {
             return Err(anyhow!("not a directory: {}", p));
         }
         let prefix = if p == "/" { "/".to_string() } else { format!("{}/", p) };
-        let like = format!("{}%", prefix);
+        let (lo, hi) = crate::vm::below_bounds(&p);
         let direct = |path: &str| -> Option<String> {
             let rest = path.get(prefix.len()..)?;
             if rest.is_empty() || rest.contains('/') { None } else { Some(rest.to_string()) }
@@ -273,15 +273,15 @@ impl Overlay {
 
         let mut delta_names = std::collections::BTreeSet::new();
         {
-            let mut st = self.conn.prepare("SELECT path FROM main.vm_fs WHERE path LIKE ?1")?;
-            for r in st.query_map(params![like], |r| r.get::<_, String>(0))? {
+            let mut st = self.conn.prepare("SELECT path FROM main.vm_fs WHERE path > ?1 AND path < ?2")?;
+            for r in st.query_map(params![lo, hi], |r| r.get::<_, String>(0))? {
                 if let Some(n) = direct(&r?) { delta_names.insert(n); }
             }
         }
         let mut base_names = std::collections::BTreeSet::new();
         {
-            let mut st = self.conn.prepare("SELECT path FROM base.vm_fs WHERE path LIKE ?1")?;
-            for r in st.query_map(params![like], |r| r.get::<_, String>(0))? {
+            let mut st = self.conn.prepare("SELECT path FROM base.vm_fs WHERE path > ?1 AND path < ?2")?;
+            for r in st.query_map(params![lo, hi], |r| r.get::<_, String>(0))? {
                 if let Some(n) = direct(&r?) { base_names.insert(n); }
             }
         }
@@ -298,8 +298,8 @@ impl Overlay {
         let mut hide_all = false;
         let mut hidden_children = std::collections::BTreeSet::new();
         {
-            let mut st = self.conn.prepare("SELECT path FROM main.vm_whiteouts WHERE path = ?1 OR path LIKE ?2")?;
-            for r in st.query_map(params![p, like], |r| r.get::<_, String>(0))? {
+            let mut st = self.conn.prepare("SELECT path FROM main.vm_whiteouts WHERE path = ?1 OR (path > ?2 AND path < ?3)")?;
+            for r in st.query_map(params![p, lo, hi], |r| r.get::<_, String>(0))? {
                 let w = r?;
                 if ancestors.iter().any(|a| a == &w) { hide_all = true; }
                 if let Some(n) = direct(&w) { hidden_children.insert(n); }
@@ -339,8 +339,8 @@ impl Overlay {
         self.check_base_policy(&p)?;
         self.write_tx(|| {
             // drop the Delta subtree (rows and their chunk references go with them)
-            let prefix = format!("{}/%", if p == "/" { "" } else { &p });
-            self.conn.execute("DELETE FROM main.vm_fs WHERE path=?1 OR path LIKE ?2", params![p, prefix])?;
+            let (lo, hi) = crate::vm::below_bounds(&p);
+            self.conn.execute("DELETE FROM main.vm_fs WHERE path=?1 OR (path > ?2 AND path < ?3)", params![p, lo, hi])?;
             // hide whatever Base still has under this path, including descendants
             if self.in_base_subtree(&p)? {
                 self.conn.execute("INSERT OR IGNORE INTO main.vm_whiteouts(path) VALUES (?1)", params![p])?;
@@ -386,9 +386,9 @@ impl Overlay {
             // keep every Base path under a whited-out ancestor hidden, except p and its ancestors
             let keep_prefix = format!("{}/", p);
             for anc in &whited {
-                let prefix = format!("{}/%", anc);
-                let mut st = self.conn.prepare("SELECT path FROM base.vm_fs WHERE path LIKE ?1")?;
-                let base_paths: Vec<String> = st.query_map(params![prefix], |r| r.get(0))?.map(|x| x.unwrap()).collect();
+                let (lo, hi) = crate::vm::below_bounds(anc);
+                let mut st = self.conn.prepare("SELECT path FROM base.vm_fs WHERE path > ?1 AND path < ?2")?;
+                let base_paths: Vec<String> = st.query_map(params![lo, hi], |r| r.get(0))?.map(|x| x.unwrap()).collect();
                 for bp in base_paths {
                     if bp == p || bp.starts_with(&keep_prefix) { continue; }
                     if ancestors.iter().any(|a| a == &bp) { continue; }
@@ -400,9 +400,9 @@ impl Overlay {
         // the Base subtree below p, so lock every Base path under p first. p itself is excluded:
         // the caller is making p visible, and p's own row (if Base has one) is what it replaces.
         if self.whited_out_exact(p)? {
-            let prefix = format!("{}/%", p);
-            let mut st = self.conn.prepare("SELECT path FROM base.vm_fs WHERE path LIKE ?1")?;
-            let below: Vec<String> = st.query_map(params![prefix], |r| r.get(0))?.map(|x| x.unwrap()).collect();
+            let (lo, hi) = crate::vm::below_bounds(p);
+            let mut st = self.conn.prepare("SELECT path FROM base.vm_fs WHERE path > ?1 AND path < ?2")?;
+            let below: Vec<String> = st.query_map(params![lo, hi], |r| r.get(0))?.map(|x| x.unwrap()).collect();
             for bp in below {
                 self.conn.execute("INSERT OR IGNORE INTO main.vm_whiteouts(path) VALUES (?1)", params![bp])?;
             }
@@ -422,8 +422,8 @@ impl Overlay {
     }
 
     fn in_base_subtree(&self, p: &str) -> Result<bool> {
-        let prefix = format!("{}/%", if p == "/" { "" } else { p });
-        Ok(self.conn.query_row("SELECT 1 FROM base.vm_fs WHERE path=?1 OR path LIKE ?2 LIMIT 1", params![p, prefix], |_| Ok(())).optional()?.is_some())
+        let (lo, hi) = crate::vm::below_bounds(p);
+        Ok(self.conn.query_row("SELECT 1 FROM base.vm_fs WHERE path=?1 OR (path > ?2 AND path < ?3) LIMIT 1", params![p, lo, hi], |_| Ok(())).optional()?.is_some())
     }
 
     fn in_layer(&self, schema: &str, p: &str) -> Result<bool> {

@@ -17,10 +17,10 @@ pub fn vm_ls(conn: &Connection, vm_path: &str) -> Result<Vec<LsEntry>> {
         let row = conn.prepare_cached("SELECT path,kind,mode,size,COALESCE(NULLIF(lower(hex(hash)),''),'') FROM vm_fs WHERE path=?1")?.query_row( params![p], ls_entry)?;
         return Ok(vec![row]);
     }
-    let like = if p == "/" { "/%".to_string() } else { format!("{}/%", p) };
-    let mut st = conn.prepare("SELECT path,kind,mode,size,COALESCE(NULLIF(lower(hex(hash)),''),'') FROM vm_fs WHERE path LIKE ?1 AND path != ?2 ORDER BY path")?;
+    let (lo, hi) = below_bounds(&p);
+    let mut st = conn.prepare("SELECT path,kind,mode,size,COALESCE(NULLIF(lower(hex(hash)),''),'') FROM vm_fs WHERE path > ?1 AND path < ?2 ORDER BY path")?;
     let mut direct = Vec::new();
-    for r in st.query_map(params![like, p], ls_entry)? {
+    for r in st.query_map(params![lo, hi], ls_entry)? {
         let e = r?;
         let rel = if p=="/" { e.path.trim_start_matches('/') } else { e.path.strip_prefix(&format!("{}/", p)).unwrap_or(&e.path) };
         if !rel.contains('/') { direct.push(e); }
@@ -236,7 +236,7 @@ fn resolve_in_snapshot(conn: &Connection, vm_path: &str) -> Result<Resolved> {
                 file_bytes_in_snapshot(conn, &cur)?
             } else if let Some(b) = inline {
                 // legacy inline row (pre-blob); never produced by current code
-                decompress_bytes_raw(&b, comp).map_err(|e| anyhow!("corrupt inline content for {}: {}", cur, e))?
+                decompress_legacy(&b, comp).map_err(|e| anyhow!("corrupt inline content for {}: {}", cur, e))?
             } else {
                 // a regular file must have either a hash (chunked) or legacy inline bytes.
                 // Neither means the row is corrupt: fail instead of returning an empty file.

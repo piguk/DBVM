@@ -51,7 +51,7 @@ pub fn vm_recompress(conn: &Connection) -> Result<(usize, i64, i64)> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     for (path, data, comp) in rows {
         let cflag = comp.unwrap_or(0);
-        let raw = decompress_bytes_raw(&data, cflag)?;
+        let raw = decompress_legacy(&data, cflag)?;
         before += data.len() as i64;
         let hash = blob_key(&raw);
         let sz_before: Option<i64> = conn.prepare_cached("SELECT length(content) FROM vm_blobs WHERE hash=?1")?.query_row( params![hash.as_slice()], |r| r.get(0)).optional()?;

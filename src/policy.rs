@@ -161,20 +161,13 @@ pub fn covers(prefix: &str, path: &str) -> bool {
     path == prefix || path.starts_with(&format!("{}/", prefix))
 }
 
-/// Escapes LIKE wildcards so a prefix matches literally.
-fn like_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-}
-
-/// SQL condition: `col` is the protected path or under it. `col` must be a column reference.
+/// SQL condition: `col` is the protected path or under it. `col` must be a column reference. Compared by
+/// bytes (see `vm::below_bounds`): LIKE ignores ASCII case, so a rule for `/tests` also caught `/Tests`.
 fn under_prefix(col: &str, prefix: &str) -> String {
-    let p = prefix.replace('\'', "''");
-    let like = like_escape(prefix).replace('\'', "''");
-    if prefix == "/" {
-        "1=1".to_string()
-    } else {
-        format!("({c} = '{p}' OR {c} LIKE '{like}/%' ESCAPE '\\')", c = col, p = p, like = like)
-    }
+    if prefix == "/" { return "1=1".to_string(); }
+    let q = |s: &str| s.replace('\'', "''");
+    let (lo, hi) = crate::vm::below_bounds(prefix);
+    format!("({c} = '{p}' OR ({c} > '{lo}' AND {c} < '{hi}'))", c = col, p = q(prefix), lo = q(&lo), hi = q(&hi))
 }
 
 /// Drops and recreates every policy trigger from the current rule set.

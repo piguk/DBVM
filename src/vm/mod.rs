@@ -70,14 +70,23 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///  11 = vm_policies: write rules compiled into triggers (see `policy`)
 ///  12 = vm_dirty: files whose whole-file hash a deferred write left stale (see `finalize_dirty`)
 ///  13 = vm_undo*: per-step undo records (see `undo`); agent_steps.undo_id
-pub const VM_USER_VERSION: u32 = 13;
+pub const VM_USER_VERSION: u32 = 14;
 
 pub use crate::overlay::Overlay;
 
 pub fn now_secs() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 }
 
+/// The paths strictly below directory `vm_dir`, as bounds for `path > ?lo AND path < ?hi`: each of them
+/// starts with `vm_dir/`, and '0' is the byte after '/'. `LIKE 'dir/%'` would read `_` and `%` in names
+/// as wildcards and ignore ASCII case (deleting `/a_b` took `/aXb` along, `/Docs` took `/docs`).
+pub fn below_bounds(vm_dir: &str) -> (String, String) {
+    let d = vm_dir.trim_end_matches('/');
+    (format!("{}/", d), format!("{}0", d))
+}
+
 pub fn normalize_vm_path(p: &str) -> String {
-    let mut s = p.trim().to_string();
+    // names may begin or end with spaces: the path is taken as it is
+    let mut s = p.to_string();
     if !s.starts_with('/') { s = format!("/{}", s); }
     if s.len() > 1 && s.ends_with('/') { s.pop(); }
     while s.contains("//") { s = s.replace("//", "/"); }

@@ -70,8 +70,9 @@ pub fn undo_capture(conn: &Connection, undo: i64, path: &str) -> Result<()> {
 
 /// Record `path` and everything below it, before they are deleted.
 pub fn undo_capture_tree(conn: &Connection, undo: i64, path: &str) -> Result<()> {
-    let below: Vec<String> = conn.prepare_cached("SELECT path FROM vm_fs WHERE path=?1 OR path LIKE ?2")?
-        .query_map(params![path, format!("{}/%", path.trim_end_matches('/'))], |r| r.get(0))?
+    let (lo, hi) = crate::vm::below_bounds(path);
+    let below: Vec<String> = conn.prepare_cached("SELECT path FROM vm_fs WHERE path=?1 OR (path > ?2 AND path < ?3)")?
+        .query_map(params![path, lo, hi], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for p in below { undo_capture(conn, undo, &p)?; }
     Ok(())

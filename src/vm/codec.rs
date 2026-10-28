@@ -256,15 +256,24 @@ pub fn decompress_bytes_raw(data: &[u8], compressed: i64) -> Result<Vec<u8>> {
         d.read_to_end(&mut out)?;
         return Ok(out);
     }
-    // auto-detect
-    if data.len() >= 4 && data[0]==0x28 && data[1]==0xb5 && data[2]==0x2f && data[3]==0xfd {
-        if let Ok(v) = decompress_bytes_zstd(data) { return Ok(v); }
-    }
-    if data.len() >=2 && data[0]==0x1f && data[1]==0x8b {
-        use flate2::read::GzDecoder;
-        let mut d = GzDecoder::new(data);
-        let mut out = Vec::new();
-        if d.read_to_end(&mut out).is_ok() { return Ok(out); }
-    }
+    // flag 0: stored as it is. A file that is itself gzip or zstd (`.gz`, `.zst`, which do not compress
+    // further) is stored this way, and must not be decompressed on the way out.
     Ok(data.to_vec())
+}
+
+/// Decode content written before flags were reliable (inline rows, blobs before schema 4): flag 0 may
+/// still hold gzip or zstd, told by its magic bytes. Only for those legacy rows.
+// TODO: remove with the schema-4 migration and the legacy inline-content paths.
+pub fn decompress_legacy(data: &[u8], compressed: i64) -> Result<Vec<u8>> {
+    if compressed == 0 {
+        if data.len() >= 4 && data[0]==0x28 && data[1]==0xb5 && data[2]==0x2f && data[3]==0xfd {
+            if let Ok(v) = decompress_bytes_zstd(data) { return Ok(v); }
+        }
+        if data.len() >= 2 && data[0]==0x1f && data[1]==0x8b {
+            let mut d = flate2::read::GzDecoder::new(data);
+            let mut out = Vec::new();
+            if d.read_to_end(&mut out).is_ok() { return Ok(out); }
+        }
+    }
+    decompress_bytes_raw(data, compressed)
 }

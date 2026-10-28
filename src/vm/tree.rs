@@ -121,6 +121,8 @@ pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root
     let db_path = conn.path().map(|p| p.to_string()).ok_or_else(|| anyhow!("materialize needs a database file"))?;
     let dest_buf = dest.to_path_buf();
     let written = std::sync::atomic::AtomicUsize::new(0);
+    // a file that cannot be read or written fails the whole call: a tree missing files is not the VM
+    let failures: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     // One read connection per worker, opened for this database by this call. A thread-local connection
     // opened once per thread was reused for whatever database the thread materialized next, so a second
     // VM in the same process was read from the first: its /usr/bin/git came out empty (measured).
@@ -142,16 +144,16 @@ pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root
             }
         }
         if !need { written.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; }
-        // a read failure is reported and the file skipped, never written as empty or short
+        // a file is never written empty or short: a read failure is recorded and fails the call
         let data = match worker.as_ref().map_err(|e| anyhow!("open {}: {}", db_path, e)).and_then(|c| file_bytes(c, &t.path)) {
             Ok(b) => b,
-            Err(e) => { eprintln!("materialize {}: {}", t.path, e); return; }
+            Err(e) => { failures.lock().unwrap().push(format!("{}: {}", t.path, e)); return; }
         };
         if let Some(par)=host.parent(){ let _ = std::fs::create_dir_all(par); }
         let key = t.hash.clone().unwrap_or_else(|| fx_hash_u64(&data));
         let cache_p = cache_root.join(&key[0..2.min(key.len())]).join(&key);
         if !cache_copy_out(&cache_p, data.len() as u64, &host) {
-            let _ = std::fs::write(&host, &data);
+            if let Err(e) = std::fs::write(&host, &data) { failures.lock().unwrap().push(format!("{}: write {}: {}", t.path, host.display(), e)); return; }
             cache_put(&cache_p, &data);
         }
         #[cfg(unix)]
@@ -165,6 +167,10 @@ pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root
         }
         written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
+    let failures = failures.into_inner().unwrap();
+    if let Some(first) = failures.first() {
+        return Err(anyhow!("{} file(s) could not be materialized, first: {}", failures.len(), first));
+    }
     for d in ["dev","proc","sys","tmp"] { let _ = std::fs::create_dir_all(dest.join(d)); }
     Ok(written.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -431,12 +437,9 @@ pub fn vm_apply_upper(conn: &Connection, upper: &Path) -> Result<(usize, usize)>
         unsafe { libc::lgetxattr(p.as_ptr(), name.as_ptr(), v.as_mut_ptr().cast(), v.len()) == 1 && v[0] == b'y' }
     };
     let delete_below = |vm_p: &str, with_self: bool| -> Result<usize> {
-        let like = format!("{}/%", vm_p.trim_end_matches('/'));
-        let n = if with_self {
-            conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1 OR path LIKE ?2")?.execute(params![vm_p, like])?
-        } else {
-            conn.prepare_cached("DELETE FROM vm_fs WHERE path LIKE ?1")?.execute(params![like])?
-        };
+        let (lo, hi) = below_bounds(vm_p);
+        let mut n = conn.prepare_cached("DELETE FROM vm_fs WHERE path > ?1 AND path < ?2")?.execute(params![lo, hi])?;
+        if with_self { n += conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1")?.execute(params![vm_p])?; }
         Ok(n)
     };
     write_tx(conn, || {
@@ -506,8 +509,9 @@ pub fn vm_sync_paths(conn: &Connection, host_root: &Path, paths: &std::collectio
                     // the translated path of a link is where the link itself lived on the host
                     let row = link_alias.get(vm_p).cloned().unwrap_or_else(|| vm_p.clone());
                     if let Some(u) = undo { undo_capture_tree(conn, u, &row)?; }
-                    let n = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1 OR path LIKE ?2")?
-                        .execute(params![row, format!("{}/%", row.trim_end_matches('/'))])?;
+                    let (lo, hi) = below_bounds(&row);
+                    let n = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1 OR (path > ?2 AND path < ?3)")?
+                        .execute(params![row, lo, hi])?;
                     rep.deleted += n;
                 }
                 Err(e) => { rep.failed += 1; rep.failures.push((vm_p.clone(), e.to_string())); }

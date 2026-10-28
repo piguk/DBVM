@@ -70,6 +70,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
                 10 => migrate_10_to_11(conn)?,
                 11 => migrate_11_to_12(conn)?,
                 12 => migrate_12_to_13(conn)?,
+                13 => migrate_13_to_14(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -119,7 +120,7 @@ fn migrate_3_to_4(conn: &Connection) -> Result<()> {
         rows.collect::<rusqlite::Result<_>>()?
     };
     for (old_key, content, comp) in old {
-        let raw = decompress_bytes_raw(&content, comp)
+        let raw = decompress_legacy(&content, comp)
             .map_err(|e| anyhow!("migration: blob {} undecodable: {}", old_key, e))?;
         let key = blob_key(&raw);
         conn.prepare_cached("INSERT OR IGNORE INTO vm_blobs_v4(hash, content, compressed, raw_size, refcnt) VALUES (?1,?2,?3,?4,0)")?
@@ -306,6 +307,14 @@ fn migrate_12_to_13(conn: &Connection) -> Result<()> {
     if !cols.iter().any(|c| c == "undo_id") {
         conn.execute_batch("ALTER TABLE agent_steps ADD COLUMN undo_id INTEGER;")?;
     }
+    Ok(())
+}
+
+/// 13 -> 14: policy triggers compare paths by bytes instead of LIKE (which ignores ASCII case); triggers
+/// are generated SQL, so they are regenerated from the rules.
+fn migrate_13_to_14(conn: &Connection) -> Result<()> {
+    let has: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='vm_policies'", [], |r| r.get(0))?;
+    if has > 0 { crate::policy::rebuild_triggers(conn)?; }
     Ok(())
 }
 
