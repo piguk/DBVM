@@ -55,9 +55,39 @@ pub struct StepResult {
     /// of `duration_ms` is the sandbox, the tools and the agent's own work. Zero for a plain step.
     pub model_ms: u128,
     pub model_requests: u64,
-    /// Snapshot taken before the run, and after it (None when the run was rolled back).
-    pub snap_before: String,
-    pub snap_after: Option<String>,
+    /// What the run can be undone with.
+    pub restore: RestorePoint,
+}
+
+/// How a recorded run can be undone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestorePoint {
+    /// Content snapshots before and after the run (no "after" when it was rolled back).
+    Snapshots { before: String, after: Option<String> },
+    /// A session command's undo record (`vm::undo_apply`): the rows it changed, as they were before it.
+    Undo(i64),
+}
+
+impl RestorePoint {
+    /// The `snap_before` / `snap_after` / `undo_id` columns of agent_steps.
+    fn columns(&self) -> (String, Option<String>, Option<i64>) {
+        match self {
+            RestorePoint::Snapshots { before, after } => (before.clone(), after.clone(), None),
+            RestorePoint::Undo(id) => (format!("undo:{}", id), None, Some(*id)),
+        }
+    }
+}
+
+/// Record a run in agent_steps; returns its step id.
+pub(crate) fn insert_step(conn: &rusqlite::Connection, cmd: &str, o: &Outcome, rolled_back: bool, duration_ms: u128,
+                          restore: &RestorePoint, changes: &vm::SnapDiff) -> Result<i64> {
+    let (before, after, undo_id) = restore.columns();
+    conn.execute(
+        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json, undo_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![cmd, o.exit_code, o.timed_out as i64, rolled_back as i64, duration_ms as i64,
+                &o.stdout, &o.stderr, o.stdout_truncated as i64, o.stderr_truncated as i64, before, after, diff_to_json(changes), undo_id])?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// How a run is recorded once its sandbox has finished.
@@ -85,15 +115,12 @@ pub(crate) fn finish_run(conn: &rusqlite::Connection, o: Outcome, f: Finish) -> 
         Some(vm::snapshot_create_named(conn, f.after_prefix, f.note)?.1)
     };
     let duration_ms = f.started.elapsed().as_millis();
-    conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![f.cmd, o.exit_code, o.timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &o.stdout, &o.stderr, o.stdout_truncated as i64, o.stderr_truncated as i64, f.before, snap_after, diff_to_json(&changes)])?;
+    let restore = RestorePoint::Snapshots { before: f.before.to_string(), after: snap_after };
+    let step_id = insert_step(conn, &f.cmd, &o, rolled_back, duration_ms, &restore, &changes)?;
     Ok(StepResult {
-        step_id: conn.last_insert_rowid(), exit_code: o.exit_code, timed_out: o.timed_out, rolled_back,
+        step_id, exit_code: o.exit_code, timed_out: o.timed_out, rolled_back,
         stdout: o.stdout, stderr: o.stderr, stdout_truncated: o.stdout_truncated, stderr_truncated: o.stderr_truncated,
-        changes, duration_ms, model_ms: f.model.0, model_requests: f.model.1, snap_before: f.before.to_string(), snap_after,
+        changes, duration_ms, model_ms: f.model.0, model_requests: f.model.1, restore,
     })
 }
 

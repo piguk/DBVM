@@ -224,6 +224,7 @@ fn legacy_v3_database_migrates_to_blob_keys() {
         c.execute_batch("DROP TRIGGER IF EXISTS vm_fc_ins; DROP TRIGGER IF EXISTS vm_fc_del; DROP TRIGGER IF EXISTS vm_fc_upd;
             DROP TRIGGER IF EXISTS vm_fs_del_chunks; DROP TABLE IF EXISTS vm_file_chunks;
             DROP TRIGGER IF EXISTS vm_snc_ins; DROP TRIGGER IF EXISTS vm_snc_del; DROP TABLE IF EXISTS vm_snapshot_chunks; DROP TABLE IF EXISTS vm_snapshot_fs;
+            DROP TRIGGER IF EXISTS vm_unc_ins; DROP TRIGGER IF EXISTS vm_unc_del; DROP TABLE IF EXISTS vm_undo_chunks; DROP TABLE IF EXISTS vm_undo_fs; DROP TABLE IF EXISTS vm_undo;
             DROP TABLE vm_blobs; DROP INDEX IF EXISTS idx_vm_blobs_refcnt;
             CREATE TABLE vm_blobs(hash TEXT PRIMARY KEY, content BLOB NOT NULL, compressed INTEGER NOT NULL DEFAULT 0,
               raw_size INTEGER NOT NULL, refcnt INTEGER NOT NULL DEFAULT 1);

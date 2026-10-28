@@ -9,7 +9,7 @@
 - `vm_mem`：内存镜像；`vm_snapshots` / `vm_log`：checkpoint 与变更日志
 - `vm_disk_blocks(block_id PK, content, compressed, raw_size)`：4K 稀疏分页块设备；`vm_meta.disk_size` 记录逻辑大小
 - `vm_dirty(path)`：整文件 hash 尚未更新的文件。经挂载的写入（`write_range_deferred`）只改 chunk、size、mtime，路径记入此表；读取 `vm_fs.hash` 的操作（快照、diff、物化、sync、verify、ls/stat）先调用 `finalize_dirty` 补算，`vm_open` 与卸载时也会补算。只读挂接的 Base 或 vm-inject 包若有未补算的行会被拒绝
-- 库 `application_id = 0x564D5351 ("VMSQ")`，`user_version = 12`（当前 schema）。旧库在打开时按序迁移，每步一个事务；历史版本见 `src/vm/mod.rs` 顶部注释。v8 起有快照表，v9 起有 `agent_steps`，v10 补截断列，v11 起有 `vm_policies`，v12 起有 `vm_dirty`
+- 库 `application_id = 0x564D5351 ("VMSQ")`，`user_version = 13`（当前 schema）。旧库在打开时按序迁移，每步一个事务；历史版本见 `src/vm/mod.rs` 顶部注释。v8 起有快照表，v9 起有 `agent_steps`，v10 补截断列，v11 起有 `vm_policies`，v12 起有 `vm_dirty`，v13 起有 `vm_undo*`
 
 新库 `page_size 8192`, `auto_vacuum=INCREMENTAL`；`--vm-only` 跳过 SELF 专用表（`segments/symbols/self_blob/bundle_*` 等）。连接 PRAGMA：`journal_mode=WAL synchronous=NORMAL mmap_size=256M busy_timeout=5000 journal_size_limit=64M`。
 
@@ -238,12 +238,27 @@ let r = s.exec(&argv, &ExecOptions { timeout_secs: 60, rollback_on_fail: true, .
 s.close();
 ```
 
-- 每条命令仍是一个记录在 `agent_steps` 的 step：命令结束后回写树、与上一条命令后的快照比较、保留（新快照）或回滚（库与树都恢复）。
-- 命令在独立的 session 中运行，超时结束其整个进程组；输出写入文件，后台进程持有输出不会阻塞请求。
+- 每条命令仍是一个记录在 `agent_steps` 的 step，代价与它改动的路径数成正比，而不是与树的大小成正比：
+  - inotify 监视树的每个目录（`src/session/watch.rs`），命令结束后只回写变化过的路径。事件队列溢出、目录被移动或无法添加监视时，该次回写整棵树，并重建监视。
+  - 每条命令有一条 undo 记录（schema v13 的 `vm_undo*`）：写入或删除任何行之前，先保存该行原来的内容（含 chunk 引用，blob 引用计数由触发器维护）。变更清单由 undo 记录与当前行比较得出；回滚即应用 undo 记录。`agent_steps.undo_id` 指向它，`snap_before` 记为 `undo:<id>`。
+  - `Session::rewind(undo_id)` 从最新一条到指定的那条依次应用 undo 记录，回到该命令之前的状态。
+  - 回滚后先删除树中被恢复的文件，再物化：物化按大小与秒级 mtime 判断是否重写，同一秒内的等长改写否则会留在树中（已有测试）。
+- 命令在独立的 session 中运行，超时结束其整个进程组；输出写入文件，后台进程持有输出不会阻塞请求。命令之间后台进程的写入计入下一条命令。
 - session 持有数据库的 step 锁，期间其他 step 与 session 等待。
 - gVisor 下以 `--file-access=shared` 运行：回滚时宿主恢复树，独占模式下 gVisor 看不到这一改动（已实测）。
 - 根为物化树而非 FUSE 挂载（挂载上文件密集负载慢 5–12 倍）。
-- 实测（dev 工具集，49,328 个条目，3 次最小值）：session 启动 2.76 s；空命令 1.25–1.28 s，其中主要是回写时对全部文件的 stat、全量快照与 diff，它们与总文件数成正比，与命令改动的文件数无关。这是当前 session 的主要开销。
+- 不覆盖：经硬链接修改另一名字的内容（inotify 只报告被打开的那个名字）；经 mmap 写入且不关闭的文件（在关闭时才报告）。
+- 实测（dev 工具集，49,328 个条目，3 次最小值）：
+
+  | 项 | bwrap | gVisor |
+  |---|---|---|
+  | 启动 session | 1.82 s | 2.20 s |
+  | 空命令 | 5 ms | 7 ms |
+  | 复制 2k 文件的目录树 | 158 ms | 306 ms |
+  | git add + commit 该树 | 331 ms | 823 ms |
+  | gcc 编译 ×20 | 421 ms | 884 ms |
+
+  改为增量之前（每条命令全量回写、全量快照、全量 diff），空命令为 1246 ms / 1283 ms。
 
 ## 安全边界
 

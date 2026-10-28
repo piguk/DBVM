@@ -33,6 +33,7 @@ mod maint;
 mod snapshot;
 mod mem;
 mod disk;
+mod undo;
 pub use cache::*;
 pub use schema::*;
 pub use codec::*;
@@ -44,6 +45,7 @@ pub use maint::*;
 pub use snapshot::*;
 pub use mem::*;
 pub use disk::*;
+pub use undo::*;
 
 pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 
@@ -67,7 +69,8 @@ pub const VM_APP_ID: u32 = 0x564D5351; // 'VMSQ'
 ///  10 = agent_steps.stdout_truncated / stderr_truncated
 ///  11 = vm_policies: write rules compiled into triggers (see `policy`)
 ///  12 = vm_dirty: files whose whole-file hash a deferred write left stale (see `finalize_dirty`)
-pub const VM_USER_VERSION: u32 = 12;
+///  13 = vm_undo*: per-step undo records (see `undo`); agent_steps.undo_id
+pub const VM_USER_VERSION: u32 = 13;
 
 pub use crate::overlay::Overlay;
 

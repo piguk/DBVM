@@ -69,6 +69,7 @@ fn vm_migrate(conn: &Connection) -> Result<()> {
                 9 => migrate_9_to_10(conn)?,
                 10 => migrate_10_to_11(conn)?,
                 11 => migrate_11_to_12(conn)?,
+                12 => migrate_12_to_13(conn)?,
                 v => return Err(anyhow!("no migration from schema {}", v)),
             }
             conn.execute_batch(&format!("PRAGMA user_version={};", ver + 1))?;
@@ -274,6 +275,8 @@ CREATE TABLE IF NOT EXISTS agent_steps(
     snap_before TEXT NOT NULL,
     snap_after TEXT,
     fs_diff_json TEXT NOT NULL,
+    -- a session step's undo record (vm_undo.id); NULL for steps recorded with snapshots
+    undo_id INTEGER,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 ";
@@ -292,6 +295,17 @@ fn migrate_10_to_11(conn: &Connection) -> Result<()> {
 /// 11 -> 12: vm_dirty, the files whose whole-file hash a deferred write left stale.
 fn migrate_11_to_12(conn: &Connection) -> Result<()> {
     conn.execute_batch(VM_DIRTY_SQL)?;
+    Ok(())
+}
+
+/// 12 -> 13: undo records (see undo.rs), and the step that each one belongs to.
+fn migrate_12_to_13(conn: &Connection) -> Result<()> {
+    conn.execute_batch(VM_UNDO_SQL)?;
+    let cols: Vec<String> = conn.prepare("PRAGMA table_info(agent_steps)")?
+        .query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<_>>()?;
+    if !cols.iter().any(|c| c == "undo_id") {
+        conn.execute_batch("ALTER TABLE agent_steps ADD COLUMN undo_id INTEGER;")?;
+    }
     Ok(())
 }
 
@@ -501,7 +515,8 @@ CREATE TABLE IF NOT EXISTS vm_disk_blocks(
 {snapshot}
 {agent}
 {dirty}
-"#, app=VM_APP_ID, ver=VM_USER_VERSION, triggers=VM_TRIGGERS_SQL, counters=VM_COUNTERS_INIT_SQL, counter_triggers=VM_COUNTER_TRIGGERS_SQL, snapshot=VM_SNAPSHOT_SQL, agent=VM_AGENT_SQL, dirty=VM_DIRTY_SQL)
+{undo}
+"#, app=VM_APP_ID, ver=VM_USER_VERSION, triggers=VM_TRIGGERS_SQL, counters=VM_COUNTERS_INIT_SQL, counter_triggers=VM_COUNTER_TRIGGERS_SQL, snapshot=VM_SNAPSHOT_SQL, agent=VM_AGENT_SQL, dirty=VM_DIRTY_SQL, undo=VM_UNDO_SQL)
 }
 
 pub fn init_vm_db_with_opts(path: &str, overwrite: bool, vm_only: bool) -> Result<Connection> {

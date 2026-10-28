@@ -211,16 +211,18 @@ pub fn vm_verify(conn: &Connection, deep: bool) -> Result<String> {
         if real_files != files { drift.push(format!("files {}!={}", files, real_files)); }
         if real_bytes != bytes { drift.push(format!("logical {}!={}", bytes, real_bytes)); }
         if real_blob != vm_counter(conn, "blob_bytes")? { drift.push(format!("blob_bytes {}!={}", vm_counter(conn, "blob_bytes")?, real_blob)); }
-        // refcnt must equal live chunk references plus snapshot chunk references (schema v8)
+        // refcnt must equal live chunk references plus snapshot (v8) and undo record (v13) chunk references
         let bad_rc: i64 = conn.prepare_cached(
             "SELECT count(*) FROM vm_blobs b WHERE b.refcnt != (
                (SELECT count(*) FROM vm_file_chunks c WHERE c.hash=b.hash) +
-               (SELECT count(*) FROM vm_snapshot_chunks s WHERE s.hash=b.hash))")?.query_row( [], |r| r.get(0))?;
+               (SELECT count(*) FROM vm_snapshot_chunks s WHERE s.hash=b.hash) +
+               (SELECT count(*) FROM vm_undo_chunks u WHERE u.hash=b.hash))")?.query_row( [], |r| r.get(0))?;
         if bad_rc > 0 { drift.push(format!("{} blobs with bad refcnt", bad_rc)); }
         // every chunk, live or in a snapshot, must point at an existing blob
         let orphan: i64 = conn.prepare_cached("SELECT count(*) FROM vm_file_chunks c WHERE NOT EXISTS (SELECT 1 FROM vm_blobs b WHERE b.hash=c.hash)")?.query_row( [], |r| r.get(0))?;
         let orphan_s: i64 = conn.prepare_cached("SELECT count(*) FROM vm_snapshot_chunks c WHERE NOT EXISTS (SELECT 1 FROM vm_blobs b WHERE b.hash=c.hash)")?.query_row( [], |r| r.get(0))?;
-        if orphan + orphan_s > 0 { drift.push(format!("{} chunks reference missing blobs", orphan + orphan_s)); }
+        let orphan_u: i64 = conn.prepare_cached("SELECT count(*) FROM vm_undo_chunks c WHERE NOT EXISTS (SELECT 1 FROM vm_blobs b WHERE b.hash=c.hash)")?.query_row( [], |r| r.get(0))?;
+        if orphan + orphan_s + orphan_u > 0 { drift.push(format!("{} chunks reference missing blobs", orphan + orphan_s + orphan_u)); }
         // a snapshot's chunk list must be contiguous per file, like the live list
         let snap_gaps: i64 = conn.prepare_cached("SELECT count(*) FROM (SELECT snap_id, path, count(*) AS n, max(idx) AS mx FROM vm_snapshot_chunks GROUP BY snap_id, path) WHERE mx + 1 != n")?.query_row( [], |r| r.get(0))?;
         if snap_gaps > 0 { drift.push(format!("{} snapshot files with chunk index gaps", snap_gaps)); }

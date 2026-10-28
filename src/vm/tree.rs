@@ -217,46 +217,161 @@ pub fn vm_sync_from_host(conn: &Connection, host_root: &Path) -> Result<(usize,u
 }
 
 pub fn vm_sync_report(conn: &Connection, host_root: &Path) -> Result<SyncReport> {
-    sync_report_impl(conn, host_root, false)
+    sync_report_impl(conn, host_root, false, None)
 }
 
 /// Full verification: like `vm_sync_report`, but a regular file is compared by content (the
 /// stored whole-file sha256 against the host bytes), not by metadata. This catches rows that
 /// metadata cannot prove current, such as rows written before schema v7.
 pub fn vm_sync_full(conn: &Connection, host_root: &Path) -> Result<SyncReport> {
-    sync_report_impl(conn, host_root, true)
+    sync_report_impl(conn, host_root, true, None)
 }
 
-fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool) -> Result<SyncReport> {
-    use std::collections::{HashMap, HashSet};
+/// A `vm_fs` row as the sync compares it: metadata only, no content.
+struct SyncRow { kind: String, mode: i64, mtime: i64, mtime_ns: i64, size: i64, link: Option<String> }
+
+fn sync_row(r: &rusqlite::Row) -> rusqlite::Result<SyncRow> {
+    Ok(SyncRow { kind: r.get(0)?, mode: r.get(1)?, mtime: r.get(2)?, size: r.get(3)?, link: r.get(4)?, mtime_ns: r.get(5)? })
+}
+const SYNC_ROW_COLS: &str = "kind, mode, mtime, size, link_target, mtime_ns";
+
+/// Translated path -> DB link path, for links the materialize wrote under a resolved parent.
+fn link_aliases(links: &std::collections::HashMap<String, String>) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    for p in links.keys() {
+        if let Some(pv) = resolve_parent_in_vm(p, links) {
+            let translated = format!("{}/{}", pv.trim_end_matches('/'), Path::new(p).file_name().unwrap().to_string_lossy());
+            m.insert(normalize_vm_path(&translated), p.clone());
+        }
+    }
+    m
+}
+
+/// What stays the same for every entry of one sync.
+#[derive(Clone, Copy)]
+struct SyncCtx {
+    /// Compare file content with the stored hash, not only metadata (`vm-sync --full`).
+    verify_content: bool,
+    /// Record every row in this undo record before it is written.
+    undo: Option<i64>,
+    now: i64,
+}
+
+/// Bring the row of `vm_p` in line with the host entry at `host`, whose metadata is `md`. `prev` is the
+/// row as it is. Some(false) = created, Some(true) = updated, None = unchanged (or a kind the VM does not
+/// store, such as a socket).
+fn sync_one(conn: &Connection, host: &Path, md: &std::fs::Metadata, vm_p: &str, prev: Option<&SyncRow>, ctx: SyncCtx) -> Result<Option<bool>> {
+    let SyncCtx { verify_content, undo, now } = ctx;
     #[cfg(unix)] use std::os::unix::fs::PermissionsExt;
+    // permission bits only: the VM stores modes as 0o7777 (the sync used to store the full st_mode, so
+    // every file looked changed on the next sync)
+    #[cfg(unix)] let mode = (md.permissions().mode() & 0o7777) as i64;
+    #[cfg(not(unix))] let mode = 420i64;
+    let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(now);
+    let ns_before = host_mtime_ns(host);
+    let ft = md.file_type();
+    let host_kind = if ft.is_symlink() { "symlink" } else if md.is_dir() { "dir" } else if md.is_file() { "file" } else { return Ok(None) };
+    let capture = || -> Result<()> { if let Some(u) = undo { undo_capture(conn, u, vm_p)?; } Ok(()) };
+    match (prev, host_kind) {
+        (None, "dir") => { capture()?; fs_put_node(conn, vm_p, "dir", mode, now, None)?; Ok(Some(false)) }
+        (None, "symlink") => {
+            let t = std::fs::read_link(host)?;
+            capture()?;
+            fs_put_node(conn, vm_p, "symlink", mode, now, Some(&t.to_string_lossy()))?;
+            Ok(Some(false))
+        }
+        (None, _) => {
+            let mut f = std::fs::File::open(host)?;
+            capture()?;
+            write_file_checked(conn, host, vm_p, mode, mtime, &mut f)?;
+            Ok(Some(false))
+        }
+        (Some(p), "dir") if p.kind == "dir" => {
+            if p.mode == mode { return Ok(None); }
+            capture()?;
+            conn.prepare_cached("UPDATE vm_fs SET mode=?2, mtime=?3 WHERE path=?1")?.execute(params![vm_p, mode, now])?;
+            Ok(Some(true))
+        }
+        (Some(p), "symlink") if p.kind == "symlink" => {
+            let t = std::fs::read_link(host)?.to_string_lossy().to_string();
+            if p.link.as_deref() == Some(t.as_str()) && p.mode == mode { return Ok(None); }
+            capture()?;
+            conn.prepare_cached("UPDATE vm_fs SET mode=?2, link_target=?3, mtime=?4 WHERE path=?1")?.execute(params![vm_p, mode, t, now])?;
+            Ok(Some(true))
+        }
+        (Some(p), "file") if p.kind == "file" => {
+            let metadata_current = p.size == md.len() as i64 && p.mtime == mtime && p.mode == mode && ns_matches(p.mtime_ns, ns_before);
+            let content_current = if verify_content && metadata_current {
+                // compare against the stored whole-file hash; a mismatch means stale content
+                let stored: Option<Vec<u8>> = conn.prepare_cached("SELECT hash FROM vm_fs WHERE path=?1")?.query_row(params![vm_p], |r| r.get(0)).optional()?.flatten();
+                let mut f = std::fs::File::open(host)?;
+                let mut hasher = sha2::Sha256::new();
+                std::io::copy(&mut f, &mut hasher)?;
+                use sha2::Digest;
+                let host_hash: [u8; 32] = hasher.finalize().into();
+                stored.as_deref() == Some(&host_hash[..])
+            } else { metadata_current };
+            if content_current { return Ok(None); }
+            // a write during the read leaves ns unknown (0), so the next sync re-reads
+            let mut f = std::fs::File::open(host)?;
+            capture()?;
+            write_file_checked(conn, host, vm_p, mode, mtime, &mut f)?;
+            Ok(Some(true))
+        }
+        // type changed (or unknown): replace the entry
+        (Some(_), _) => {
+            capture()?;
+            match host_kind {
+                "dir" => fs_put_node(conn, vm_p, "dir", mode, now, None)?,
+                "symlink" => { let t = std::fs::read_link(host)?; fs_put_node(conn, vm_p, "symlink", mode, now, Some(&t.to_string_lossy()))? }
+                _ => { let mut f = std::fs::File::open(host)?; write_file_checked(conn, host, vm_p, mode, mtime, &mut f)?; }
+            }
+            Ok(Some(true))
+        }
+    }
+}
+
+fn count(rep: &mut SyncReport, vm_p: &str, res: Result<Option<bool>>) {
+    match res {
+        Ok(Some(false)) => rep.created += 1,
+        Ok(Some(true)) => rep.updated += 1,
+        Ok(None) => rep.unchanged += 1,
+        Err(err) => { rep.failed += 1; rep.failures.push((vm_p.to_string(), err.to_string())); }
+    }
+}
+
+fn log_sync(conn: &Connection, host_root: &Path, rep: &SyncReport) -> Result<()> {
+    conn.prepare_cached("INSERT INTO vm_log(op, detail) VALUES ('sync', ?1)")?
+        .execute(params![format!("host:{} created:{} updated:{} unchanged:{} deleted:{} failed:{}", host_root.display(), rep.created, rep.updated, rep.unchanged, rep.deleted, rep.failed)])?;
+    let wal_size: i64 = conn.path().and_then(|pp| std::fs::metadata(format!("{}-wal", pp)).ok()).map(|m| m.len() as i64).unwrap_or(0);
+    if wal_size > 4 * 1024 * 1024 {
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+    }
+    Ok(())
+}
+
+/// The whole tree against the database. With `undo`, every row it writes or deletes is recorded there first.
+pub fn vm_sync_tree(conn: &Connection, host_root: &Path, undo: Option<i64>) -> Result<SyncReport> {
+    sync_report_impl(conn, host_root, false, undo)
+}
+
+fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool, undo: Option<i64>) -> Result<SyncReport> {
+    use std::collections::{HashMap, HashSet};
     // a full sync compares host content with vm_fs.hash
     finalize_dirty(conn)?;
 
     // 1) DB side: metadata only (no content, no hash).
-    struct Row { kind: String, mode: i64, mtime: i64, mtime_ns: i64, size: i64, link: Option<String> }
-    let mut db: HashMap<String, Row> = HashMap::new();
+    let mut db: HashMap<String, SyncRow> = HashMap::new();
     {
-        let mut st = conn.prepare("SELECT path, kind, mode, mtime, size, link_target, mtime_ns FROM vm_fs")?;
-        for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, Row { kind: r.get(1)?, mode: r.get(2)?, mtime: r.get(3)?, size: r.get(4)?, link: r.get(5)?, mtime_ns: r.get(6)? })))? {
+        let mut st = conn.prepare(&format!("SELECT path, {} FROM vm_fs", SYNC_ROW_COLS))?;
+        for r in st.query_map([], |r| Ok((r.get::<_, String>(0)?, SyncRow { kind: r.get(1)?, mode: r.get(2)?, mtime: r.get(3)?, size: r.get(4)?, link: r.get(5)?, mtime_ns: r.get(6)? })))? {
             let (p, row) = r?;
             db.insert(p, row);
         }
     }
-
-    // Translated path -> DB link path, for links the materialize wrote under a resolved parent.
-    let link_alias: HashMap<String, String> = {
-        let link_rows: HashMap<String, String> = db.iter()
-            .filter(|(_, r)| r.kind == "symlink").filter_map(|(p, r)| r.link.clone().map(|t| (p.clone(), t))).collect();
-        let mut m = HashMap::new();
-        for p in link_rows.keys() {
-            if let Some(pv) = resolve_parent_in_vm(p, &link_rows) {
-                let translated = format!("{}/{}", pv.trim_end_matches('/'), Path::new(p).file_name().unwrap().to_string_lossy());
-                m.insert(normalize_vm_path(&translated), p.clone());
-            }
-        }
-        m
-    };
+    let links: HashMap<String, String> = db.iter()
+        .filter(|(_, r)| r.kind == "symlink").filter_map(|(p, r)| r.link.clone().map(|t| (p.clone(), t))).collect();
+    let link_alias = link_aliases(&links);
     // 2) Host side: walk, keep only metadata. Entries are processed as we go.
     let mut seen: HashSet<String> = HashSet::new();
     // A link whose translated path holds a real entry is never written by the materialize (it is
@@ -274,110 +389,71 @@ fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool) -
         let rel = e.path().strip_prefix(host_root).unwrap_or(e.path()).to_string_lossy().to_string();
         let vm_p = normalize_vm_path(&format!("/{}", rel.trim_start_matches('/')));
         if is_reserved_vm_path(&vm_p) { continue; }
-        // A link the materialize placed under its translated path (e.g. usr/bin/sh for the VM's
-        // /bin/sh) is the same row, not a new one: keep the DB's own path and do not create it.
-        // Only a walked *symlink* is an alias: a real file or dir at the translated path is its own row.
-        let is_link = std::fs::symlink_metadata(e.path()).map(|m| m.file_type().is_symlink()).unwrap_or(false);
-        if is_link {
-            if let Some(alias) = link_alias_row(&vm_p, &link_alias) {
-                seen.insert(alias);
-                continue;
-            }
-        }
         let md = match std::fs::symlink_metadata(e.path()) {
             Ok(m) => m,
             Err(err) => { rep.failed += 1; rep.failures.push((vm_p.clone(), err.to_string())); continue; }
         };
-        // permission bits only: the VM stores modes as 0o7777 (the sync used to store the full
-        // st_mode, so every file looked changed on the next sync)
-        #[cfg(unix)] let mode = (md.permissions().mode() & 0o7777) as i64;
-        #[cfg(not(unix))] let mode = 420i64;
-        let mtime = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(now);
-        let ns_before = host_mtime_ns(e.path());
-        seen.insert(vm_p.clone());
-        let ft = md.file_type();
-        let host_kind = if ft.is_symlink() { "symlink" } else if md.is_dir() { "dir" } else if md.is_file() { "file" } else { continue };
-        let prev = db.get(&vm_p);
-        let res: Result<Option<bool>> = (|| {
-            // Some(true)=updated, Some(false)=created, None=unchanged
-            match (prev, host_kind) {
-                (None, "dir") => { fs_put_node(conn, &vm_p, "dir", mode, now, None)?; Ok(Some(false)) }
-                (None, "symlink") => {
-                    let t = std::fs::read_link(e.path())?;
-                    fs_put_node(conn, &vm_p, "symlink", mode, now, Some(&t.to_string_lossy()))?;
-                    Ok(Some(false))
-                }
-                (None, _) => {
-                    let mut f = std::fs::File::open(e.path())?;
-                    write_file_checked(conn, e.path(), &vm_p, mode, mtime, &mut f)?;
-                    Ok(Some(false))
-                }
-                (Some(p), "dir") if p.kind == "dir" => {
-                    if p.mode == mode { Ok(None) } else {
-                        conn.prepare_cached("UPDATE vm_fs SET mode=?2, mtime=?3 WHERE path=?1")?.execute(params![vm_p, mode, now])?;
-                        Ok(Some(true))
-                    }
-                }
-                (Some(p), "symlink") if p.kind == "symlink" => {
-                    let t = std::fs::read_link(e.path())?.to_string_lossy().to_string();
-                    if p.link.as_deref() == Some(t.as_str()) && p.mode == mode { Ok(None) } else {
-                        conn.prepare_cached("UPDATE vm_fs SET mode=?2, link_target=?3, mtime=?4 WHERE path=?1")?.execute(params![vm_p, mode, t, now])?;
-                        Ok(Some(true))
-                    }
-                }
-                (Some(p), "file") if p.kind == "file" => {
-                    let metadata_current = p.size == md.len() as i64 && p.mtime == mtime && p.mode == mode && ns_matches(p.mtime_ns, ns_before);
-                    let content_current = if verify_content && metadata_current {
-                        // compare against the stored whole-file hash; a mismatch means stale content
-                        let stored: Option<Vec<u8>> = conn.prepare_cached("SELECT hash FROM vm_fs WHERE path=?1")?.query_row(params![vm_p], |r| r.get(0)).optional()?.flatten();
-                        let mut f = std::fs::File::open(e.path())?;
-                        let mut hasher = sha2::Sha256::new();
-                        std::io::copy(&mut f, &mut hasher)?;
-                        use sha2::Digest;
-                        let host_hash: [u8; 32] = hasher.finalize().into();
-                        stored.as_deref() == Some(&host_hash[..])
-                    } else { metadata_current };
-                    if content_current && (!verify_content || metadata_current) {
-                        Ok(None)
-                    } else {
-                        // a write during the read leaves ns unknown (0), so the next sync re-reads
-                        let mut f = std::fs::File::open(e.path())?;
-                        write_file_checked(conn, e.path(), &vm_p, mode, mtime, &mut f)?;
-                        Ok(Some(true))
-                    }
-                }
-                // type changed (or unknown): replace the entry
-                (Some(_), _) => {
-                    match host_kind {
-                        "dir" => fs_put_node(conn, &vm_p, "dir", mode, now, None)?,
-                        "symlink" => { let t = std::fs::read_link(e.path())?; fs_put_node(conn, &vm_p, "symlink", mode, now, Some(&t.to_string_lossy()))? }
-                        _ => { let mut f = std::fs::File::open(e.path())?; write_file_checked(conn, e.path(), &vm_p, mode, mtime, &mut f)?; }
-                    }
-                    Ok(Some(true))
-                }
-            }
-        })();
-        match res {
-            Ok(Some(false)) => rep.created += 1,
-            Ok(Some(true)) => rep.updated += 1,
-            Ok(None) => rep.unchanged += 1,
-            Err(err) => { rep.failed += 1; rep.failures.push((vm_p.clone(), err.to_string())); }
+        // A link the materialize placed under its translated path (e.g. usr/bin/sh for the VM's
+        // /bin/sh) is the same row, not a new one: keep the DB's own path and do not create it.
+        // Only a walked *symlink* is an alias: a real file or dir at the translated path is its own row.
+        if md.file_type().is_symlink() {
+            if let Some(alias) = link_alias_row(&vm_p, &link_alias) { seen.insert(alias); continue; }
         }
+        seen.insert(vm_p.clone());
+        let res = sync_one(conn, e.path(), &md, &vm_p, db.get(&vm_p), SyncCtx { verify_content, undo, now });
+        count(&mut rep, &vm_p, res);
     }
 
     // 3) Deletions: DB paths absent from the host (prefix match is exact; DELETE fires triggers).
     let mut gone: Vec<&String> = db.keys().filter(|p| !is_reserved_vm_path(p) && !seen.contains(*p)).collect();
     gone.sort_by_key(|p| std::cmp::Reverse(p.len()));
     for p in gone {
+        if let Some(u) = undo { undo_capture(conn, u, p)?; }
         let n = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1")?.execute(params![p])?;
         if n > 0 { rep.deleted += 1; }
     }
     conn.execute_batch("COMMIT;")?;
-    conn.prepare_cached("INSERT INTO vm_log(op, detail) VALUES ('sync', ?1)")?
-        .execute(params![format!("host:{} created:{} updated:{} unchanged:{} deleted:{} failed:{}", host_root.display(), rep.created, rep.updated, rep.unchanged, rep.deleted, rep.failed)])?;
-    let wal_size: i64 = conn.path().and_then(|pp| std::fs::metadata(format!("{}-wal", pp)).ok()).map(|m| m.len() as i64).unwrap_or(0);
-    if wal_size > 4 * 1024 * 1024 {
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
-    }
+    log_sync(conn, host_root, &rep)?;
+    Ok(rep)
+}
+
+/// Sync only `paths` (VM paths that may have changed on the host), not the whole tree: what a session does
+/// after each command, with the paths its tree watcher saw change. A path missing on the host is deleted
+/// with everything below it. With `undo`, every row written or deleted is recorded there first.
+pub fn vm_sync_paths(conn: &Connection, host_root: &Path, paths: &std::collections::BTreeSet<String>, undo: Option<i64>) -> Result<SyncReport> {
+    use std::collections::HashMap;
+    finalize_dirty(conn)?;
+    let links: HashMap<String, String> = conn.prepare_cached("SELECT path, link_target FROM vm_fs WHERE kind='symlink'")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let link_alias = link_aliases(&links);
+    let mut rep = SyncReport::default();
+    let now = now_secs();
+    in_savepoint(conn, "sync_paths", || {
+        // sorted: a parent comes before its children
+        for vm_p in paths {
+            if is_reserved_vm_path(vm_p) { continue; }
+            let host = host_root.join(vm_p.trim_start_matches('/'));
+            match std::fs::symlink_metadata(&host) {
+                Ok(md) => {
+                    if md.file_type().is_symlink() && link_alias_row(vm_p, &link_alias).is_some() { continue; }
+                    let prev = conn.prepare_cached(&format!("SELECT {} FROM vm_fs WHERE path=?1", SYNC_ROW_COLS))?
+                        .query_row(params![vm_p], sync_row).optional()?;
+                    let res = sync_one(conn, &host, &md, vm_p, prev.as_ref(), SyncCtx { verify_content: false, undo, now });
+                    count(&mut rep, vm_p, res);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // the translated path of a link is where the link itself lived on the host
+                    let row = link_alias.get(vm_p).cloned().unwrap_or_else(|| vm_p.clone());
+                    if let Some(u) = undo { undo_capture_tree(conn, u, &row)?; }
+                    let n = conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1 OR path LIKE ?2")?
+                        .execute(params![row, format!("{}/%", row.trim_end_matches('/'))])?;
+                    rep.deleted += n;
+                }
+                Err(e) => { rep.failed += 1; rep.failures.push((vm_p.clone(), e.to_string())); }
+            }
+        }
+        Ok(())
+    })?;
+    log_sync(conn, host_root, &rep)?;
     Ok(rep)
 }

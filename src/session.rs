@@ -6,17 +6,26 @@
 //! life, and each command is sent to that supervisor. Background processes (a dev server, a watcher) keep
 //! running between commands.
 //!
-//! Each command is still a recorded step: after it finishes, the tree is synced back to the database,
-//! diffed against the snapshot taken after the previous command, and either kept (a new snapshot) or rolled
-//! back (database and tree both restored). The root is the materialized tree, not the FUSE mount: over the
-//! mount, file-heavy work was 5-12 times slower (measured, docs/vm.md).
+//! Each command is still a recorded step, at a cost in proportion to what it changed, not to the tree:
+//! - an inotify watcher (session/watch.rs) collects the paths the command touched, and only those are
+//!   synced back (the whole tree when the watcher is unsure);
+//! - every row written is first copied into the command's undo record (vm::undo_*), which gives the change
+//!   list and, applied, the rollback.
+//!
+//! With a full sync, a snapshot and a full diff per command, an empty command cost 1.25 s at 49k entries
+//! (measured); those three scale with the tree.
+//!
+//! The root is the materialized tree, not the FUSE mount: over the mount, file-heavy work was 5-12 times
+//! slower (measured, docs/vm.md).
+
+mod watch;
 
 use anyhow::{anyhow, Result};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::agent::{self, Finish, StepLock, StepResult};
+use crate::agent::{self, RestorePoint, StepLock, StepResult};
 use crate::sandbox::{self, Isolation, Limits, Outcome, Sandbox};
 use crate::vm;
 
@@ -76,8 +85,8 @@ pub struct Session {
     dir: PathBuf,
     sandbox: Option<Sandbox>,
     env: Vec<(String, String)>,
-    /// The snapshot the next command is diffed against: the state after the previous command.
-    before: String,
+    /// Paths of the tree changed since the last command was recorded.
+    watch: watch::TreeWatch,
     seq: u64,
     _lock: StepLock,
 }
@@ -91,9 +100,11 @@ impl Session {
         let work = vm::WorkDir::create("vm-session-")?;
         let dir = work.path().to_path_buf();
         // from here on, a failure must not leave the directory behind
-        let mut session = Session { conn, _work: work, dir: dir.clone(), sandbox: None, env: opts.env.clone(), before: String::new(), seq: 0, _lock: lock };
         let (tree, ctl, bin) = (dir.join("tree"), dir.join("ctl"), dir.join("bin"));
-        vm::vm_materialize_tree(&session.conn, &tree).map_err(|e| anyhow!("materialize failed: {}", e))?;
+        vm::vm_materialize_tree(&conn, &tree).map_err(|e| anyhow!("materialize failed: {}", e))?;
+        // watching starts before the sandbox does, so no write of the session is missed
+        let watch = watch::TreeWatch::new(&tree)?;
+        let mut session = Session { conn, _work: work, dir: dir.clone(), sandbox: None, env: opts.env.clone(), watch, seq: 0, _lock: lock };
         std::fs::create_dir_all(&ctl)?;
         std::fs::create_dir_all(&bin)?;
         let init = bin.join("init");
@@ -120,7 +131,6 @@ impl Session {
             if started.elapsed() > START_TIMEOUT { return Err(anyhow!("session supervisor did not start: {}", session.log_tail())); }
             std::thread::sleep(Duration::from_millis(5));
         }
-        session.before = vm::snapshot_create_named(&session.conn, "session-start", "vm-session")?.1;
         Ok(session)
     }
 
@@ -142,25 +152,66 @@ impl Session {
         if argv.is_empty() { return Err(anyhow!("empty command")); }
         let started = Instant::now();
         let outcome = self.run(argv, opts)?;
-        // Sync the tree back. A sync that could not write some paths fails the step: the command's writes
-        // were refused (a policy rule), so reporting success would be untrue.
-        let sync = vm::vm_sync_report(&self.conn, &self.tree())?;
+        let cmd = format!("session: {}", argv.join(" "));
+        let changes = self.watch.take();
+        let undo = vm::undo_begin(&self.conn, &cmd)?;
+        let sync = if changes.full {
+            vm::vm_sync_tree(&self.conn, &self.tree(), Some(undo))?
+        } else {
+            vm::vm_sync_paths(&self.conn, &self.tree(), &changes.paths, Some(undo))?
+        };
+        // A sync that could not write some paths fails the command: its writes were refused (a policy rule),
+        // so reporting success would be untrue. What was applied is undone, and the tree is brought back to
+        // what the database holds.
         if let Some(why) = sync.failure_summary() {
-            // the database refused the change: bring the tree back to what the database holds
-            let _ = vm::vm_materialize_tree(&self.conn, &self.tree());
+            let paths = undo_paths(&self.conn, &[undo])?;
+            vm::undo_apply(&self.conn, undo)?;
+            vm::undo_delete(&self.conn, undo)?;
+            self.restore_tree(&paths)?;
             return Err(anyhow!("sandbox content not applied: {}", why));
         }
-        let before = self.before.clone();
-        let r = agent::finish_run(&self.conn, outcome, Finish {
-            cmd: format!("session: {}", argv.join(" ")), before: &before, rollback_on_fail: opts.rollback_on_fail,
-            after_prefix: "session-step", note: "vm-session", started, model: (0, 0),
-        })?;
-        if r.rolled_back {
-            // the database is back at `before`; so must the tree be, or the next sync would undo the rollback
-            vm::vm_materialize_tree(&self.conn, &self.tree())?;
+        let diff = vm::undo_diff(&self.conn, undo)?;
+        let rolled_back = (outcome.exit_code != 0 || outcome.timed_out) && opts.rollback_on_fail;
+        if rolled_back {
+            vm::undo_apply(&self.conn, undo)?;
+            self.restore_tree(&undo_paths(&self.conn, &[undo])?)?;
         }
-        if let Some(after) = &r.snap_after { self.before = after.clone(); }
-        Ok(r)
+        // The undo record is kept either way: it is this command's restore point, and after a rollback it
+        // describes the state that is now current.
+        let restore = RestorePoint::Undo(undo);
+        let duration_ms = started.elapsed().as_millis();
+        let step_id = agent::insert_step(&self.conn, &cmd, &outcome, rolled_back, duration_ms, &restore, &diff)?;
+        let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
+        Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated,
+                        changes: diff, duration_ms, model_ms: 0, model_requests: 0, restore })
+    }
+
+    /// Return to the state before command `undo` (a `RestorePoint::Undo` of this database): every undo
+    /// record from it on is applied, newest first. Processes the commands left running keep running.
+    pub fn rewind(&mut self, undo: i64) -> Result<()> {
+        let ids: Vec<i64> = self.conn.prepare("SELECT id FROM vm_undo WHERE id >= ?1 ORDER BY id DESC")?
+            .query_map([undo], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        if !ids.contains(&undo) { return Err(anyhow!("no undo record {}", undo)); }
+        vm::in_savepoint(&self.conn, "rewind", || { for id in &ids { vm::undo_apply(&self.conn, *id)?; } Ok(()) })?;
+        let paths = undo_paths(&self.conn, &ids)?;
+        self.restore_tree(&paths)
+    }
+
+    /// Make the tree match the database again after `paths` were restored there, and forget the writes
+    /// that did it. The restored entries are removed from the tree first: the materialize keeps a file
+    /// whose size and mtime (to the second) match the row, and a same-size rewrite within the second of the
+    /// restored mtime would otherwise stay in the tree while the database holds the old content.
+    fn restore_tree(&mut self, paths: &[String]) -> Result<()> {
+        let tree = self.tree();
+        for p in paths {
+            let host = tree.join(p.trim_start_matches('/'));
+            if let Ok(md) = std::fs::symlink_metadata(&host) {
+                if !md.is_dir() { let _ = std::fs::remove_file(&host); }
+            }
+        }
+        vm::vm_materialize_tree(&self.conn, &tree)?;
+        self.watch.discard();
+        Ok(())
     }
 
     /// Send one request to the supervisor and wait for its status.
@@ -216,6 +267,17 @@ impl Drop for Session {
         // the sandbox first: its processes hold the tree open; the work directory goes after it
         self.sandbox = None;
     }
+}
+
+/// The paths the given undo records cover.
+fn undo_paths(conn: &rusqlite::Connection, ids: &[i64]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for id in ids {
+        let rows: Vec<String> = conn.prepare_cached("SELECT path FROM vm_undo_fs WHERE undo_id=?1")?
+            .query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        out.extend(rows);
+    }
+    Ok(out)
 }
 
 /// The first `cap` bytes of a file, and whether it held more.
