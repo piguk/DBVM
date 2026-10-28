@@ -417,6 +417,67 @@ fn sync_report_impl(conn: &Connection, host_root: &Path, verify_content: bool, u
     Ok(rep)
 }
 
+/// Apply an overlay upper directory to the tree in the database: what a rollout changed, as overlayfs
+/// recorded it. A whiteout (a 0:0 character device) deletes the path and everything below it; a directory
+/// marked `user.overlay.opaque` replaces what the database had below it; every other entry is written as it
+/// is. Runs in one transaction. Returns (written, deleted) row counts.
+pub fn vm_apply_upper(conn: &Connection, upper: &Path) -> Result<(usize, usize)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    #[cfg(unix)] use std::os::unix::fs::PermissionsExt;
+    finalize_dirty(conn)?;
+    let opaque = |dir: &Path| -> bool {
+        let (Ok(p), Ok(name)) = (std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()), std::ffi::CString::new("user.overlay.opaque")) else { return false };
+        let mut v = [0u8; 4];
+        unsafe { libc::lgetxattr(p.as_ptr(), name.as_ptr(), v.as_mut_ptr().cast(), v.len()) == 1 && v[0] == b'y' }
+    };
+    let delete_below = |vm_p: &str, with_self: bool| -> Result<usize> {
+        let like = format!("{}/%", vm_p.trim_end_matches('/'));
+        let n = if with_self {
+            conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1 OR path LIKE ?2")?.execute(params![vm_p, like])?
+        } else {
+            conn.prepare_cached("DELETE FROM vm_fs WHERE path LIKE ?1")?.execute(params![like])?
+        };
+        Ok(n)
+    };
+    write_tx(conn, || {
+        let (mut written, mut deleted) = (0usize, 0usize);
+        // parents before children, so an opaque directory clears its old contents before its new ones arrive
+        for e in walkdir::WalkDir::new(upper).min_depth(1).follow_links(false).sort_by_file_name() {
+            let e = e?;
+            let rel = e.path().strip_prefix(upper).unwrap_or(e.path()).to_string_lossy().to_string();
+            let vm_p = normalize_vm_path(&format!("/{}", rel));
+            if is_reserved_vm_path(&vm_p) { continue; }
+            let md = std::fs::symlink_metadata(e.path())?;
+            let ft = md.file_type();
+            let mode = (md.permissions().mode() & 0o7777) as i64;
+            let mtime = md.mtime();
+            if ft.is_char_device() && md.rdev() == 0 {
+                deleted += delete_below(&vm_p, true)?;
+            } else if ft.is_dir() {
+                if opaque(e.path()) { deleted += delete_below(&vm_p, false)?; }
+                let same: Option<(String, i64)> = conn.prepare_cached("SELECT kind, mode FROM vm_fs WHERE path=?1")?
+                    .query_row(params![vm_p], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+                if same.as_ref().map(|(k, m)| k != "dir" || *m != mode).unwrap_or(true) {
+                    if same.as_ref().map(|(k, _)| k != "dir").unwrap_or(false) { deleted += delete_below(&vm_p, true)?; }
+                    fs_put_node(conn, &vm_p, "dir", mode, mtime, None)?;
+                    written += 1;
+                }
+            } else if ft.is_symlink() {
+                let t = std::fs::read_link(e.path())?;
+                delete_below(&vm_p, false)?;
+                fs_put_node(conn, &vm_p, "symlink", 0o777, mtime, Some(&t.to_string_lossy()))?;
+                written += 1;
+            } else if ft.is_file() {
+                delete_below(&vm_p, false)?;
+                let mut f = std::fs::File::open(e.path())?;
+                write_file_checked(conn, e.path(), &vm_p, mode, mtime, &mut f)?;
+                written += 1;
+            }
+        }
+        Ok((written, deleted))
+    })
+}
+
 /// Sync only `paths` (VM paths that may have changed on the host), not the whole tree: what a session does
 /// after each command, with the paths its tree watcher saw change. A path missing on the host is deleted
 /// with everything below it. With `undo`, every row written or deleted is recorded there first.

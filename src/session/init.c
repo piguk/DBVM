@@ -7,17 +7,29 @@
  *
  * Protocol, all inside the control directory CTL (argv[1]), which the host can read and write:
  *   CTL/fifo          the host writes a request id and a newline
+ *   CTL/<id>/op       "exec" (the default when absent), "read", "write" or "list"
+ * exec:
  *   CTL/<id>/argv     NUL-separated argument vector (argv[0] is looked up on the request's PATH)
  *   CTL/<id>/env      NUL-separated NAME=value list: the command's whole environment
  *   CTL/<id>/cwd      working directory
  *   CTL/<id>/timeout_ms
+ * read:   CTL/<id>/path, CTL/<id>/offset, CTL/<id>/len   -> the bytes in out
+ * write:  CTL/<id>/path, CTL/<id>/mode (octal), CTL/<id>/in -> the file, parent directories created
+ * list:   CTL/<id>/path                                   -> "<kind>\t<size>\t<name>\n" per entry in out
  * and the supervisor writes
- *   CTL/<id>/out, CTL/<id>/err   the command's stdout and stderr
+ *   CTL/<id>/out, CTL/<id>/err   output (exec: the command's stdout and stderr; file ops: result, error)
  *   CTL/<id>/status              "exit N", "timeout" or "error <message>", written last and atomically
  *   CTL/ready                    once, when it accepts requests
  *
+ * File operations run in the supervisor itself, inside the sandbox, so the sandbox's mounts apply to them
+ * as to a command: a read-only path refuses a write either way.
+ *
  * A command runs in its own session (setsid), so a timeout kills its whole process group. Output goes to
  * files, not pipes: a background process that keeps the output open cannot hold the request open.
+ *
+ * With "--forward PORT SOCKET", a separate process relays every connection to 127.0.0.1:PORT to the unix
+ * socket SOCKET (the host's egress proxy, bound into the sandbox). It is its own process because a command
+ * that needs the network (pip install) is running while its connections arrive.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -28,7 +40,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <netinet/in.h>
 #include <sys/signalfd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -108,7 +124,7 @@ static int reap(pid_t want, int *status) {
     return found;
 }
 
-static void run(const char *id) {
+static void run_exec(const char *id) {
     size_t alen = 0, elen = 0;
     char *pa = path_in(id, "argv"), *pe = path_in(id, "env"), *pc = path_in(id, "cwd"), *pt = path_in(id, "timeout_ms");
     char *abuf = read_file(pa, &alen), *ebuf = read_file(pe, &elen), *cwd = read_file(pc, NULL), *tbuf = read_file(pt, NULL);
@@ -161,6 +177,182 @@ done:
     free(abuf); free(ebuf); free(cwd); free(tbuf); free(out); free(err);
 }
 
+static void trim(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == ' ')) s[--n] = 0;
+}
+
+/* Write `text` to the request's err file. */
+static void put_err(const char *id, const char *text) {
+    char *pe = path_in(id, "err");
+    int fd = open(pe, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) { ssize_t w = write(fd, text, strlen(text)); (void)w; close(fd); }
+    free(pe);
+}
+
+static void fail(const char *id, const char *what, const char *path) {
+    char *msg;
+    if (asprintf(&msg, "%s %s: %s\n", what, path, strerror(errno)) < 0) msg = NULL;
+    put_err(id, msg ? msg : "error\n");
+    free(msg);
+    write_status(id, "exit 1");
+}
+
+/* Copy up to `len` bytes from `in` to `out`. -1 on error. */
+static int copy_fd(int in, int out, long long len) {
+    char buf[65536];
+    while (len != 0) {
+        size_t want = len < 0 || len > (long long)sizeof buf ? sizeof buf : (size_t)len;
+        ssize_t r = read(in, buf, want);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) break;
+        for (ssize_t done = 0; done < r;) {
+            ssize_t w = write(out, buf + done, (size_t)(r - done));
+            if (w < 0) { if (errno == EINTR) continue; return -1; }
+            done += w;
+        }
+        if (len > 0) len -= r;
+    }
+    return 0;
+}
+
+static void op_read(const char *id) {
+    char *pp = path_in(id, "path"), *po = path_in(id, "offset"), *pl = path_in(id, "len"), *out = path_in(id, "out");
+    char *path = read_file(pp, NULL), *off = read_file(po, NULL), *len = read_file(pl, NULL);
+    if (!path || !off || !len) { put_err(id, "incomplete request\n"); write_status(id, "exit 1"); goto done; }
+    trim(path);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fail(id, "cannot open", path); goto done; }
+    int o = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (o < 0 || lseek(fd, atoll(off), SEEK_SET) < 0 || copy_fd(fd, o, atoll(len)) != 0) { fail(id, "cannot read", path); }
+    else write_status(id, "exit 0");
+    if (o >= 0) close(o);
+    close(fd);
+done:
+    free(pp); free(po); free(pl); free(out); free(path); free(off); free(len);
+}
+
+/* mkdir -p for the parent directories of `path`. */
+static void make_parents(char *path) {
+    for (char *p = path + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        mkdir(path, 0755);
+        *p = '/';
+    }
+}
+
+static void op_write(const char *id) {
+    char *pp = path_in(id, "path"), *pm = path_in(id, "mode"), *pi = path_in(id, "in");
+    char *path = read_file(pp, NULL), *mode = read_file(pm, NULL);
+    if (!path || !mode) { put_err(id, "incomplete request\n"); write_status(id, "exit 1"); goto done; }
+    trim(path);
+    int in = open(pi, O_RDONLY | O_CLOEXEC);
+    if (in < 0) { fail(id, "cannot read request data for", path); goto done; }
+    make_parents(path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, (mode_t)strtol(mode, NULL, 8));
+    if (fd < 0) { fail(id, "cannot open", path); close(in); goto done; }
+    if (copy_fd(in, fd, -1) != 0) fail(id, "cannot write", path);
+    else write_status(id, "exit 0");
+    close(fd);
+    close(in);
+done:
+    free(pp); free(pm); free(pi); free(path); free(mode);
+}
+
+static void op_list(const char *id) {
+    char *pp = path_in(id, "path"), *out = path_in(id, "out");
+    char *path = read_file(pp, NULL);
+    if (!path) { put_err(id, "incomplete request\n"); write_status(id, "exit 1"); goto done; }
+    trim(path);
+    DIR *d = opendir(path);
+    if (!d) { fail(id, "cannot list", path); goto done; }
+    FILE *o = fopen(out, "we");
+    if (!o) { closedir(d); fail(id, "cannot write listing for", path); goto done; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        struct stat st;
+        char kind = 'o';
+        long long size = 0;
+        if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+            kind = S_ISREG(st.st_mode) ? 'f' : S_ISDIR(st.st_mode) ? 'd' : S_ISLNK(st.st_mode) ? 'l' : 'o';
+            size = st.st_size;
+        }
+        fprintf(o, "%c\t%lld\t%s\n", kind, size, e->d_name);
+    }
+    fclose(o);
+    closedir(d);
+    write_status(id, "exit 0");
+done:
+    free(pp); free(out); free(path);
+}
+
+static void handle(const char *id) {
+    char *po = path_in(id, "op");
+    char *op = read_file(po, NULL);
+    free(po);
+    if (op) trim(op);
+    if (!op || !strcmp(op, "exec")) run_exec(id);
+    else if (!strcmp(op, "read")) op_read(id);
+    else if (!strcmp(op, "write")) op_write(id);
+    else if (!strcmp(op, "list")) op_list(id);
+    else write_status(id, "error unknown operation");
+    free(op);
+}
+
+/* Relay one connection between `a` and `b` until both directions are closed. */
+static void relay(int a, int b) {
+    char buf[65536];
+    int open_a = 1, open_b = 1;
+    while (open_a || open_b) {
+        struct pollfd pf[2] = { { .fd = open_a ? a : -1, .events = POLLIN }, { .fd = open_b ? b : -1, .events = POLLIN } };
+        if (poll(pf, 2, -1) < 0) { if (errno == EINTR) continue; return; }
+        for (int i = 0; i < 2; i++) {
+            if (!pf[i].revents) continue;
+            int from = i == 0 ? a : b, to = i == 0 ? b : a;
+            ssize_t r = read(from, buf, sizeof buf);
+            if (r <= 0) {
+                shutdown(to, SHUT_WR);
+                if (i == 0) open_a = 0; else open_b = 0;
+                continue;
+            }
+            for (ssize_t done = 0; done < r;) {
+                ssize_t w = write(to, buf + done, (size_t)(r - done));
+                if (w <= 0) return;
+                done += w;
+            }
+        }
+    }
+}
+
+/* The forwarder: 127.0.0.1:port -> unix socket. Runs until the sandbox ends. */
+static void forwarder(int port, const char *sock) {
+    sigset_t none;
+    sigemptyset(&none);
+    sigprocmask(SIG_SETMASK, &none, NULL);
+    signal(SIGCHLD, SIG_IGN);  /* connection children are reaped by the kernel */
+    int l = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int one = 1;
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons((uint16_t)port), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    if (l < 0 || bind(l, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(l, 128) != 0) { perror("forwarder"); _exit(1); }
+    for (;;) {
+        int c = accept4(l, NULL, NULL, SOCK_CLOEXEC);
+        if (c < 0) { if (errno == EINTR) continue; _exit(1); }
+        if (fork() == 0) {
+            close(l);
+            int u = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            struct sockaddr_un ua = { .sun_family = AF_UNIX };
+            strncpy(ua.sun_path, sock, sizeof ua.sun_path - 1);
+            if (u < 0 || connect(u, (struct sockaddr *)&ua, sizeof ua) != 0) _exit(1);
+            relay(c, u);
+            _exit(0);
+        }
+        close(c);
+    }
+}
+
 /* A request id is the decimal sequence number the host assigned; anything else is ignored. */
 static int valid_id(const char *s) {
     if (!*s) return 0;
@@ -169,8 +361,12 @@ static int valid_id(const char *s) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) { fprintf(stderr, "usage: init CONTROL_DIR\n"); return 2; }
+    if (argc != 2 && !(argc == 5 && !strcmp(argv[2], "--forward"))) {
+        fprintf(stderr, "usage: init CONTROL_DIR [--forward PORT SOCKET]\n");
+        return 2;
+    }
     ctl = argv[1];
+    if (argc == 5 && fork() == 0) forwarder(atoi(argv[3]), argv[4]);
     signal(SIGPIPE, SIG_IGN);
     sigset_t chld;
     sigemptyset(&chld);
@@ -202,7 +398,7 @@ int main(int argc, char **argv) {
             if (c != '\n') { if (n < sizeof line - 1) line[n++] = c; continue; }
             line[n] = 0;
             n = 0;
-            if (valid_id(line)) run(line);
+            if (valid_id(line)) handle(line);
             break;
         }
     }

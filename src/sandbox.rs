@@ -97,11 +97,22 @@ pub struct Bind {
     pub writable: bool,
 }
 
+/// A read-only overlay of `layers` (bottom first) mounted at `dest`.
+#[derive(Debug, Clone)]
+pub struct RoOverlay { pub layers: Vec<PathBuf>, pub dest: String }
+
 /// What to run and where.
 #[derive(Debug, Clone)]
 pub struct Spec {
-    /// The sandbox's `/`.
+    /// The sandbox's `/`, when it is a plain directory (`layers` is empty).
     pub root: PathBuf,
+    /// The sandbox's `/` as an overlay instead: these read-only layers (bottom first) under `upper`, which
+    /// receives every write (`work` is overlayfs's scratch directory, on the same filesystem). Many
+    /// sandboxes share the layers, so starting one costs nothing in proportion to the tree. bwrap only.
+    pub layers: Vec<PathBuf>,
+    pub upper: Option<(PathBuf, PathBuf)>,
+    /// Read-only overlays mounted over the root, for paths the sandbox must not change.
+    pub ro_overlays: Vec<RoOverlay>,
     pub root_writable: bool,
     /// The root may be changed from outside while the sandbox runs (a session restores it after a
     /// rollback). gVisor otherwise assumes exclusive access and keeps serving its cached view (measured:
@@ -122,6 +133,9 @@ impl Spec {
     pub fn new(root: &Path, argv: Vec<String>) -> Spec {
         Spec {
             root: root.to_path_buf(),
+            layers: Vec::new(),
+            upper: None,
+            ro_overlays: Vec::new(),
             root_writable: true,
             root_shared: false,
             argv,
@@ -318,6 +332,22 @@ impl Sandbox {
         Ok(Sandbox { child, cgroup, _runsc_state: runsc_state, _keep: keep })
     }
 
+    /// CPU time used by everything in the sandbox so far, in microseconds, from its cgroup. None without
+    /// a cgroup, or when it cannot be read.
+    pub fn cpu_usec(&mut self) -> Option<u64> {
+        let path = match &self.cgroup {
+            Some(SandboxCgroup::Dir(dir)) => dir.clone(),
+            Some(SandboxCgroup::Unit(_)) => {
+                // the scope's cgroup is the one the sandbox's top process runs in
+                let line = std::fs::read_to_string(format!("/proc/{}/cgroup", self.child.id())).ok()?;
+                PathBuf::from(format!("/sys/fs/cgroup{}", line.trim().strip_prefix("0::")?))
+            }
+            None => return None,
+        };
+        let stat = std::fs::read_to_string(path.join("cpu.stat")).ok()?;
+        stat.lines().find_map(|l| l.strip_prefix("usage_usec ")).and_then(|v| v.trim().parse().ok())
+    }
+
     /// Whether the sandbox's top process is still running.
     pub fn is_running(&mut self) -> bool { matches!(self.child.try_wait(), Ok(None)) }
 
@@ -443,10 +473,34 @@ fn bwrap_command(spec: &Spec, keep: &mut Vec<OwnedFd>) -> Result<Command> {
     // sandbox cannot regain capabilities in a namespace of its own
     cmd.args(["--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--hostname", "vm"]);
     if !spec.interactive { cmd.arg("--new-session"); }
-    cmd.arg(if spec.root_writable { "--bind" } else { "--ro-bind" }).arg(&spec.root).arg("/");
+    if spec.layers.is_empty() {
+        cmd.arg(if spec.root_writable { "--bind" } else { "--ro-bind" }).arg(&spec.root).arg("/");
+    } else {
+        match &spec.upper {
+            Some((upper, work)) => {
+                for l in &spec.layers { cmd.arg("--overlay-src").arg(l); }
+                cmd.arg("--overlay").arg(upper).arg(work).arg("/");
+            }
+            // one layer read-only is a read-only bind (bwrap's read-only overlay needs two)
+            None if spec.layers.len() == 1 => { cmd.arg("--ro-bind").arg(&spec.layers[0]).arg("/"); }
+            None => {
+                for l in &spec.layers { cmd.arg("--overlay-src").arg(l); }
+                cmd.args(["--ro-overlay", "/"]);
+            }
+        }
+    }
     cmd.args(["--dev", "/dev", "--proc", "/proc"]);
     for b in &spec.binds {
         cmd.arg(if b.writable { "--bind" } else { "--ro-bind" }).arg(&b.host).arg(&b.dest);
+    }
+    for o in &spec.ro_overlays {
+        // bwrap needs two layers for a read-only overlay; one layer read-only is the same as a read-only bind
+        if let [one] = o.layers.as_slice() {
+            cmd.arg("--ro-bind").arg(one).arg(&o.dest);
+            continue;
+        }
+        for l in &o.layers { cmd.arg("--overlay-src").arg(l); }
+        cmd.arg("--ro-overlay").arg(&o.dest);
     }
     cmd.arg("--clearenv");
     for (k, v) in &spec.env { cmd.arg("--setenv").arg(k).arg(v); }
@@ -603,6 +657,9 @@ pub mod gvisor {
 
     /// The command that runs `spec` in gVisor, and the state directory to remove afterwards.
     pub(super) fn command(spec: &Spec) -> Result<(Command, crate::vm::WorkDir)> {
+        if !spec.layers.is_empty() || !spec.ro_overlays.is_empty() {
+            return Err(anyhow!("overlay roots are supported with bwrap only; use a materialized root under gVisor"));
+        }
         let runsc = runsc().ok_or_else(|| anyhow!("gVisor isolation needs runsc (set SELF_RUNSC or put it on PATH)"))?;
         let work = crate::vm::WorkDir::create("selfdb-runsc-")?;
         let state = work.path();

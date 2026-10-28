@@ -1,0 +1,25 @@
+# The tests need unprivileged user namespaces (bwrap, rootless gVisor), cgroup v2 delegation, a C compiler
+# with a static libc, and FUSE: GitHub-hosted runners restrict user namespaces, so this runs on a
+# self-hosted runner labelled `sandbox` (Linux with bwrap, systemd user session, runsc at $SELF_RUNSC).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, sandbox]
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: clippy
+        run: cargo clippy --all-targets --features fuse -- -D warnings
+      - name: tests
+        run: |
+          mkdir -p tmp
+          TMPDIR=$PWD/tmp cargo test --no-fail-fast --features fuse
+      - name: clean
+        if: always()
+        run: rm -rf tmp

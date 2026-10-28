@@ -11,5 +11,8 @@ pub mod owner;
 pub mod proxy;
 pub mod sandbox;
 pub mod session;
+pub mod rollout;
+pub mod egress;
+pub mod env;
 #[cfg(feature = "fuse")]
 pub mod fuse;

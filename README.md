@@ -59,6 +59,15 @@ target/release/self vm-chroot /tmp/alpine.vm.db /bin/sh -c 'cat /etc/alpine-rele
 target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --help
 ```
 
+## RL 环境服务
+
+以 HTTP 接口提供 RL 训练用的环境：模板、任务、批量 rollout、fork、判分、轨迹，多租户与配额。见 **[docs/env.md](docs/env.md)**。
+
+```sh
+self env-admin --data /srv/env image import base rootfs.tar
+self env-serve --data /srv/env --listen 0.0.0.0:8650
+```
+
 ## 布局
 
 - `src/elf.rs` — ELF 解析（goblin）
@@ -66,6 +75,12 @@ target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --help
 - `src/closure.rs` — 依赖闭包寻库（RUNPATH/RPATH/LD_LIBRARY_PATH/调用方目录/系统目录）
 - `src/vm/` — VM 存储层（`vm_fs`/`vm_blobs` 去重、zstd 字典、快照、`vm_mem`、4K 稀疏块设备），子模块划分见 `src/vm/mod.rs`
 - `src/fuse.rs` — FUSE 挂载 `vm_fs`（`--features fuse`）
+- `src/sandbox.rs` — 所有运行 VM 内容的 sandbox（bwrap / gVisor、seccomp、cgroup）
+- `src/session.rs`、`src/session/` — 长期 session 与 sandbox 内的 supervisor（`init.c`，构建时静态链接，需要 C 编译器与 libc.a）
+- `src/rollout.rs` — 以共享只读层为根的 overlay rollout
+- `src/egress.rs` — build session 的出站白名单代理
+- `src/env/` — RL 环境服务（控制库、存储、任务、HTTP 接口）
+- `sdk/python/` — Python SDK
 - `src/bin/self.rs` — 主 CLI（SELF 查询 + `vm-*` 子命令）
 - `src/bin/self-exec.rs` — 加载器：`memfd` + `execve` 委托宿主 `ld.so`，bundle 展开
 - `src/bin/elf2self.rs` — ELF → SELF 转换

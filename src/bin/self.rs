@@ -45,6 +45,20 @@ impl SandboxArgs {
     }
 }
 
+#[derive(Subcommand, Debug)]
+enum EnvAdmin {
+    /// Create a tenant; prints its id.
+    Tenant { name: String,
+             #[arg(long, default_value_t=256)] max_sessions: i64,
+             #[arg(long, default_value_t=50 << 30)] max_storage_bytes: i64,
+             #[arg(long, default_value_t=4 * 3600)] max_session_secs: i64,
+             #[arg(long, default_value_t=4 << 30)] max_session_disk_bytes: i64 },
+    /// Create an API key for a tenant. The key is printed once; only its digest is stored.
+    Key { tenant: String },
+    /// Import a root filesystem tarball as a system template every tenant can use; prints its id.
+    Image { name: String, rootfs: String },
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     File{ path: String },
@@ -143,6 +157,10 @@ enum Cmd {
     VmDiskImport{ db: String, raw: String, #[arg(long, default_value="")] size: String },
     VmDiskExport{ db: String, raw: String },
     VmDiskInfo{ db: String },
+    /// The RL environment service (see docs/env.md).
+    EnvServe{ #[arg(long)] data: String, #[arg(long, default_value="127.0.0.1:8650")] listen: String, #[arg(long, default_value="n1")] node: String },
+    /// Operator commands for the environment service's data directory.
+    EnvAdmin{ #[arg(long)] data: String, #[arg(long, default_value="n1")] node: String, #[command(subcommand)] action: EnvAdmin },
     VmRun{ db: String, #[arg(long, default_value="512M")] mem: String, #[arg(long, default_value="")] raw: String, #[arg(long)] kvm: bool, #[arg(long, default_value="")] kernel: String, #[arg(long, default_value="")] initrd: String, #[arg(long, default_value="")] append: String },
 }
 
@@ -331,6 +349,26 @@ fn main() -> anyhow::Result<()> {
                 if cr + up + del > 0 { eprintln!("-> sync {} -> {}: +{} ~{} -{}", tmp.display(), db, cr, up, del); }
             }
             std::process::exit(code?);
+        },
+        Cmd::EnvServe{data, listen, node} => {
+            let svc = selfdb::env::service::Service::open(Path::new(&data), &node)?;
+            eprintln!("environment service on {} (data {}, node {})", listen, data, node);
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(selfdb::env::api::serve(svc, &listen))?;
+        },
+        Cmd::EnvAdmin{data, node, action} => {
+            // the control database and the store only: opening the service would end the running service's
+            // sessions and clear its run directory
+            let store = selfdb::env::store::Store::open(Path::new(&data), &node)?;
+            let control = selfdb::env::control::ControlDb::open(&Path::new(&data).join("control.db"))?;
+            match action {
+                EnvAdmin::Tenant{name, max_sessions, max_storage_bytes, max_session_secs, max_session_disk_bytes} => {
+                    let q = selfdb::env::control::Quotas { max_sessions, max_storage_bytes, max_session_secs, max_session_disk_bytes };
+                    println!("{}", control.create_tenant(&store.new_id("ten")?, &name, &q)?.id);
+                }
+                EnvAdmin::Key{tenant} => println!("{}", control.create_key(&tenant)?),
+                EnvAdmin::Image{name, rootfs} => println!("{}", store.import_image(&control, &name, Path::new(&rootfs))?.id),
+            }
         },
         Cmd::VmResolve{db, vm_path} => {
             let c=selfdb::vm::vm_open(&db)?;

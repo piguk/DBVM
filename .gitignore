@@ -8,3 +8,4 @@ AGENT.md
 /.workflow/
 *.snap.*
 /examples/greet/app
+__pycache__/

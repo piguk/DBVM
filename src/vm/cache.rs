@@ -12,13 +12,34 @@ pub fn cache_dir() -> PathBuf {
 
 /// Create unique temp dir `$TMPDIR/<prefix>XXXXXX` via mkdtemp(3).
 pub fn make_tmp_dir(prefix: &str) -> Result<PathBuf> {
-    let tmpl = std::env::temp_dir().join(format!("{}XXXXXX", prefix));
+    make_dir_in(&std::env::temp_dir(), prefix)
+}
+
+/// A new, uniquely named directory `<root>/<prefix>XXXXXX`.
+pub fn make_dir_in(root: &Path, prefix: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let tmpl = root.join(format!("{}XXXXXX", prefix));
     let mut buf = tmpl.to_string_lossy().as_bytes().to_vec();
     buf.push(0);
     let p = unsafe { libc::mkdtemp(buf.as_mut_ptr() as *mut libc::c_char) };
     if p.is_null() { return Err(anyhow!("mkdtemp {}: {}", tmpl.display(), std::io::Error::last_os_error())); }
     buf.pop();
     Ok(PathBuf::from(String::from_utf8_lossy(&buf).to_string()))
+}
+
+/// Remove a directory tree, including directories without permissions. overlayfs leaves its `work/work`
+/// directory mode 000, which `remove_dir_all` cannot enter: every rollout's directory stayed behind
+/// (measured). Directories are made accessible top down (links are not followed), then removed.
+pub fn remove_tree(path: &Path) -> std::io::Result<()> {
+    if std::fs::remove_dir_all(path).is_ok() || std::fs::symlink_metadata(path).is_err() { return Ok(()); }
+    fn open_up(dir: &Path) {
+        let Ok(md) = std::fs::symlink_metadata(dir) else { return };
+        if !md.is_dir() { return; }
+        let _ = std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        if let Ok(rd) = std::fs::read_dir(dir) { for e in rd.flatten() { open_up(&e.path()); } }
+    }
+    open_up(path);
+    std::fs::remove_dir_all(path)
 }
 
 /// A private working directory under $TMPDIR, removed when dropped.
@@ -32,8 +53,13 @@ pub struct WorkDir { path: PathBuf, lock: PathBuf, _owner: std::fs::File }
 
 impl WorkDir {
     pub fn create(prefix: &str) -> Result<WorkDir> {
-        reclaim_abandoned(prefix);
-        let path = make_tmp_dir(prefix)?;
+        WorkDir::create_in(&std::env::temp_dir(), prefix)
+    }
+
+    /// As `create`, under `root` instead of $TMPDIR.
+    pub fn create_in(root: &Path, prefix: &str) -> Result<WorkDir> {
+        reclaim_abandoned(root, prefix);
+        let path = make_dir_in(root, prefix)?;
         let lock = PathBuf::from(format!("{}.lock", path.display()));
         // locked under a temporary name and then renamed, so no unlocked `.lock` is ever visible
         let staging = PathBuf::from(format!("{}.lock-{}", path.display(), std::process::id()));
@@ -51,14 +77,14 @@ impl WorkDir {
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-        let _ = std::fs::remove_file(&self.lock);
+        // the lock goes only once the directory is gone, so a failed removal is retried by a later reclaim
+        if remove_tree(&self.path).is_ok() { let _ = std::fs::remove_file(&self.lock); }
     }
 }
 
-/// Remove `<prefix>*` directories under $TMPDIR whose owner lock is free.
-fn reclaim_abandoned(prefix: &str) {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+/// Remove `<prefix>*` directories under `root` whose owner lock is free.
+fn reclaim_abandoned(root: &Path, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         let Some(dir_name) = name.strip_suffix(".lock") else { continue };
@@ -66,8 +92,7 @@ fn reclaim_abandoned(prefix: &str) {
         let Ok(f) = std::fs::OpenOptions::new().write(true).open(e.path()) else { continue };
         if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&f), libc::LOCK_EX | libc::LOCK_NB) } != 0 { continue; }
         // the owner is gone: remove its directory, then the lock, while holding the lock
-        let _ = std::fs::remove_dir_all(e.path().with_file_name(dir_name));
-        let _ = std::fs::remove_file(e.path());
+        if remove_tree(&e.path().with_file_name(dir_name)).is_ok() { let _ = std::fs::remove_file(e.path()); }
     }
 }
 
