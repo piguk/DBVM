@@ -176,3 +176,85 @@ fn rewriting_a_chunk_with_identical_bytes_keeps_its_blob() {
     assert!(rep.contains("deep=ok"), "deep verify: {}", rep);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+fn sha256(b: &[u8]) -> Vec<u8> { use sha2::{Digest, Sha256}; Sha256::digest(b).to_vec() }
+
+fn stored_hash(c: &rusqlite::Connection, path: &str) -> Vec<u8> {
+    c.query_row("SELECT hash FROM vm_fs WHERE path=?1", [path], |r| r.get(0)).unwrap()
+}
+
+fn dirty(c: &rusqlite::Connection) -> i64 { c.query_row("SELECT count(*) FROM vm_dirty", [], |r| r.get(0)).unwrap() }
+
+#[test]
+fn a_deferred_write_is_seen_by_snapshots_and_diffs() {
+    // A deferred write leaves the whole-file hash stale until something reads it. A snapshot diff that
+    // trusted the stale hash would report the file as unchanged.
+    let (d, c) = make("deferred-diff");
+    let mut model = vec![7u8; 2 * CHUNK_SIZE + 9];
+    vm::vm_add_bytes(&c, "/f", &model, 0o644, 1).unwrap();
+    let (_, before) = vm::snapshot_create_named(&c, "s", "").unwrap();
+    for (i, off) in [0usize, 4096, CHUNK_SIZE + 3, 2 * CHUNK_SIZE].into_iter().enumerate() {
+        let w = vec![i as u8 + 1; 100];
+        vm::write_range_deferred(&c, "/f", off as u64, &w, 2, None).unwrap();
+        let end = (off + w.len()).max(model.len());
+        model.resize(end, 0);
+        model[off..off + w.len()].copy_from_slice(&w);
+    }
+    check(&c, "/f", &model);
+    assert_eq!(dirty(&c), 1, "the file is recorded as pending");
+    let diff = vm::snapshot_diff_live(&c, &before).unwrap();
+    assert_eq!(diff.modified, vec!["/f".to_string()], "the diff sees the deferred write");
+    assert_eq!(dirty(&c), 0, "the diff finalized it");
+    assert_eq!(stored_hash(&c, "/f"), sha256(&model), "the finalized hash is the content's sha256");
+    assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_pending_hash_follows_a_rename_and_survives_a_reopen() {
+    // vm_dirty keys on the path; the foreign key carries the row through a rename, and a writer that
+    // stops before finalizing (a crash) leaves it for the next open.
+    let (d, c) = make("deferred-rename");
+    vm::vm_add_bytes(&c, "/a", b"old content", 0o644, 1).unwrap();
+    vm::write_range_deferred(&c, "/a", 0, b"NEW", 2, None).unwrap();
+    c.execute("UPDATE vm_fs SET path='/b' WHERE path='/a'", []).unwrap();
+    c.execute("UPDATE vm_file_chunks SET path='/b' WHERE path='/a'", []).unwrap();
+    let pending: String = c.query_row("SELECT path FROM vm_dirty", [], |r| r.get(0)).unwrap();
+    assert_eq!(pending, "/b");
+    drop(c);
+    let c = vm::vm_open(d.join("v.db").to_str().unwrap()).unwrap();
+    assert_eq!(dirty(&c), 0, "opening the database finalizes pending hashes");
+    assert_eq!(stored_hash(&c, "/b"), sha256(b"NEW content"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_deferred_truncate_is_finalized_like_a_write() {
+    let (d, c) = make("deferred-trunc");
+    let data: Vec<u8> = (0..(2 * CHUNK_SIZE + 500)).map(|i| (i % 253) as u8).collect();
+    vm::vm_add_bytes(&c, "/f", &data, 0o644, 1).unwrap();
+    vm::truncate_range_deferred(&c, "/f", CHUNK_SIZE as u64 + 10, 2, None).unwrap();
+    check(&c, "/f", &data[..CHUNK_SIZE + 10]);
+    assert_eq!(vm::finalize_dirty(&c).unwrap(), 1);
+    assert_eq!(stored_hash(&c, "/f"), sha256(&data[..CHUNK_SIZE + 10]));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_database_with_pending_hashes_is_refused_as_base_or_package() {
+    // A Base or a package is attached read-only, so its stale hashes cannot be finalized, and copying
+    // them would record wrong content hashes in the target.
+    let (d, c) = make("deferred-ro");
+    vm::vm_add_bytes(&c, "/f", b"abc", 0o644, 1).unwrap();
+    vm::write_range_deferred(&c, "/f", 0, b"X", 2, None).unwrap();
+    // closing a connection does not finalize: the database is left with a pending hash, as a crashed
+    // writer would leave it
+    drop(c);
+    let db = d.join("v.db");
+    let e = selfdb::overlay::Overlay::open(&d.join("delta.db"), &db).err().expect("base with pending hashes refused");
+    assert!(e.to_string().contains("pending hashes"), "{}", e);
+    let target = vm::init_vm_db_with_opts(d.join("t.db").to_str().unwrap(), true, true).unwrap();
+    let e = selfdb::inject::inject(&target, &db).expect_err("package with pending hashes refused");
+    assert!(e.to_string().contains("pending hashes"), "{}", e);
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -9,6 +9,42 @@ const APP_ID: u32 = 0x53454C46;
 #[command(name="self", about="inspect and pack SELF files")]
 struct Cli { #[command(subcommand)] cmd: Cmd }
 
+/// How a command that runs VM content is sandboxed. Unset limits keep the command's defaults.
+#[derive(clap::Args, Debug, Clone)]
+struct SandboxArgs {
+    #[arg(long, default_value="bwrap", help="isolation boundary: bwrap (namespaces + seccomp, shared kernel) or gvisor (runsc)")]
+    isolation: String,
+    #[arg(long, help="memory limit of the whole sandbox in MiB (cgroup memory.max, no swap)")]
+    memory_mb: Option<u64>,
+    #[arg(long, help="process and thread limit of the sandbox (cgroup pids.max)")]
+    pids: Option<u64>,
+    #[arg(long, help="CPU quota in percent of one CPU, e.g. 200 = two CPUs (cgroup cpu.max)")]
+    cpu_percent: Option<u64>,
+    #[arg(long, help="RLIMIT_AS per process in MiB")]
+    address_space_mb: Option<u64>,
+    #[arg(long, help="RLIMIT_CPU per process in seconds")]
+    cpu_secs: Option<u64>,
+    #[arg(long, help="RLIMIT_FSIZE per process in MiB")]
+    file_mb: Option<u64>,
+    #[arg(long, help="run without any resource limit (trusted code only: the sandbox can exhaust the host)")]
+    no_limits: bool,
+}
+
+impl SandboxArgs {
+    fn isolation(&self) -> anyhow::Result<selfdb::sandbox::Isolation> { selfdb::sandbox::Isolation::parse(&self.isolation) }
+    fn limits(&self, defaults: selfdb::sandbox::Limits) -> selfdb::sandbox::Limits {
+        if self.no_limits { return selfdb::sandbox::Limits::none(); }
+        selfdb::sandbox::Limits {
+            memory_mb: self.memory_mb.unwrap_or(defaults.memory_mb),
+            pids: self.pids.unwrap_or(defaults.pids),
+            cpu_percent: self.cpu_percent.unwrap_or(defaults.cpu_percent),
+            address_space_mb: self.address_space_mb.unwrap_or(defaults.address_space_mb),
+            cpu_secs: self.cpu_secs.unwrap_or(defaults.cpu_secs),
+            file_size_mb: self.file_mb.unwrap_or(defaults.file_size_mb),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     File{ path: String },
@@ -33,8 +69,10 @@ enum Cmd {
     VmLs{ db: String, #[arg(default_value="/")] path: String },
     VmCat{ db: String, path: String },
     VmStat{ db: String, path: String },
-    VmExec{ db: String, vm_path: String, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String> },
-    VmChroot{ db: String, #[arg(default_value="/bin/sh")] cmd: String, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String>, #[arg(long, help="keep tmp dir and persist history (default: true unless --ephemeral)")] persist: bool, #[arg(long, help="skip sync and remove tmp, disables history persistence")] ephemeral: bool },
+    /// Run one VM binary in a sandbox whose root holds only that binary and the VM's libraries.
+    VmExec{ db: String, vm_path: String, #[command(flatten)] sandbox: SandboxArgs, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String> },
+    /// Interactive shell (or a command) inside the VM, in a sandbox.
+    VmChroot{ db: String, #[arg(default_value="/bin/sh")] cmd: String, #[arg(long, help="write changes back and keep shell history in the VM (the default unless --ephemeral)")] persist: bool, #[arg(long, help="discard every change made in the session")] ephemeral: bool, #[command(flatten)] sandbox: SandboxArgs, #[arg(trailing_var_arg=true, allow_hyphen_values=true)] rest: Vec<String> },
     VmResolve{ db: String, vm_path: String },
     VmCheckpoint{ db: String, name: String, #[arg(long, default_value="")] note: String },
     VmSnapshots{ db: String },
@@ -72,14 +110,12 @@ enum Cmd {
              #[arg(long, default_value="gpt-6.1-sol")] model: String,
              #[arg(long, default_value_t=18081)] port: u16,
              #[arg(long, default_value_t=selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES)] max_output: usize,
-             #[arg(long, default_value_t=2048, help="RLIMIT_AS in MiB for the agent (node needs >= ~1536); 0 = unlimited")] mem_mb: u32,
-             #[arg(long, default_value_t=0, help="RLIMIT_CPU in seconds for the agent; 0 = unlimited")] cpu_secs: u32,
-             #[arg(long, default_value_t=1024, help="RLIMIT_FSIZE in MiB for the agent; 0 = unlimited")] file_mb: u32,
+             #[command(flatten)] sandbox: SandboxArgs,
              #[arg(long, help="read-only Base database; <DB> becomes a Delta on top of it")]
              base: Option<String>,
              #[arg(long, default_value="", help="comma-separated hosts the agent may fetch packages from via /pkg/<host>/<path>")]
              allow_hosts: String,
-             #[arg(long, help="EXPERIMENTAL: bind the sandbox to a FUSE mount instead of unpacking to /tmp. The mount serves the whole VM and the agent starts, but pi's session file is opened with O_EXCL, which this FUSE layer answers with an error, so the run fails. Kept for further work; the materialised path stays the default.")]
+             #[arg(long, help="EXPERIMENTAL: bind the sandbox to a FUSE mount instead of unpacking to /tmp. The O_EXCL create failure that stopped pi is fixed, but a full agent run over the mount has not been verified yet; the materialised path stays the default.")]
              fuse: bool,
              task: String },
     /// Host-side model proxy: a unix socket the sandboxed agent reaches without network access.
@@ -98,7 +134,7 @@ enum Cmd {
     /// List recorded agent steps (oldest first); --json prints one JSON array.
     AgentLog{ db: String, #[arg(long, help="print a JSON array instead of a table")] json: bool, #[arg(long, help="only the most recent N steps")] last: Option<usize> },
     /// Run one command in a sandbox against the VM; record output, changes, and optionally roll back.
-    VmStep{ db: String, #[arg(long, default_value_t=60, help="kill the step after N seconds")] timeout: u64, #[arg(long, help="restore the pre-step snapshot if the step fails or times out")] rollback_on_fail: bool, #[arg(long, default_value_t=selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES, help="keep at most N bytes of each of stdout/stderr")] max_output: usize, #[arg(trailing_var_arg=true, allow_hyphen_values=true, required=true)] argv: Vec<String> },
+    VmStep{ db: String, #[arg(long, default_value_t=60, help="kill the step after N seconds")] timeout: u64, #[arg(long, help="restore the pre-step snapshot if the step fails or times out")] rollback_on_fail: bool, #[arg(long, default_value_t=selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES, help="keep at most N bytes of each of stdout/stderr")] max_output: usize, #[command(flatten)] sandbox: SandboxArgs, #[arg(trailing_var_arg=true, allow_hyphen_values=true, required=true)] argv: Vec<String> },
     /// keep the newest N content snapshots, delete the rest (reports each removed name)
     VmRetain{ db: String, keep: usize },
     VmMount{ db: String, mountpoint: String, #[arg(long)] allow_other: bool },
@@ -112,6 +148,8 @@ enum Cmd {
 
 fn open_db(path: &str) -> Connection {
     let conn = Connection::open(path).unwrap();
+    // a SELF file may come from anyone: the same defenses as for VM databases
+    if let Err(e) = selfdb::vm::harden(&conn) { eprintln!("{}: {}", path, e); std::process::exit(1); }
     let appid: u32 = conn.query_row("PRAGMA application_id", [], |r| r.get(0)).unwrap_or(0);
     if appid != APP_ID { eprintln!("not a SELF file: {}", path); std::process::exit(1); }
     conn
@@ -154,16 +192,18 @@ fn main() -> anyhow::Result<()> {
         },
         Cmd::VmInit{db, force, vm_only} => { let _c=selfdb::vm::init_vm_db_with_opts(&db, force, vm_only)?; println!("vm init -> {} (WAL+mmap+compress vm_only={})", db, vm_only); },
         Cmd::VmAdd{db, host, vm_path} => { let c=selfdb::vm::vm_open(&db)?; selfdb::vm::vm_add_file(&c, &host, &vm_path)?; println!("add {} -> {}:{}", host, db, vm_path); },
-        Cmd::VmPack{db, host_dir, prefix, serial} => { let c=selfdb::vm::vm_open(&db)?; let n=if serial { selfdb::vm::vm_pack_host_dir(&c, &host_dir, &prefix)? } else { selfdb::vm::vm_pack_host_dir_parallel(&c, &host_dir, &prefix)? }; println!("pack {} -> {}:{} ({} files)", host_dir, db, prefix, n); },
+        Cmd::VmPack{db, host_dir, prefix, serial} => { let c=selfdb::vm::vm_open(&db)?; let n=if serial { selfdb::vm::vm_pack_host_dir(&c, &host_dir, &prefix)? } else { selfdb::vm::vm_pack_host_dir_parallel(&c, &host_dir, &prefix)? }; println!("pack {} -> {}:{} ({} entries)", host_dir, db, prefix, n); },
         Cmd::VmImport{db, elf, prefix} => { let c=selfdb::vm::vm_open(&db)?; let n=selfdb::vm::vm_import_closure(&c, &elf, &prefix)?; println!("import {} -> {} ({} objects)", elf, db, n); },
         Cmd::VmImportRootfs{db, tar, strip, whitelist, exclude} => { let c=selfdb::vm::vm_open(&db)?; let wl: Option<&[String]> = if whitelist.is_empty() { None } else { Some(&whitelist) }; let ex: Option<&[String]> = if exclude.is_empty() { None } else { Some(&exclude) }; let n=selfdb::vm::vm_import_tar_filtered(&c, &tar, &strip, wl, ex)?; println!("import-tar {} -> {} ({} entries) whitelist={:?} exclude={:?}", tar, db, n, whitelist, exclude); if n>50 { let _ = selfdb::vm::vm_train_dict(&c, 16384); } },
         Cmd::VmMaterialize{db, dest} => { let c=selfdb::vm::vm_open(&db)?; let n=selfdb::vm::vm_materialize_tree(&c, std::path::Path::new(&dest))?; println!("materialize {} -> {} ({} files)", db, dest, n); },
-        Cmd::VmLs{db, path} => { let c=selfdb::vm::vm_open(&db)?; for (p,k,m,sz,_) in selfdb::vm::vm_ls(&c, &path)? { println!("{:8} {:4} {:>10}  {}", k, format!("{:o}", m), sz, p);} },
+        Cmd::VmLs{db, path} => { let c=selfdb::vm::vm_open(&db)?; for e in selfdb::vm::vm_ls(&c, &path)? { println!("{:8} {:4} {:>10}  {}", e.kind, format!("{:o}", e.mode), e.size, e.path);} },
         Cmd::VmCat{db, path} => { let c=selfdb::vm::vm_open(&db)?; let data=selfdb::vm::vm_cat(&c, &path)?; use std::io::Write; std::io::stdout().write_all(&data)?; },
         Cmd::VmStat{db, path} => { let c=selfdb::vm::vm_open(&db)?; let (p,k,m,sz,mtime,hash)=selfdb::vm::vm_stat(&c, &path)?; println!("path={} kind={} mode={:o} size={} mtime={} hash={}", p,k,m,sz,mtime,hash); },
-        Cmd::VmExec{db, vm_path, rest} => {
+        Cmd::VmExec{db, vm_path, sandbox, rest} => {
             let c=selfdb::vm::vm_open(&db)?;
-            let tmp = selfdb::vm::make_tmp_dir("self-vm-")?;
+            // removed on return, and reclaimed by a later run if this process is killed
+            let work = selfdb::vm::WorkDir::create("self-vm-")?;
+            let tmp = work.path().to_path_buf();
             let host_bin = tmp.join(vm_path.trim_start_matches('/'));
             if let Some(parent)=host_bin.parent(){ std::fs::create_dir_all(parent)?; }
             // resolve symlink via vm_resolve and materialize (symlinks become regular file with target content)
@@ -181,32 +221,23 @@ fn main() -> anyhow::Result<()> {
                     if let Some(p)=cand { to_mat.push(p); }
                     else {
                         let mut st=c.prepare("SELECT path FROM vm_fs WHERE (kind='file' OR kind='symlink') AND (path LIKE '/lib/%' OR path LIKE '/usr/lib/%')")?;
-                        for r in st.query_map([], |r| r.get::<_,String>(0))? { if let Ok(pp)=r { if pp.ends_with(&soname) { to_mat.push(pp); break; } } }
+                        for r in st.query_map([], |r| r.get::<_,String>(0))? { let pp=r?; if pp.ends_with(&soname) { to_mat.push(pp); break; } }
                     }
                 }
                 // eagerly materialize libs + their symlink aliases
                 let mut all_libs: Vec<String> = Vec::new();
                 {
-                    let mut st=c.prepare("SELECT path, kind, link_target FROM vm_fs WHERE (path LIKE '/lib/%' OR path LIKE '/usr/lib/%' OR path LIKE '/usr/lib64/%')")?;
+                    let mut st=c.prepare("SELECT path, kind, link_target FROM vm_fs WHERE (path LIKE '/lib/%' OR path LIKE '/lib64/%' OR path LIKE '/usr/lib/%' OR path LIKE '/usr/lib64/%')")?;
                     for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<String>>(2)?)))? {
-                        if let Ok((path,kind,link))=r {
-                            if kind=="symlink" {
-                                let host = tmp.join(path.trim_start_matches('/'));
-                                if host.exists() || std::fs::symlink_metadata(&host).is_ok() { continue; }
-                                if let Some(par)=host.parent(){ std::fs::create_dir_all(par)?; }
-                                let target = link.unwrap_or_default();
-                                let _ = std::os::unix::fs::symlink(&target, &host);
-                                // also ensure target file materialized
-                                if let Ok((_,_,content,_,_)) = selfdb::vm::vm_resolve(&c, &path) {
-                                    if let Some(_d)=content {
-                                        // materialize resolved target at its real path if missing
-                                        // vm_resolve already guarantees file exists at resolved path, ensure it is present on host
-                                        // find resolved path by re-querying
-                                    }
-                                }
-                            } else {
-                                all_libs.push(path);
-                            }
+                        let (path,kind,link)=r?;
+                        if kind=="symlink" {
+                            let host = tmp.join(path.trim_start_matches('/'));
+                            if host.exists() || std::fs::symlink_metadata(&host).is_ok() { continue; }
+                            if let Some(par)=host.parent(){ std::fs::create_dir_all(par)?; }
+                            let target = link.unwrap_or_default();
+                            let _ = std::os::unix::fs::symlink(&target, &host);
+                        } else {
+                            all_libs.push(path);
                         }
                     }
                 }
@@ -222,222 +253,96 @@ fn main() -> anyhow::Result<()> {
                     // if entry is symlink, recreate symlink; vm_materialize will resolve and write file, so handle symlink case
                     let kind: Option<String> = c.query_row("SELECT kind FROM vm_fs WHERE path=?1", rusqlite::params![lp.clone()], |r| r.get(0)).ok();
                     if kind.as_deref()==Some("symlink") {
-                        if let Ok(target) = c.query_row("SELECT link_target FROM vm_fs WHERE path=?1", rusqlite::params![lp.clone()], |r| r.get::<_,Option<String>>(0)) {
-                            if let Some(t)=target { let _ = std::os::unix::fs::symlink(&t, &host); continue; }
+                        if let Ok(Some(t)) = c.query_row("SELECT link_target FROM vm_fs WHERE path=?1", rusqlite::params![lp.clone()], |r| r.get::<_,Option<String>>(0)) {
+                            let _ = std::os::unix::fs::symlink(&t, &host); continue;
                         }
                     }
                     let _ = selfdb::vm::vm_materialize(&c, &lp, &host);
                 }
             }
-            let env_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            let vm_ld = format!("{}:{}", tmp.join("usr/lib/x86_64-linux-gnu").to_string_lossy(), tmp.join("lib/x86_64-linux-gnu").to_string_lossy());
-            let merged_ld = if env_ld.is_empty(){ format!("{}:{}", tmp.to_string_lossy(), vm_ld) } else { format!("{}:{}:{}", tmp.to_string_lossy(), vm_ld, env_ld) };
-            let mut args = Vec::new(); args.extend(rest.clone());
-            let exe = std::env::var("SELF_EXEC").unwrap_or_else(|_| "target/release/self-exec".to_string());
-            let is_self = {
-                let mut f=std::fs::File::open(&host_bin).unwrap();
-                use std::io::{Read, Seek, SeekFrom};
-                let mut head=[0u8;16]; let _=f.read_exact(&mut head);
-                let mut appid=[0u8;8]; let _=f.seek(SeekFrom::Start(64));
-                let _=f.read_exact(&mut appid);
-                &appid[4..8]==b"SELF"
-            };
-            // prefer using the ELF interpreter recorded at build-time when available:
-            // musl busybox uses /lib/ld-musl-x86_64.so.1 which we have materialized under tmp.
-            // If interpreter exists in tmp, exec it directly; otherwise try native exec (glibc binaries).
-            let interp: Option<String> = selfdb::elf::parse_elf(&host_bin.to_string_lossy(), true, true).ok().and_then(|info| info.interp);
-            let status = if is_self {
-                let mut cmd=std::process::Command::new(&exe);
-                cmd.arg(host_bin.to_string_lossy().to_string());
-                cmd.args(&args);
-                cmd.env("LD_LIBRARY_PATH", merged_ld);
-                cmd.status().unwrap_or_else(|e| { eprintln!("exec failed: {}: {}", exe, e); std::process::exit(127)})
-            } else if let Some(ip) = interp.clone() {
-                // ip is absolute like /lib/ld-musl-x86_64.so.1; map to tmp/...
-                let ip_host = tmp.join(ip.trim_start_matches('/'));
-                if ip_host.exists() {
-                    // musl ld expects: ld-musl <exe> [args]; also pass --library-path if needed
-                    let mut cmd=std::process::Command::new(&ip_host);
-                    cmd.arg(&host_bin);
-                    cmd.args(&args);
-                    // musl honours LD_LIBRARY_PATH as well; keep merged_ld for any secondary libs
-                    cmd.env("LD_LIBRARY_PATH", merged_ld);
-                    cmd.status().unwrap_or_else(|e| { eprintln!("exec via interp failed: {}: {}", ip_host.display(), e); std::process::exit(127)})
-                } else {
-                    let mut cmd=std::process::Command::new(&host_bin);
-                    cmd.args(&args);
-                    cmd.env("LD_LIBRARY_PATH", merged_ld);
-                    cmd.status().unwrap_or_else(|e| { eprintln!("exec failed: {}: {}", host_bin.to_string_lossy(), e); std::process::exit(127)})
-                }
-            } else {
-                let mut cmd=std::process::Command::new(&host_bin);
-                cmd.args(&args);
-                cmd.env("LD_LIBRARY_PATH", merged_ld);
-                cmd.status().unwrap_or_else(|e| { eprintln!("exec failed: {}: {}", host_bin.to_string_lossy(), e); std::process::exit(127)})
-            };
-            std::process::exit(status.code().unwrap_or(127));
+            // The binary runs in a sandbox rooted at the partial tree: never on the host, where it would
+            // see the host's files, network and environment.
+            let mut argv = vec![vm_path.clone()];
+            argv.extend(rest);
+            let mut spec = selfdb::sandbox::Spec::new(&tmp, argv);
+            spec.interactive = true;
+            spec.limits = sandbox.limits(selfdb::sandbox::Limits::default());
+            let code = selfdb::sandbox::run_interactive(&spec, sandbox.isolation()?)?;
+            // process::exit skips destructors: remove the tree first
+            drop(work);
+            std::process::exit(code);
         },
-        Cmd::VmChroot{db, cmd, rest, persist, ephemeral} => {
+        Cmd::VmChroot{db, cmd, persist, ephemeral, sandbox, rest} => {
             if persist && ephemeral { eprintln!("cannot use both --persist and --ephemeral"); std::process::exit(2); }
-            let effective_persist = persist || !ephemeral;
-            let c=selfdb::vm::vm_open(&db)?;
-            let full_cmd = if cmd.is_empty(){ "/bin/sh".to_string()} else { cmd.clone()};
-            let has_bwrap = std::process::Command::new("bwrap").arg("--help").output().map(|o| o.status.success()).unwrap_or(false);
+            let isolation = sandbox.isolation()?;
+            let c = selfdb::vm::vm_open(&db)?;
+            let mut argv = vec![if cmd.is_empty() { "/bin/sh".to_string() } else { cmd }];
+            argv.extend(rest);
+            // Only what an interactive shell needs crosses into the sandbox. History lives in the VM
+            // (/.ash_history), so it is kept with the VM's other content and discarded by --ephemeral.
+            let mut env: Vec<(String, String)> = vec![("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()), ("HOME".into(), "/".into()),
+                                                      ("PS1".into(), r"vm:\w\$ ".into()), ("HISTFILE".into(), "/.ash_history".into())];
+            if let Ok(term) = std::env::var("TERM") { env.push(("TERM".into(), term)); }
+            let spec_for = |root: &Path| {
+                let mut spec = selfdb::sandbox::Spec::new(root, argv.clone());
+                spec.env = env.clone();
+                spec.interactive = true;
+                spec.limits = sandbox.limits(selfdb::sandbox::Limits::default());
+                spec
+            };
+            // A persistent session over a mount writes to the database as it goes. An ephemeral one never
+            // uses the mount: its writes would reach the database too.
             #[cfg(feature = "fuse")]
             {
-                if std::path::Path::new("/dev/fuse").exists() {
-                    let fuse_tmp = std::env::temp_dir().join(format!("vm-fuse-{}", std::process::id()));
-                    let _ = std::fs::create_dir_all(&fuse_tmp);
-                    // try FUSE: mount db -> fuse_tmp, then bwrap bind /mnt as /
-                    // background mount keeps session alive until child exits
-                    match selfdb::fuse::fuse_impl::mount_vm_background(&db, &fuse_tmp.to_string_lossy()) {
-                        Ok(_bg) => {
-                            eprintln!("-> FUSE {} -> {} (no materialize, SELECT vm_blobs on demand, statfs blocks=sum(blob)/4096)", db, fuse_tmp.display());
-                            // give kernel a moment to establish mount
-                            std::thread::sleep(std::time::Duration::from_millis(80));
-                            let status = if has_bwrap {
-                                eprintln!("-> bwrap --bind {} / (FUSE-backed, host tmpfs not leaked)", fuse_tmp.display());
-                                let mut cmd2 = std::process::Command::new("bwrap");
-                                cmd2.arg("--bind").arg(&fuse_tmp).arg("/").arg("--dev").arg("/dev").arg("--proc").arg("/proc").arg("--unshare-pid");
-                                if effective_persist {
-                                let db_hash = selfdb::vm::path_key(&db);
-                                let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
-                                let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
-                                // FUSE history lives inside fuse mount but also cache for later -- persist after exit via file copy
-                                cmd2.env("HISTFILE", "/.ash_history");
-                                cmd2.env("PS1", r"vm:\w\$ ");
-                                cmd2.env("HOME", "/");
-                                // pre-seed from cache if exists
-                                if hist_cached.exists() { let _ = std::fs::copy(&hist_cached, fuse_tmp.join(".ash_history")); }
-                            }
-                                cmd2.arg(full_cmd.clone()); for a in &rest { cmd2.arg(a); }
-                                cmd2.status().unwrap_or_else(|e| { eprintln!("bwrap over FUSE failed: {}", e); std::process::exit(127)})
-                            } else if std::process::Command::new("unshare").arg("--help").output().map(|o| o.status.success()).unwrap_or(false) {
-                                let mut cmd2 = std::process::Command::new("unshare");
-                                cmd2.arg("--mount").arg("--map-root-user").arg("--root").arg(&fuse_tmp);
-                                if effective_persist { cmd2.env("HISTFILE", "/.ash_history"); cmd2.env("PS1", r"vm:\w\$ "); cmd2.env("HOME", "/"); }
-                                cmd2.arg(full_cmd.clone()); for a in &rest { cmd2.arg(a); }
-                                cmd2.status().unwrap_or_else(|e| { eprintln!("unshare over FUSE failed: {}", e); std::process::exit(127)})
-                            } else {
-                                let mut cmd2 = std::process::Command::new("chroot");
-                                if effective_persist { cmd2.env("HISTFILE", "/.ash_history"); cmd2.env("PS1", r"vm:\w\$ "); cmd2.env("HOME", "/"); }
-                                cmd2.arg(&fuse_tmp).arg(full_cmd.clone()); for a in &rest { cmd2.arg(a); }
-                                cmd2.status().unwrap_or_else(|e| { eprintln!("chroot over FUSE failed: {}", e); std::process::exit(127)})
-                            };
-                            // persist history from fuse mount to cache_dir
-                            if effective_persist {
-                                let db_hash = selfdb::vm::path_key(&db);
-                                let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
-                                let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
-                                let src_hist = fuse_tmp.join(".ash_history");
-                                if src_hist.exists() { let _ = std::fs::copy(&src_hist, &hist_cached); }
-                            }
-                            // bg dropped here -> AutoUnmount; writes already flushed via flush_staged -> vm_blobs
-                            std::process::exit(status.code().unwrap_or(127));
-                        },
-                        Err(e) => {
-                            eprintln!("FUSE mount failed ({}), falling back to materialize+bwrap", e);
-                        }
+                if !ephemeral && Path::new("/dev/fuse").exists() {
+                    let mnt_dir = selfdb::vm::WorkDir::create("vm-fuse-")?;
+                    let mnt = mnt_dir.path().to_path_buf();
+                    let session = selfdb::fuse::fuse_impl::mount_vm_background(&db, &mnt.to_string_lossy());
+                    if let Ok(session) = session {
+                        let code = selfdb::sandbox::run_interactive(&spec_for(&mnt), isolation);
+                        // unmount before the mount point is removed; process::exit skips destructors
+                        drop(session);
+                        drop(mnt_dir);
+                        std::process::exit(code?);
                     }
-                } else {
-                    eprintln!("hint: /dev/fuse missing (no FUSE in this env) -> falling back to materialize. Build `cargo build --release --features fuse` already pure-rust (fuser default-features=false). In a host with /dev/fuse: `self vm-chroot` will mount without writing /tmp (df shows 3.6M not host tmpfs 13G).");
+                    drop(mnt_dir);
+                    eprintln!("FUSE mount failed; using a materialized tree");
                 }
             }
-            #[cfg(not(feature = "fuse"))]
-            {
-                eprintln!("hint: rebuild with --features fuse for zero-materialize: `cargo build --release --features fuse` (pure-rust, no libfuse3-dev)");
-            }
-            // fallback: materialize then bwrap; still auto-persists via vm_sync_from_host + WAL.
-            // The scratch dir is stable per database and reused: materialize only rewrites files
-            // whose size/mtime differ from the DB and prunes entries the DB no longer has, so a
-            // repeat run costs a metadata walk instead of a full copy. Ephemeral runs still remove it.
-            let tmp = {
-                let d = selfdb::vm::cache_dir().join("scratch").join(selfdb::vm::path_key(&db));
-                std::fs::create_dir_all(&d)?;
-                d
+            // A persistent session reuses a stable scratch directory per database: materialize only rewrites
+            // files whose size or mtime differ and prunes entries the database no longer has, so a repeat
+            // run costs a metadata walk. An ephemeral one gets its own directory, removed afterwards.
+            let ephemeral_dir = if ephemeral { Some(selfdb::vm::WorkDir::create("vm-chroot-")?) } else { None };
+            let tmp = match &ephemeral_dir {
+                Some(w) => w.path().to_path_buf(),
+                None => {
+                    let d = selfdb::vm::cache_dir().join("scratch").join(selfdb::vm::path_key(&db));
+                    std::fs::create_dir_all(&d)?;
+                    d
+                }
             };
-            let n=selfdb::vm::vm_materialize_tree(&c, &tmp)?;
-            eprintln!("materialized {} files -> {} (fallback, would be 0 with FUSE)", n, tmp.display());
-            for d in ["proc","sys","dev","tmp"] { let _=std::fs::create_dir_all(tmp.join(d)); }
-            let has_unshare = std::process::Command::new("unshare").arg("--help").output().map(|o| o.status.success()).unwrap_or(false);
-            let db_hash = selfdb::vm::path_key(&db);
-            let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
-            let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
-            // if cached exists, copy to tmp for session, else start fresh
-            if hist_cached.exists() { let _ = std::fs::copy(&hist_cached, tmp.join(".ash_history")); }
-            let hist = tmp.join(".ash_history");
-            let ps1 = r"vm:\w\$ ";
-            let status = if has_bwrap {
-                eprintln!("-> bwrap {}", tmp.display());
-                let mut cmd = std::process::Command::new("bwrap");
-                cmd.arg("--bind").arg(&tmp).arg("/").arg("--dev").arg("/dev").arg("--proc").arg("/proc").arg("--unshare-pid");
-                if effective_persist { cmd.env("HISTFILE", "/.ash_history"); cmd.env("PS1", ps1); cmd.env("HOME", "/"); cmd.env("SELF_VM_PERSIST", "1"); }
-                cmd.arg(full_cmd.clone()); for a in &rest { cmd.arg(a); }
-                cmd.status().unwrap_or_else(|e| { eprintln!("bwrap failed: {}", e); std::process::exit(127)})
-            } else if has_unshare {
-                eprintln!("-> unshare --root {}", tmp.display());
-                let mut cmd = std::process::Command::new("unshare");
-                cmd.arg("--mount").arg("--map-root-user").arg("--root").arg(&tmp);
-                if effective_persist { cmd.env("HISTFILE", "/.ash_history"); cmd.env("PS1", ps1); cmd.env("HOME", "/"); }
-                cmd.arg(full_cmd.clone()); for a in &rest { cmd.arg(a); }
-                let s = cmd.status();
-                match s {
-                    Ok(st) if st.success() || st.code().is_some() => st,
-                    _ => {
-                        let mut cmd2 = std::process::Command::new("unshare");
-                        cmd2.arg("--mount").arg("--map-root-user").arg("sh").arg("-c").arg(format!("chroot {} {} {}", tmp.display(), full_cmd, rest.join(" ")));
-                        cmd2.status().unwrap_or_else(|e| { eprintln!("unshare/chroot failed: {}", e); std::process::exit(127)})
-                    }
-                }
-            } else {
-                eprintln!("-> chroot {}", tmp.display());
-                let mut cmd = std::process::Command::new("chroot");
-                if effective_persist { cmd.env("HISTFILE", "/.ash_history"); cmd.env("PS1", ps1); cmd.env("HOME", "/"); }
-                cmd.arg(&tmp).arg(full_cmd.clone()); for a in &rest { cmd.arg(a); }
-                cmd.status().unwrap_or_else(|e| { eprintln!("chroot failed (need root): {}", e); std::process::exit(127)})
-            };
-            let do_sync = !ephemeral;
-            if do_sync {
-                let sync_res = selfdb::vm::vm_sync_from_host(&c, &tmp);
-                if let Ok((cr,up,del)) = sync_res {
-                    if cr+up+del>0 {
-                        eprintln!("-> sync {} -> {}: +{} ~{} -{} ", tmp.display(), db, cr, up, del);
-                        let _ = selfdb::vm::vm_apply_pragmas(&c);
-                    }
-                }
-            } else {
-                eprintln!("--ephemeral: skip sync back to DB");
-            }
-            // persist history to cache_dir/history/<hash> for next FUSE or persist session
-            if hist.exists() && effective_persist {
-                let db_hash = selfdb::vm::path_key(&db);
-                let hist_cached = selfdb::vm::cache_dir().join("history").join(&db_hash).join(".ash_history");
-                let _ = std::fs::create_dir_all(hist_cached.parent().unwrap());
-                let _ = std::fs::copy(&hist, &hist_cached);
-                eprintln!("history persisted {} -> {}", hist.display(), hist_cached.display());
-            }
-            if effective_persist {
-                eprintln!("--persist: keep {} (history at {}/.ash_history also cached at {})", tmp.display(), tmp.display(), selfdb::vm::cache_dir().join("history").join(selfdb::vm::path_key(&db)).join(".ash_history").display());
-            }
+            selfdb::vm::vm_materialize_tree(&c, &tmp)?;
+            let code = selfdb::sandbox::run_interactive(&spec_for(&tmp), isolation);
             if ephemeral {
-                let _ = std::fs::remove_dir_all(&tmp);
-                eprintln!("--ephemeral: removed {}", tmp.display());
+                // process::exit skips destructors
+                drop(ephemeral_dir);
+            } else {
+                let (cr, up, del) = selfdb::vm::vm_sync_from_host(&c, &tmp)?;
+                if cr + up + del > 0 { eprintln!("-> sync {} -> {}: +{} ~{} -{}", tmp.display(), db, cr, up, del); }
             }
-            std::process::exit(status.code().unwrap_or(127));
+            std::process::exit(code?);
         },
         Cmd::VmResolve{db, vm_path} => {
             let c=selfdb::vm::vm_open(&db)?;
             match selfdb::vm::vm_resolve(&c, &vm_path) {
-                Ok((real, kind, content, link, mode)) => {
-                    println!("resolve {} -> {} (kind={} mode={:o} link={:?} size={})", vm_path, real, kind, mode, link, content.as_ref().map(|v| v.len()).unwrap_or(0));
-                    if let Some(t) = link { println!("  symlink -> {}", t); }
-                    if kind=="symlink" { println!("  (symlink hops resolved via 40-step vm_resolve)"); }
+                Ok(r) => {
+                    println!("resolve {} -> {} (kind={} mode={:o} size={})", vm_path, r.path, r.kind, r.mode, r.content.as_ref().map(|v| v.len()).unwrap_or(0));
                 },
                 Err(e) => { eprintln!("vm-resolve {}: {}", vm_path, e); std::process::exit(1); }
             }
         },
         Cmd::VmCheckpoint{db, name, note} => { let c=selfdb::vm::vm_open(&db)?; selfdb::vm::vm_checkpoint(&c, &name, &note)?; println!("checkpoint {} @ {}", name, db); },
-        Cmd::VmSnapshots{db} => { let c=selfdb::vm::vm_open(&db)?; for (id,name,ts,pc,bytes,note) in selfdb::vm::vm_list_snapshots(&c)? { println!("[{}] {} ts={} pc={} bytes={} note={}", id, name, ts, pc, bytes, note);} },
+        Cmd::VmSnapshots{db} => { let c=selfdb::vm::vm_open(&db)?; for s in selfdb::vm::vm_list_snapshots(&c)? { println!("[{}] {} ts={} pc={} bytes={} note={}", s.id, s.name, s.created_at, s.page_count, s.bytes, s.note);} },
         Cmd::VmRechunk{db} => { let c=selfdb::vm::vm_open(&db)?; let (done,skipped,failed)=selfdb::vm::vm_rechunk(&c)?; println!("rechunk {}: rechunked={} already_chunked={} failed={}", db, done, skipped, failed); if failed>0 { anyhow::bail!("{} files failed to rechunk", failed); } },
         Cmd::VmVerify{db, deep} => { let c=selfdb::vm::vm_open(&db)?; println!("{}", selfdb::vm::vm_verify(&c, deep)?); },
         Cmd::VmExtract{db, vm_path, out} => { let c=selfdb::vm::vm_open(&db)?; let data=selfdb::vm::vm_cat(&c, &vm_path)?; std::fs::write(&out, &data)?; println!("extract {} -> {} ({} bytes)", vm_path, out, data.len()); },
@@ -514,11 +419,12 @@ fn main() -> anyhow::Result<()> {
             selfdb::vm::snapshot_restore(&c, &name)?;
             println!("rolled back to {}", name);
         },
-        Cmd::VmAgent{db, timeout, rollback_on_fail, model_base, key_env, model, port, max_output, mem_mb, cpu_secs, file_mb, base, fuse, allow_hosts, task} => {
+        Cmd::VmAgent{db, timeout, rollback_on_fail, model_base, key_env, model, port, max_output, sandbox, base, fuse, allow_hosts, task} => {
             let opts = selfdb::agent::AgentOptions {
                 rollback_on_fail, timeout_secs: timeout, max_output_bytes: max_output,
                 model_base, key_env, model, forward_port: port, task,
-                limits: selfdb::agent::Limits { address_space_mb: mem_mb, cpu_secs, file_size_mb: file_mb, processes: 0 },
+                limits: sandbox.limits(selfdb::agent::agent_limits()),
+                isolation: sandbox.isolation()?,
                 base: base.map(std::path::PathBuf::from),
                 fuse,
                 allow_hosts: allow_hosts.split(',').map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).collect(),
@@ -534,9 +440,9 @@ fn main() -> anyhow::Result<()> {
             std::io::stdout().write_all(&r.stdout)?;
             std::io::stderr().write_all(&r.stderr)?;
             if r.stdout_truncated || r.stderr_truncated { eprintln!("output truncated at {} bytes", max_output); }
-            eprintln!("agent step {}: exit={} timed_out={} rolled_back={} created={} modified={} deleted={} ({} ms)",
+            eprintln!("agent step {}: exit={} timed_out={} rolled_back={} created={} modified={} deleted={} ({} ms, model {} ms over {} requests)",
                 r.step_id, r.exit_code, r.timed_out, r.rolled_back,
-                r.changes.created.len(), r.changes.modified.len(), r.changes.deleted.len(), r.duration_ms);
+                r.changes.created.len(), r.changes.modified.len(), r.changes.deleted.len(), r.duration_ms, r.model_ms, r.model_requests);
             std::process::exit(r.exit_code);
         }
         Cmd::VmProxy{base, key_env, socket, port, forwarder, allow_hosts} => {
@@ -573,7 +479,7 @@ fn main() -> anyhow::Result<()> {
             if node.as_os_str().is_empty() || !node.exists() { eprintln!("node not found; pass --node <path>"); std::process::exit(2); }
             if !pi.exists() { eprintln!("pi not found at {}; pass --pi <dir>", pi.display()); std::process::exit(2); }
             let r = selfdb::agent::provision_agent_with(std::path::Path::new(&db), &node, &pi, tool_set)?;
-            println!("provisioned {}: node {} ({} objects), pi at /opt/pi ({} files)", db, r.node, r.objects, r.files);
+            println!("provisioned {}: node {} ({} objects), pi at /opt/pi ({} entries), tool data ({} entries)", db, r.node, r.objects, r.files, r.tool_files);
             println!("run it with: vm-agent {} -- \"<task>\"", db);
         }
         Cmd::VmInject{target, package} => {
@@ -629,8 +535,9 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::VmStep{db, timeout, rollback_on_fail, max_output, argv} => {
-            let opts = selfdb::agent::StepOptions{ rollback_on_fail, timeout_secs: timeout, max_output_bytes: max_output };
+        Cmd::VmStep{db, timeout, rollback_on_fail, max_output, sandbox, argv} => {
+            let opts = selfdb::agent::StepOptions{ rollback_on_fail, timeout_secs: timeout, max_output_bytes: max_output,
+                limits: sandbox.limits(selfdb::sandbox::Limits::default()), isolation: sandbox.isolation()? };
             let r = selfdb::agent::run_step(std::path::Path::new(&db), &argv, &opts)?;
             use std::io::Write;
             std::io::stdout().write_all(&r.stdout)?;
@@ -840,10 +747,10 @@ fn selfdb_scan(db: &str, dir: &str) -> anyhow::Result<()> {
     let mut next_id: i64 = conn.query_row("SELECT max(id) FROM objects", [], |r| r.get::<_,Option<i64>>(0)).unwrap_or(None).unwrap_or(0)+1;
     for exe in &exes {
         let rp=exe.clone();
-        if !seen.contains_key(&rp) {
-            let son=selfdb::elf::soname_for_path_cached(&rp, &mut meta_cache);
-            conn.execute("INSERT INTO objects VALUES (?1,?2,?3,?4,?5)", rusqlite::params![next_id, rp.to_string_lossy().to_string(), son, "exe", 1])?;
-            seen.insert(rp, next_id); next_id+=1;
+        if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(rp) {
+            let son=selfdb::elf::soname_for_path_cached(slot.key(), &mut meta_cache);
+            conn.execute("INSERT INTO objects VALUES (?1,?2,?3,?4,?5)", rusqlite::params![next_id, slot.key().to_string_lossy().to_string(), son, "exe", 1])?;
+            slot.insert(next_id); next_id+=1;
         }
     }
     let mut queue: Vec<PathBuf> = seen.keys().cloned().collect();
@@ -900,7 +807,7 @@ enum PolicyAction {
 
 /// Dispatch to the FUSE path when the binary was built with it, with a clear error otherwise.
 fn run_fused(db: &std::path::Path, opts: &selfdb::agent::AgentOptions) -> anyhow::Result<selfdb::agent::StepResult> {
-    #[cfg(feature = "fuse")] { return selfdb::agent::run_agent_fused(db, opts); }
+    #[cfg(feature = "fuse")] { selfdb::agent::run_agent_fused(db, opts)}
     #[cfg(not(feature = "fuse"))] {
         let _ = (db, opts);
         anyhow::bail!("--fuse needs a binary built with --features fuse")

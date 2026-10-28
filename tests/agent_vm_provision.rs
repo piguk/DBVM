@@ -56,7 +56,7 @@ fn node_and_pi_run_inside_the_vm() {
 
     let rep = agent::provision_agent(&db, &node, &pi).unwrap();
     assert!(rep.objects > 0, "node's library closure was imported");
-    assert!(rep.files > 1000, "pi tree was packed, got {} files", rep.files);
+    assert!(rep.files > 1000, "pi tree was packed, got {} entries", rep.files);
 
     // the database stays consistent and compressed
     let c = vm::vm_open(db.to_str().unwrap()).unwrap();

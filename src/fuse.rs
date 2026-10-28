@@ -4,32 +4,70 @@ pub mod fuse_impl {
     use anyhow::Result;
     use fuser::{FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, KernelConfig};
     use rusqlite::params;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::ffi::OsStr;
     use std::path::Path;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use std::os::raw::c_int;
 
-    use crate::vm::{vm_open, vm_add_bytes, vm_add_dir, vm_add_symlink, normalize_vm_path, now_secs};
+    use crate::vm::{vm_open, vm_add_bytes, vm_add_dir, vm_add_symlink, normalize_vm_path, now_secs, ChunkCache};
 
     const TTL: Duration = Duration::from_secs(1);
     const BLOCK_SIZE: u32 = 4096;
+    const ROOT: u64 = 1;
+    /// Decoded chunks kept by a mount: 1024 × 64 KiB = 64 MiB at most.
+    const CHUNK_CACHE_CHUNKS: usize = 1024;
+    /// `open` reply flag: keep the kernel's page cache for the file across opens. Every write to the
+    /// mount goes through this process and the kernel's cache, so the cache cannot hold stale data.
+    const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+
+    /// One entry of the mounted tree.
+    struct Node {
+        /// The row in vm_fs.
+        db_path: String,
+        /// The path the kernel reaches for this inode, which differs from `db_path` when an ancestor is
+        /// a symlink (/bin/sh is reached as usr/bin/sh). Relative link targets must be computed from
+        /// this one, or they point outside the tree.
+        view: String,
+        attr: FileAttr,
+        parent: u64,
+        /// Directory entries by name; empty for files and links.
+        children: BTreeMap<String, u64>,
+    }
 
     pub struct VmFuse {
         /// One connection per mount; fuser dispatches Filesystem callbacks on a single thread.
         conn: rusqlite::Connection,
-        ino_to_path: HashMap<u64, String>,
-        /// The path the kernel reaches for this inode, which differs from the database path when an
-        /// ancestor is a symlink (/bin/sh is reached as usr/bin/sh). Relative link targets must be
-        /// computed from this one, or they point outside the tree.
-        ino_to_view: HashMap<u64, String>,
-        path_to_ino: HashMap<String, u64>,
-        ino_to_kind: HashMap<u64, String>,
-        ino_to_attr: HashMap<u64, FileAttr>,
+        /// Every operation finds its entry through `nodes` and a directory's `children`, so a lookup,
+        /// listing or rmdir costs the size of that directory. Scanning every path instead made a
+        /// `find` over 30k entries take 39 s (measured).
+        nodes: HashMap<u64, Node>,
         next_ino: u64,
         /// The identity every node reports: the mounting process (see owner.rs).
         owner: crate::owner::Owner,
+        chunks: ChunkCache,
     }
+
+    fn join(dir: &str, name: &str) -> String {
+        if dir == "/" { format!("/{}", name) } else { format!("{}/{}", dir, name) }
+    }
+
+    fn file_name(p: &str) -> String {
+        Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+    }
+
+    fn parent_of(p: &str) -> String {
+        normalize_vm_path(&Path::new(p).parent().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| "/".into()))
+    }
+
+    fn system_time(secs: i64) -> SystemTime { UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64) }
+
+    /// errno for a failed database write: a policy refusal is EACCES, anything else is EIO.
+    fn write_errno(e: &anyhow::Error) -> c_int {
+        if crate::policy::is_refusal(e) { libc::EACCES } else { libc::EIO }
+    }
+
+    fn sql_errno(e: &rusqlite::Error) -> c_int { write_errno(&anyhow::anyhow!(e.to_string())) }
 
     impl VmFuse {
         pub fn new(db_path: String) -> Result<Self> {
@@ -37,288 +75,265 @@ pub mod fuse_impl {
             let mut fs = Self {
                 owner: crate::owner::Owner::of_current_process(),
                 conn,
-                ino_to_path: HashMap::new(),
-                ino_to_view: HashMap::new(),
-                path_to_ino: HashMap::new(),
-                ino_to_kind: HashMap::new(),
-                ino_to_attr: HashMap::new(),
-                next_ino: 2,
+                nodes: HashMap::new(),
+                next_ino: ROOT + 1,
+                chunks: ChunkCache::new(CHUNK_CACHE_CHUNKS),
             };
             fs.rebuild()?;
             Ok(fs)
         }
 
-        /// errno for a failed database write: a policy refusal is EACCES, anything else is EIO.
-        fn write_errno(e: &dyn std::error::Error) -> c_int {
-            if crate::policy::is_refusal(&anyhow::anyhow!(e.to_string())) { libc::EACCES } else { libc::EIO }
-        }
-
-        fn rebuild(&mut self) -> Result<()> {
-            self.ino_to_path.clear();
-            self.ino_to_view.clear();
-            self.path_to_ino.clear();
-            self.ino_to_kind.clear();
-            self.ino_to_attr.clear();
-            // root
-            let root_attr = FileAttr {
-                ino: 1,
-                size: 4096,
-                blocks: 8,
-                atime: UNIX_EPOCH,
-                mtime: UNIX_EPOCH,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
-                kind: FileType::Directory,
-                perm: 0o755,
-                nlink: 2,
+        fn attr(&self, ino: u64, kind: FileType, perm: u16, size: u64, mtime: SystemTime) -> FileAttr {
+            FileAttr {
+                ino,
+                size,
+                blocks: if kind == FileType::Directory { 8 } else { size.div_ceil(512) },
+                atime: mtime,
+                mtime,
+                ctime: mtime,
+                crtime: mtime,
+                kind,
+                perm,
+                nlink: if kind == FileType::Directory { 2 } else { 1 },
                 uid: self.owner.uid,
                 gid: self.owner.gid,
                 rdev: 0,
                 blksize: BLOCK_SIZE,
                 flags: 0,
-            };
-            self.ino_to_path.insert(1, "/".to_string());
-            self.ino_to_view.insert(1, "/".to_string());
-            self.path_to_ino.insert("/".to_string(), 1);
-            self.ino_to_kind.insert(1, "dir".to_string());
-            self.ino_to_attr.insert(1, root_attr);
+            }
+        }
 
-            let conn = &self.conn;
+        fn rebuild(&mut self) -> Result<()> {
+            self.nodes.clear();
+            self.next_ino = ROOT + 1;
+            let root_attr = self.attr(ROOT, FileType::Directory, 0o755, 4096, UNIX_EPOCH);
+            self.nodes.insert(ROOT, Node { db_path: "/".into(), view: "/".into(), attr: root_attr, parent: ROOT, children: BTreeMap::new() });
+
             // A path whose parent is a symlink is not reachable at its literal path: /bin is a link to
             // /usr/bin, so a child of /bin lives at usr/bin inside the mounted tree. Registering the
             // literal path made such entries invisible (measured: /bin/sh could not be listed or read at
             // all). Every entry is therefore registered under the path the kernel would reach, and the
-            // database path stays in ino_to_path for reads and writes.
-            let link_map: std::collections::HashMap<String, String> = {
-                let mut m = std::collections::HashMap::new();
-                let mut ls = conn.prepare("SELECT path, link_target FROM vm_fs WHERE kind='symlink'")?;
-                for r in ls.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
-                    let (p, t): (String, String) = r?; m.insert(normalize_vm_path(&p), t);
-                }
-                m
+            // database path is kept for reads and writes.
+            let link_map: HashMap<String, String> = {
+                let mut ls = self.conn.prepare("SELECT path, link_target FROM vm_fs WHERE kind='symlink'")?;
+                let rows = ls.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                rows.map(|r| r.map(|(p, t)| (normalize_vm_path(&p), t))).collect::<rusqlite::Result<_>>()?
             };
             let view_of = |p: &str| -> String {
                 match crate::vm::resolve_parent_in_vm(p, &link_map) {
-                    Some(pv) => {
-                        let name = std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        normalize_vm_path(&format!("{}/{}", pv.trim_end_matches('/'), name))
-                    }
+                    Some(pv) => normalize_vm_path(&format!("{}/{}", pv.trim_end_matches('/'), file_name(p))),
                     None => p.to_string(),
                 }
             };
-            let real_paths: std::collections::HashSet<String> = {
-                let mut st = conn.prepare("SELECT path FROM vm_fs WHERE kind <> 'symlink'")?;
+            let real_paths: HashSet<String> = {
+                let mut st = self.conn.prepare("SELECT path FROM vm_fs WHERE kind <> 'symlink'")?;
                 let rows = st.query_map([], |r| r.get::<_, String>(0))?;
-                let mut set = std::collections::HashSet::new();
-                for r in rows { set.insert(normalize_vm_path(&r?)); }
-                set
+                rows.map(|r| r.map(|p| normalize_vm_path(&p))).collect::<rusqlite::Result<_>>()?
             };
-            // uid/gid are read only to be passed to Owner::for_node, which ignores them (see owner.rs)
-            let mut stmt = conn.prepare("SELECT path, kind, mode, size, mtime, uid, gid, link_target, compressed FROM vm_fs ORDER BY length(path), path")?;
-            let rows = stmt.query_map([], |r| Ok((
-                r.get::<_,String>(0)?,
-                r.get::<_,String>(1)?,
-                r.get::<_,i64>(2)?,
-                r.get::<_,i64>(3)?,
-                r.get::<_,i64>(4)?,
-                r.get::<_,i64>(5)?,
-                r.get::<_,i64>(6)?,
-                r.get::<_,Option<String>>(7)?,
-                r.get::<_,Option<i64>>(8)?,
-            )))?;
-            for row in rows {
-                let (path, kind, mode, size, mtime, stored_uid, stored_gid, link_target, _comp) = row?;
+            // uid/gid are not read: Owner reports the mounting process for every node (see owner.rs)
+            let rows: Vec<(String, String, i64, i64, i64, Option<String>)> = {
+                let mut st = self.conn.prepare("SELECT path, kind, mode, size, mtime, link_target FROM vm_fs ORDER BY length(path), path")?;
+                let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut by_view: HashMap<String, u64> = HashMap::from([("/".to_string(), ROOT)]);
+            for (path, kind, mode, size, mtime, link_target) in rows {
                 let norm = normalize_vm_path(&path);
-                if norm == "/" { 
-                    // update root mtime if needed but keep ino 1
-                    if let Some(attr) = self.ino_to_attr.get_mut(&1) {
-                        let t = UNIX_EPOCH + Duration::from_secs(mtime as u64);
-                        attr.mtime = t;
-                        attr.ctime = t;
-                        attr.atime = t;
+                if norm == "/" {
+                    if let Some(root) = self.nodes.get_mut(&ROOT) {
+                        let t = system_time(mtime);
+                        root.attr.mtime = t; root.attr.ctime = t; root.attr.atime = t;
                     }
                     continue;
                 }
                 // an alias link pointing at a real entry has no room in the tree; the real entry serves it
                 let view = view_of(&norm);
                 if view != norm && real_paths.contains(&view) { continue; }
-                if self.path_to_ino.contains_key(&view) { continue; }
-                let ino = self.next_ino;
-                self.next_ino += 1;
-                self.path_to_ino.insert(view.clone(), ino);
-                self.ino_to_path.insert(ino, norm.clone());
-                self.ino_to_view.insert(ino, view.clone());
-                self.ino_to_kind.insert(ino, kind.clone());
+                if by_view.contains_key(&view) { continue; }
                 let ft = match kind.as_str() {
                     "dir" => FileType::Directory,
                     "symlink" => FileType::Symlink,
                     _ => FileType::RegularFile,
                 };
-                let perm = (mode & 0o7777) as u16;
-                let sz = if kind == "dir" { 4096 } else if kind == "symlink" { link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0) } else { size as u64 };
-                let blocks = if sz == 0 { 0 } else { (sz + 511)/512 };
-                let t = UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64);
-                let nlink = if ft == FileType::Directory { 2 } else { 1 };
-                // directories need parent check but default nlink 2
-                let (node_uid, node_gid) = self.owner.for_node(stored_uid, stored_gid);
-                let attr = FileAttr {
-                    ino,
-                    size: sz,
-                    blocks,
-                    atime: t,
-                    mtime: t,
-                    ctime: t,
-                    crtime: t,
-                    kind: ft,
-                    perm,
-                    nlink,
-                    uid: node_uid,
-                    gid: node_gid,
-                    rdev: 0,
-                    blksize: BLOCK_SIZE,
-                    flags: 0,
+                let sz = match ft {
+                    FileType::Directory => 4096,
+                    FileType::Symlink => link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0),
+                    _ => size as u64,
                 };
-                self.ino_to_attr.insert(ino, attr);
-                // ensure parent dir attrs nlink maybe update but keep simple
+                let ino = self.next_ino;
+                self.next_ino += 1;
+                let attr = self.attr(ino, ft, (mode & 0o7777) as u16, sz, system_time(mtime));
+                by_view.insert(view.clone(), ino);
+                self.nodes.insert(ino, Node { db_path: norm, view, attr, parent: ROOT, children: BTreeMap::new() });
             }
-            // ensure parent dirs missing? vm_fs ensure_parent_dirs should have created them
+            // Parents are linked after every node exists: a view path can be shorter than its parent's
+            // (/bin/sh is viewed as /usr/bin/sh), so the length order above does not put parents first.
+            // An entry whose parent is not in the tree is unreachable, as it was before.
+            let inos: Vec<u64> = self.nodes.keys().copied().filter(|&i| i != ROOT).collect();
+            for ino in inos {
+                let view = self.nodes[&ino].view.clone();
+                match by_view.get(&parent_of(&view)).copied() {
+                    Some(parent) if self.nodes[&parent].attr.kind == FileType::Directory => {
+                        self.nodes.get_mut(&ino).unwrap().parent = parent;
+                        self.nodes.get_mut(&parent).unwrap().children.insert(file_name(&view), ino);
+                    }
+                    _ => { self.nodes.remove(&ino); }
+                }
+            }
             Ok(())
         }
 
-        fn get_parent_ino(&self, ino: u64) -> Option<u64> {
-            let path = self.ino_to_path.get(&ino)?;
-            if path == "/" { return Some(1); }
-            let parent = Path::new(path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or("/".to_string());
-            let parent_norm = normalize_vm_path(&if parent.is_empty() { "/".to_string() } else { parent });
-            self.path_to_ino.get(&parent_norm).copied()
+        /// The child `name` of directory `parent`.
+        fn child(&self, parent: u64, name: &OsStr) -> Option<u64> {
+            self.nodes.get(&parent)?.children.get(name.to_str()?).copied()
         }
 
-        fn ensure_not_exists(&self, parent: u64, name: &OsStr) -> Result<String> {
-            let parent_path = self.ino_to_path.get(&parent).ok_or_else(|| anyhow::anyhow!("parent not found"))?.clone();
-            let n = name.to_string_lossy().to_string();
-            if n.contains('/') || n.is_empty() || n == "." || n == ".." {
-                anyhow::bail!("invalid name");
+        /// Database and view paths for a new entry `name` under directory `parent`, or the errno.
+        fn new_entry_paths(&self, parent: u64, name: &OsStr) -> std::result::Result<(String, String), c_int> {
+            let p = self.nodes.get(&parent).ok_or(libc::ENOENT)?;
+            if p.attr.kind != FileType::Directory { return Err(libc::ENOTDIR); }
+            let n = name.to_str().ok_or(libc::EINVAL)?;
+            if n.is_empty() || n.contains('/') || n == "." || n == ".." { return Err(libc::EINVAL); }
+            if p.children.contains_key(n) { return Err(libc::EEXIST); }
+            Ok((join(&p.db_path, n), join(&p.view, n)))
+        }
+
+        /// Register a created entry under `parent` and return its attributes.
+        fn add_node(&mut self, parent: u64, db_path: String, view: String, kind: FileType, perm: u16, size: u64) -> FileAttr {
+            let ino = self.next_ino;
+            self.next_ino += 1;
+            let attr = self.attr(ino, kind, perm, size, SystemTime::now());
+            self.nodes.get_mut(&parent).unwrap().children.insert(file_name(&view), ino);
+            self.nodes.insert(ino, Node { db_path, view, attr, parent, children: BTreeMap::new() });
+            attr
+        }
+
+        /// Drop `ino` and everything under it from the tree.
+        fn remove_node(&mut self, ino: u64) {
+            let Some(node) = self.nodes.remove(&ino) else { return };
+            if let Some(p) = self.nodes.get_mut(&node.parent) { p.children.remove(&file_name(&node.view)); }
+            let mut stack: Vec<u64> = node.children.into_values().collect();
+            while let Some(i) = stack.pop() {
+                if let Some(n) = self.nodes.remove(&i) { stack.extend(n.children.into_values()); }
             }
-            let new_path = if parent_path == "/" { format!("/{}", n) } else { format!("{}/{}", parent_path, n) };
-            let norm = normalize_vm_path(&new_path);
-            if self.path_to_ino.contains_key(&norm) {
-                anyhow::bail!("exists");
+        }
+
+        /// Set a regular file's size through the database and in the cached attributes.
+        fn truncate_node(&mut self, ino: u64, size: u64) -> std::result::Result<(), c_int> {
+            let path = self.nodes.get(&ino).ok_or(libc::ENOENT)?.db_path.clone();
+            if let Err(e) = crate::vm::truncate_range_deferred(&self.conn, &path, size, now_secs(), Some(&self.chunks)) {
+                if !crate::policy::is_refusal(&e) { eprintln!("vm-fuse truncate {}: {}", path, e); }
+                return Err(write_errno(&e));
             }
-            Ok(norm)
+            let a = &mut self.nodes.get_mut(&ino).unwrap().attr;
+            a.size = size;
+            a.blocks = size.div_ceil(512);
+            a.mtime = SystemTime::now();
+            a.ctime = a.mtime;
+            Ok(())
+        }
+
+        /// `ino` and its descendants, parents before children.
+        fn subtree(&self, ino: u64) -> Vec<u64> {
+            let mut out = vec![ino];
+            let mut i = 0;
+            while i < out.len() {
+                if let Some(n) = self.nodes.get(&out[i]) { out.extend(n.children.values().copied()); }
+                i += 1;
+            }
+            out
         }
     }
 
     impl Filesystem for VmFuse {
-        fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::result::Result<(), c_int> {
-            // Announce the atomic-create capability. Without it the kernel does not deliver O_EXCL creates
-            // to `create` and reports an I/O error instead (measured: node's `flag: 'wx'` failed while
-            // 'w'/'a' succeeded, and `create` was never called). pi opens its session file that way.
-            if let Err(e) = _config.add_capabilities(1 << 3 /* FUSE_ATOMIC_O_TRUNC */) {
+        fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::result::Result<(), c_int> {
+            // FUSE_ATOMIC_O_TRUNC: O_TRUNC is applied by `open` and `create` (see there) instead of a
+            // separate truncate from the kernel, so an overwrite is one request.
+            if let Err(e) = config.add_capabilities(1 << 3 /* FUSE_ATOMIC_O_TRUNC */) {
                 eprintln!("vm-fuse: FUSE_ATOMIC_O_TRUNC not accepted: {}", e);
             }
             Ok(())
         }
         fn destroy(&mut self) {
-            // nothing is buffered: every write already reached the database
+            // Every write already reached the database. Writes defer the whole-file hash (see vm_dirty);
+            // computing the pending ones now leaves the database complete after an unmount. A failure
+            // keeps them in vm_dirty for the next reader of hashes.
+            if let Err(e) = crate::vm::finalize_dirty(&self.conn) { eprintln!("vm-fuse: pending hashes not finalized: {}", e); }
         }
         fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-            let parent_path = match self.ino_to_path.get(&parent) {
-                Some(p) => p.clone(),
-                None => { reply.error(libc::ENOENT); return; }
-            };
-            let n = name.to_string_lossy().to_string();
-            let child_path = if parent_path == "/" { format!("/{}", n) } else { format!("{}/{}", parent_path, n) };
-            let norm = normalize_vm_path(&child_path);
-            if let Some(&ino) = self.path_to_ino.get(&norm) {
-                if let Some(attr) = self.ino_to_attr.get(&ino) {
-                    reply.entry(&TTL, attr, 0);
-                    return;
-                }
+            match self.child(parent, name).and_then(|ino| self.nodes.get(&ino)) {
+                Some(n) => reply.entry(&TTL, &n.attr, 0),
+                None => reply.error(libc::ENOENT),
             }
-            reply.error(libc::ENOENT);
         }
         fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-            if let Some(attr) = self.ino_to_attr.get(&ino) {
-                reply.attr(&TTL, attr);
-            } else {
-                reply.error(libc::ENOENT);
+            match self.nodes.get(&ino) {
+                Some(n) => reply.attr(&TTL, &n.attr),
+                None => reply.error(libc::ENOENT),
             }
         }
         fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
-            let path = match self.ino_to_path.get(&ino) {
-                Some(p) => p.clone(),
-                None => { reply.error(libc::ENOENT); return; }
-            };
-            let conn = &self.conn;
-            let target: Result<String, _> = conn.prepare_cached("SELECT link_target FROM vm_fs WHERE path=?1").and_then(|mut st| st.query_row(params![path], |r| r.get(0)));
+            let Some(n) = self.nodes.get(&ino) else { reply.error(libc::ENOENT); return };
+            let target: rusqlite::Result<String> = self.conn.prepare_cached("SELECT link_target FROM vm_fs WHERE path=?1")
+                .and_then(|mut st| st.query_row(params![n.db_path], |r| r.get(0)));
             match target {
                 // the stored target is unchanged; the mount shows absolute targets as paths that stay
                 // inside the mount (see owner::mount_link_text)
-                Ok(t) => {
-                    let view = self.ino_to_view.get(&ino).cloned().unwrap_or_else(|| path.clone());
-                    reply.data(crate::owner::mount_link_text(&view, &t).as_bytes())
-                }
+                Ok(t) => reply.data(crate::owner::mount_link_text(&n.view, &t).as_bytes()),
                 Err(_) => reply.error(libc::ENOENT),
             }
         }
-        fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-            if self.ino_to_attr.contains_key(&ino) {
-                // check kind is file?
-                let kind = self.ino_to_kind.get(&ino).map(|s| s.as_str()).unwrap_or("file");
-                if kind == "dir" {
-                    reply.error(libc::EISDIR);
-                } else {
-                    reply.opened(0, 0);
+        fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+            match self.nodes.get(&ino).map(|n| n.attr.kind) {
+                None => reply.error(libc::ENOENT),
+                Some(FileType::Directory) => reply.error(libc::EISDIR),
+                Some(kind) => {
+                    // With FUSE_ATOMIC_O_TRUNC (announced in init) the kernel leaves O_TRUNC to the open
+                    // and sends no truncate of its own. Ignoring it left the old tail behind on every
+                    // overwrite: `echo hi > f` over "hello world\n" gave "hi\nlo world\n" (measured).
+                    if flags & libc::O_TRUNC != 0 && kind == FileType::RegularFile {
+                        if let Err(e) = self.truncate_node(ino, 0) { reply.error(e); return; }
+                    }
+                    // Without KEEP_CACHE the kernel dropped the file's pages on every open, so a second
+                    // read of a tree was as slow as the first (measured).
+                    reply.opened(0, FOPEN_KEEP_CACHE)
                 }
-            } else {
-                reply.error(libc::ENOENT);
             }
         }
         fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
             if offset < 0 { reply.error(libc::EINVAL); return; }
-            let path = match self.ino_to_path.get(&ino) {
-                Some(p) => p.clone(),
-                None => { reply.error(libc::ENOENT); return; }
-            };
-            let kind = self.ino_to_kind.get(&ino).map(|s| s.as_str()).unwrap_or("");
-            if kind == "dir" { reply.error(libc::EISDIR); return; }
-            if kind == "symlink" { reply.error(libc::EINVAL); return; }
-            match crate::vm::read_range(&self.conn, &path, offset as u64, size as usize) {
+            let Some(n) = self.nodes.get(&ino) else { reply.error(libc::ENOENT); return };
+            match n.attr.kind {
+                FileType::Directory => { reply.error(libc::EISDIR); return; }
+                FileType::Symlink => { reply.error(libc::EINVAL); return; }
+                _ => {}
+            }
+            match crate::vm::read_range_cached(&self.conn, &n.db_path, offset as u64, size as usize, Some(&self.chunks)) {
                 Ok(bytes) => reply.data(&bytes),
-                Err(e) => { eprintln!("vm-fuse read {}: {}", path, e); reply.error(libc::EIO) },
+                Err(e) => { eprintln!("vm-fuse read {}: {}", n.db_path, e); reply.error(libc::EIO) },
             }
         }
         fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
             if offset < 0 { reply.error(libc::EINVAL); return; }
-            let path = match self.ino_to_path.get(&ino) { Some(p) => p.clone(), None => { reply.error(libc::ENOENT); return; } };
-            let kind = self.ino_to_kind.get(&ino).map(|s| s.as_str()).unwrap_or("file").to_string();
-            if kind == "dir" { reply.error(libc::EISDIR); return; }
-            // Only the 64 KiB chunks this write touches are rewritten. A failed write is reported as
-            // EIO, never as success: the file is left unchanged by write_range.
-            let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-            if let Err(e) = crate::vm::write_range(&self.conn, &path, offset as u64, data, mtime) {
-                // a write the policy forbids is EACCES, the answer a user expects; anything else is EIO
-                if crate::policy::is_refusal(&e) {
-                    reply.error(libc::EACCES);
-                } else {
-                    eprintln!("vm-fuse write {}: {}", path, e);
-                    reply.error(libc::EIO);
-                }
+            let Some(n) = self.nodes.get(&ino) else { reply.error(libc::ENOENT); return };
+            if n.attr.kind == FileType::Directory { reply.error(libc::EISDIR); return; }
+            let path = n.db_path.clone();
+            // Only the 64 KiB chunks this write touches are rewritten, and the whole-file hash is
+            // deferred (see vm_dirty). A failed write is reported, never as success: write_range leaves
+            // the file unchanged.
+            let mtime = now_secs();
+            if let Err(e) = crate::vm::write_range_deferred(&self.conn, &path, offset as u64, data, mtime, Some(&self.chunks)) {
+                if !crate::policy::is_refusal(&e) { eprintln!("vm-fuse write {}: {}", path, e); }
+                reply.error(write_errno(&e));
                 return;
             }
-            // refresh the cached attributes from the stored row
-            if let Ok((size, mt)) = self.conn.query_row("SELECT size, mtime FROM vm_fs WHERE path=?1", params![path], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
-                if let Some(a) = self.ino_to_attr.get_mut(&ino) {
-                    a.size = size as u64;
-                    a.blocks = if size == 0 { 0 } else { (size as u64 + 511) / 512 };
-                    let t = UNIX_EPOCH + Duration::from_secs(mt as u64);
-                    a.mtime = t;
-                    a.ctime = t;
-                }
-            }
+            let a = &mut self.nodes.get_mut(&ino).unwrap().attr;
+            a.size = a.size.max(offset as u64 + data.len() as u64);
+            a.blocks = a.size.div_ceil(512);
+            a.mtime = system_time(mtime);
+            a.ctime = a.mtime;
             reply.written(data.len() as u32);
         }
-
         fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock: u64, reply: ReplyEmpty) {
             reply.ok();
         }
@@ -329,49 +344,20 @@ pub mod fuse_impl {
             reply.ok();
         }
         fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-            if self.ino_to_attr.get(&ino).map(|a| a.kind) == Some(FileType::Directory) {
+            if self.nodes.get(&ino).map(|n| n.attr.kind) == Some(FileType::Directory) {
                 reply.opened(0, 0);
             } else {
                 reply.error(libc::ENOTDIR);
             }
         }
         fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-            let path = match self.ino_to_path.get(&ino) {
-                Some(p) => p.clone(),
-                None => { reply.error(libc::ENOENT); return; }
-            };
-            let kind = self.ino_to_kind.get(&ino).map(|s| s.as_str()).unwrap_or("");
-            if kind != "dir" && ino != 1 {
-                reply.error(libc::ENOTDIR);
-                return;
-            }
-            let mut entries: Vec<(u64, FileType, String)> = Vec::new();
-            // . and ..
-            entries.push((ino, FileType::Directory, ".".to_string()));
-            let parent_ino = self.get_parent_ino(ino).unwrap_or(1);
-            entries.push((parent_ino, FileType::Directory, "..".to_string()));
-            // children
-            for (p, c_ino) in self.path_to_ino.iter() {
-                if p == "/" { continue; }
-                let parent_p = Path::new(p).parent().map(|pp| pp.to_string_lossy().to_string()).unwrap_or("/".to_string());
-                let parent_norm = normalize_vm_path(&if parent_p.is_empty() { "/".to_string() } else { parent_p });
-                if parent_norm == path {
-                    let k = self.ino_to_kind.get(c_ino).map(|s| s.as_str()).unwrap_or("file");
-                    let ft = match k {
-                        "dir" => FileType::Directory,
-                        "symlink" => FileType::Symlink,
-                        _ => FileType::RegularFile,
-                    };
-                    let name = Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    entries.push((*c_ino, ft, name));
-                }
-            }
-            // sort by name but keep . and .. first
-            let mut tail = entries.split_off(2);
-            tail.sort_by(|a,b| a.2.cmp(&b.2));
-            entries.extend(tail);
-            for (i, (c_ino, ft, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-                if reply.add(c_ino, (i+1) as i64, ft, name) { break; }
+            let Some(n) = self.nodes.get(&ino) else { reply.error(libc::ENOENT); return };
+            if n.attr.kind != FileType::Directory { reply.error(libc::ENOTDIR); return; }
+            // ".", "..", then the children in name order; `offset` is the index of the next entry
+            let dots = [(ino, FileType::Directory, "."), (n.parent, FileType::Directory, "..")];
+            let children = n.children.iter().map(|(name, c)| (*c, self.nodes[c].attr.kind, name.as_str()));
+            for (i, (c_ino, ft, name)) in dots.into_iter().chain(children).enumerate().skip(offset as usize) {
+                if reply.add(c_ino, (i + 1) as i64, ft, name) { break; }
             }
             reply.ok();
         }
@@ -380,284 +366,161 @@ pub mod fuse_impl {
         }
         fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
             // df reports stored blob bytes (compressed), not host tmpfs
-            let (blocks, files) = match Some(&self.conn) {
-                Some(c) => {
-                    let blob_bytes: i64 = c.prepare_cached("SELECT COALESCE(sum(length(content)),0) FROM vm_blobs").and_then(|mut st| st.query_row([], |r| r.get(0))).unwrap_or(0);
-                    let files: i64 = c.prepare_cached("SELECT count(*) FROM vm_fs").and_then(|mut st| st.query_row([], |r| r.get(0))).unwrap_or(0);
-                    ((blob_bytes as u64).div_ceil(BLOCK_SIZE as u64), files as u64)
-                }
-                None => (0, 0),
-            };
-            let bsize = BLOCK_SIZE;
-            reply.statfs(blocks, 0, 0, files, 0, bsize, 255, bsize);
+            let c = &self.conn;
+            let blob_bytes: i64 = c.prepare_cached("SELECT COALESCE(sum(length(content)),0) FROM vm_blobs").and_then(|mut st| st.query_row([], |r| r.get(0))).unwrap_or(0);
+            let files: i64 = c.prepare_cached("SELECT count(*) FROM vm_fs").and_then(|mut st| st.query_row([], |r| r.get(0))).unwrap_or(0);
+            reply.statfs((blob_bytes as u64).div_ceil(BLOCK_SIZE as u64), 0, 0, files as u64, 0, BLOCK_SIZE, 255, BLOCK_SIZE);
         }
         fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
-            // O_CREAT without O_EXCL on an existing file must open it, not fail. pi opens its session file
-            // repeatedly; answering EEXIST made every run fail (measured).
-            if let Err(why) = self.ensure_not_exists(parent, name) {
-                let parent_path = match self.ino_to_path.get(&parent) {
-                    Some(p) => p.clone(),
-                    // the parent inode is unknown: that is missing, not existing
-                    None => { reply.error(libc::ENOENT); return; }
-                };
-                let _ = why;
-                let n = name.to_string_lossy().to_string();
-                let p = normalize_vm_path(&if parent_path == "/" { format!("/{}", n) } else { format!("{}/{}", parent_path, n) });
-                if let Some(&ino) = self.path_to_ino.get(&p) {
-                    if self.ino_to_kind.get(&ino).map(|k| k == "file").unwrap_or(false) {
-                        if let Some(attr) = self.ino_to_attr.get(&ino) { reply.created(&TTL, attr, 0, 0, flags as u32); return; }
-                    }
-                }
-                reply.error(libc::EEXIST);
-                return;
-            }
-            let new_path = match self.ensure_not_exists(parent, name) {
+            let (db_path, view) = match self.new_entry_paths(parent, name) {
                 Ok(p) => p,
-                Err(_) => { reply.error(libc::EEXIST); return; }
+                // O_CREAT without O_EXCL on an existing file must open it, not fail. pi opens its session
+                // file repeatedly; answering EEXIST made every run fail (measured). O_TRUNC applies as in
+                // `open`.
+                Err(libc::EEXIST) => {
+                    let existing = self.child(parent, name).filter(|i| self.nodes[i].attr.kind == FileType::RegularFile);
+                    match existing {
+                        Some(ino) if flags & libc::O_EXCL == 0 => {
+                            if flags & libc::O_TRUNC != 0 {
+                                if let Err(e) = self.truncate_node(ino, 0) { reply.error(e); return; }
+                            }
+                            reply.created(&TTL, &self.nodes[&ino].attr, 0, 0, FOPEN_KEEP_CACHE);
+                        }
+                        _ => reply.error(libc::EEXIST),
+                    }
+                    return;
+                }
+                Err(e) => { reply.error(e); return; }
             };
             let perm = mode & 0o7777;
-            let now = now_secs();
-            let conn = &self.conn;
-            if let Err(e) = vm_add_bytes(&conn, &new_path, &[], perm as i64, now) {
-                eprintln!("vm-fuse create {}: {}", new_path, e);
-                reply.error(if crate::policy::is_refusal(&e) { libc::EACCES } else { libc::EIO });
+            if let Err(e) = vm_add_bytes(&self.conn, &db_path, &[], perm as i64, now_secs()) {
+                eprintln!("vm-fuse create {}: {}", db_path, e);
+                reply.error(write_errno(&e));
                 return;
             }
-            let ino = self.next_ino;
-            self.next_ino += 1;
-            self.path_to_ino.insert(new_path.clone(), ino);
-            self.ino_to_path.insert(ino, new_path);
-            self.ino_to_kind.insert(ino, "file".to_string());
-            let now_sys = UNIX_EPOCH + Duration::from_secs(now as u64);
-            let attr = FileAttr {
-                ino,
-                size: 0,
-                blocks: 0,
-                atime: now_sys,
-                mtime: now_sys,
-                ctime: now_sys,
-                crtime: now_sys,
-                kind: FileType::RegularFile,
-                perm: perm as u16,
-                nlink: 1,
-                uid: self.owner.uid,
-                gid: self.owner.gid,
-                rdev: 0,
-                blksize: BLOCK_SIZE,
-                flags: 0,
-            };
-            self.ino_to_attr.insert(ino, attr);
-            reply.created(&TTL, &attr, 0, ino, flags as u32);
+            let attr = self.add_node(parent, db_path, view, FileType::RegularFile, perm as u16, 0);
+            // The last argument is the reply's FOPEN_* flags, not the open(2) flags. Passing the open flags
+            // set FOPEN_PASSTHROUGH whenever O_EXCL was given (both are bit 7), and the kernel failed the
+            // create with EIO: every `open(..., O_CREAT|O_EXCL)` (cp, tar, node's 'wx') failed (measured).
+            reply.created(&TTL, &attr, 0, 0, FOPEN_KEEP_CACHE);
         }
         fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
-            // mkdir on an existing directory is success (EEXIST only if it is not a directory): pi creates
-            // its session directory on every run.
-            if let Err(why) = self.ensure_not_exists(parent, name) {
-                let parent_path = match self.ino_to_path.get(&parent) {
-                    Some(p) => p.clone(),
-                    // the parent inode is unknown: that is missing, not existing
-                    None => { reply.error(libc::ENOENT); return; }
-                };
-                let _ = why;
-                let n = name.to_string_lossy().to_string();
-                let p = normalize_vm_path(&if parent_path == "/" { format!("/{}", n) } else { format!("{}/{}", parent_path, n) });
-                if let Some(&ino) = self.path_to_ino.get(&p) {
-                    if self.ino_to_kind.get(&ino).map(|k| k == "dir").unwrap_or(false) {
-                        if let Some(attr) = self.ino_to_attr.get(&ino) { reply.entry(&TTL, attr, 0); return; }
-                    }
-                }
-                reply.error(libc::EEXIST);
-                return;
-            }
-            let new_path = match self.ensure_not_exists(parent, name) {
+            let (db_path, view) = match self.new_entry_paths(parent, name) {
                 Ok(p) => p,
-                Err(_) => { reply.error(libc::EEXIST); return; }
+                // mkdir on an existing directory is success (EEXIST only if it is not a directory): pi
+                // creates its session directory on every run.
+                Err(libc::EEXIST) => {
+                    match self.child(parent, name).and_then(|i| self.nodes.get(&i)) {
+                        Some(n) if n.attr.kind == FileType::Directory => reply.entry(&TTL, &n.attr, 0),
+                        _ => reply.error(libc::EEXIST),
+                    }
+                    return;
+                }
+                Err(e) => { reply.error(e); return; }
             };
             let perm = mode & 0o7777;
-            let now = now_secs();
-            let conn = &self.conn;
-            if let Err(_) = vm_add_dir(&conn, &new_path, perm as i64, now) {
-                reply.error(libc::EIO);
+            if let Err(e) = vm_add_dir(&self.conn, &db_path, perm as i64, now_secs()) {
+                reply.error(write_errno(&e));
                 return;
             }
-            let ino = self.next_ino;
-            self.next_ino += 1;
-            self.path_to_ino.insert(new_path.clone(), ino);
-            self.ino_to_path.insert(ino, new_path);
-            self.ino_to_kind.insert(ino, "dir".to_string());
-            let now_sys = UNIX_EPOCH + Duration::from_secs(now as u64);
-            let attr = FileAttr {
-                ino,
-                size: 4096,
-                blocks: 8,
-                atime: now_sys,
-                mtime: now_sys,
-                ctime: now_sys,
-                crtime: now_sys,
-                kind: FileType::Directory,
-                perm: perm as u16,
-                nlink: 2,
-                uid: self.owner.uid,
-                gid: self.owner.gid,
-                rdev: 0,
-                blksize: BLOCK_SIZE,
-                flags: 0,
-            };
-            self.ino_to_attr.insert(ino, attr);
+            let attr = self.add_node(parent, db_path, view, FileType::Directory, perm as u16, 4096);
             reply.entry(&TTL, &attr, 0);
         }
         fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-            let parent_path = match self.ino_to_path.get(&parent) { Some(p)=>p.clone(), None=> {reply.error(libc::ENOENT); return;} };
-            let n = name.to_string_lossy().to_string();
-            let target = if parent_path == "/" { format!("/{}", n) } else { format!("{}/{}", parent_path, n) };
-            let norm = normalize_vm_path(&target);
-            let ino = match self.path_to_ino.get(&norm).copied() { Some(i)=> i, None=> {reply.error(libc::ENOENT); return;} };
-            let kind = self.ino_to_kind.get(&ino).cloned().unwrap_or_default();
-            if kind == "dir" { reply.error(libc::EISDIR); return; }
+            let Some(ino) = self.child(parent, name) else { reply.error(libc::ENOENT); return };
+            let n = &self.nodes[&ino];
+            if n.attr.kind == FileType::Directory { reply.error(libc::EISDIR); return; }
             // DELETE fires vm_fs_hash_del, which releases the blob reference. A refused delete (a policy
             // rule) must be reported and must not touch the in-memory view, or the mount would show the
             // entry as gone while the database still has it.
-            if let Err(e) = self.conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![norm.clone()])) {
-                reply.error(Self::write_errno(&e));
+            if let Err(e) = self.conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![n.db_path])) {
+                reply.error(sql_errno(&e));
                 return;
             }
-            self.path_to_ino.remove(&norm);
-            self.ino_to_path.remove(&ino);
-            self.ino_to_kind.remove(&ino);
-            self.ino_to_attr.remove(&ino);
+            self.remove_node(ino);
             reply.ok();
         }
         fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-            let parent_path = match self.ino_to_path.get(&parent) { Some(p)=>p.clone(), None=> {reply.error(libc::ENOENT); return;} };
-            let n = name.to_string_lossy().to_string();
-            let target = if parent_path == "/" { format!("/{}", n) } else { format!("{}/{}", parent_path, n) };
-            let norm = normalize_vm_path(&target);
-            let ino = match self.path_to_ino.get(&norm).copied() { Some(i)=> i, None=> {reply.error(libc::ENOENT); return;} };
-            let kind = self.ino_to_kind.get(&ino).cloned().unwrap_or_default();
-            if kind != "dir" { reply.error(libc::ENOTDIR); return; }
-            // check empty
-            for p in self.path_to_ino.keys() {
-                if p != &norm {
-                    let pp = Path::new(p).parent().map(|pp| pp.to_string_lossy().to_string()).unwrap_or("/".to_string());
-                    let pp_norm = normalize_vm_path(&if pp.is_empty() { "/".to_string() } else { pp });
-                    if pp_norm == norm { reply.error(libc::ENOTEMPTY); return; }
-                }
-            }
+            let Some(ino) = self.child(parent, name) else { reply.error(libc::ENOENT); return };
+            let n = &self.nodes[&ino];
+            if n.attr.kind != FileType::Directory { reply.error(libc::ENOTDIR); return; }
+            if !n.children.is_empty() { reply.error(libc::ENOTEMPTY); return; }
             // as in unlink: report a refused delete and leave the view untouched
-            if let Err(e) = self.conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![norm.clone()])) {
-                reply.error(Self::write_errno(&e));
+            if let Err(e) = self.conn.prepare_cached("DELETE FROM vm_fs WHERE path=?1").and_then(|mut st| st.execute(params![n.db_path])) {
+                reply.error(sql_errno(&e));
                 return;
             }
-            self.path_to_ino.remove(&norm);
-            self.ino_to_path.remove(&ino);
-            self.ino_to_kind.remove(&ino);
-            self.ino_to_attr.remove(&ino);
+            self.remove_node(ino);
             reply.ok();
         }
         fn symlink(&mut self, _req: &Request, parent: u64, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
-            let new_path = match self.ensure_not_exists(parent, link_name) {
+            let (db_path, view) = match self.new_entry_paths(parent, link_name) {
                 Ok(p) => p,
-                Err(_) => { reply.error(libc::EEXIST); return; }
+                Err(e) => { reply.error(e); return; }
             };
             let tgt = target.to_string_lossy().to_string();
-            let conn = &self.conn;
-            if let Err(_) = vm_add_symlink(&conn, &new_path, &tgt) {
-                reply.error(libc::EIO); return;
+            if let Err(e) = vm_add_symlink(&self.conn, &db_path, &tgt) {
+                reply.error(write_errno(&e));
+                return;
             }
-            let ino = self.next_ino;
-            self.next_ino += 1;
-            self.path_to_ino.insert(new_path.clone(), ino);
-            self.ino_to_path.insert(ino, new_path);
-            self.ino_to_kind.insert(ino, "symlink".to_string());
-            let now_sys = SystemTime::now();
-            let attr = FileAttr {
-                ino,
-                size: tgt.len() as u64,
-                blocks: 0,
-                atime: now_sys,
-                mtime: now_sys,
-                ctime: now_sys,
-                crtime: now_sys,
-                kind: FileType::Symlink,
-                perm: 0o777,
-                nlink: 1,
-                uid: self.owner.uid,
-                gid: self.owner.gid,
-                rdev: 0,
-                blksize: BLOCK_SIZE,
-                flags: 0,
-            };
-            self.ino_to_attr.insert(ino, attr);
+            let attr = self.add_node(parent, db_path, view, FileType::Symlink, 0o777, tgt.len() as u64);
             reply.entry(&TTL, &attr, 0);
         }
         fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
-            let old_parent_path = match self.ino_to_path.get(&parent) { Some(p)=>p.clone(), None=>{reply.error(libc::ENOENT); return;}};
-            let new_parent_path = match self.ino_to_path.get(&newparent) { Some(p)=>p.clone(), None=>{reply.error(libc::ENOENT); return;}};
-            let old_n = name.to_string_lossy().to_string();
-            let new_n = newname.to_string_lossy().to_string();
-            let old_path = normalize_vm_path(& if old_parent_path=="/" { format!("/{}", old_n) } else { format!("{}/{}", old_parent_path, old_n) });
-            let new_path = normalize_vm_path(& if new_parent_path=="/" { format!("/{}", new_n) } else { format!("{}/{}", new_parent_path, new_n) });
-            if !self.path_to_ino.contains_key(&old_path) { reply.error(libc::ENOENT); return; }
-            if new_path == old_path { reply.ok(); return; }
-            let old_prefix = if old_path=="/" { "/".to_string() } else { format!("{}/", old_path) };
-            let new_prefix = if new_path=="/" { "/".to_string() } else { format!("{}/", new_path) };
-            // every path that moves: the entry itself and its descendants
-            let mut affected: Vec<String> = self.path_to_ino.keys()
-                .filter(|p| **p == old_path || p.starts_with(&old_prefix)).cloned().collect();
-            if self.path_to_ino.get(&new_path).map(|_| ()).is_some() {
-                let ino = self.path_to_ino[&new_path];
-                if self.ino_to_kind.get(&ino).map(|k| k == "dir").unwrap_or(false) { reply.error(libc::EEXIST); return; }
+            let Some(ino) = self.child(parent, name) else { reply.error(libc::ENOENT); return };
+            let Some(np) = self.nodes.get(&newparent) else { reply.error(libc::ENOENT); return };
+            if np.attr.kind != FileType::Directory { reply.error(libc::ENOTDIR); return; }
+            let Some(new_n) = newname.to_str().filter(|n| !n.is_empty() && !n.contains('/') && *n != "." && *n != "..") else {
+                reply.error(libc::EINVAL); return;
+            };
+            let replaced = np.children.get(new_n).copied();
+            if replaced == Some(ino) { reply.ok(); return; }
+            if let Some(r) = replaced {
+                if self.nodes[&r].attr.kind == FileType::Directory { reply.error(libc::EEXIST); return; }
             }
-            affected.sort_by(|a,b| b.len().cmp(&a.len())); // longer first to avoid collision
-            // Build the final mapping, then apply it in one savepoint. Only after the commit is the
-            // in-memory view updated, so a refused rename leaves the mount showing the old state.
-            let moves: Vec<(String, String)> = affected.iter().map(|old_p| {
-                let new_p = if *old_p == old_path { new_path.clone() } else { format!("{}{}", new_prefix, &old_p[old_prefix.len()..]) };
-                (old_p.clone(), new_p)
+            let moved = self.subtree(ino);
+            // a directory cannot move into itself
+            if moved.contains(&newparent) { reply.error(libc::EINVAL); return; }
+            let new_db = join(&np.db_path, new_n);
+            let new_view = join(&np.view, new_n);
+            // Every moved entry lands under the new path by its position in the tree, so an entry reached
+            // through a linked ancestor moves with the directory the user sees it in.
+            let old_view = self.nodes[&ino].view.clone();
+            let moves: Vec<(u64, String, String, String)> = moved.iter().map(|&i| {
+                let n = &self.nodes[&i];
+                let rel = &n.view[old_view.len()..];
+                (i, n.db_path.clone(), format!("{}{}", new_db, rel), format!("{}{}", new_view, rel))
             }).collect();
-            let res: Result<(), rusqlite::Error> = (|| {
-                self.conn.execute_batch("SAVEPOINT fuse_rename;")?;
+            let replaced_db = replaced.map(|r| self.nodes[&r].db_path.clone());
+            // All rows move in one savepoint. Only after it commits is the in-memory view updated, so a
+            // refused rename leaves the mount showing the old state.
+            let res = crate::vm::in_savepoint(&self.conn, "fuse_rename", || {
                 // an existing destination is replaced (removed with its chunks by the cascade)
-                self.conn.execute("DELETE FROM vm_fs WHERE path=?1", params![new_path.clone()])?;
-                for (old_p, new_p) in &moves {
+                if let Some(d) = &replaced_db { self.conn.execute("DELETE FROM vm_fs WHERE path=?1", params![d])?; }
+                for (_, old_db, new_db, _) in &moves {
                     // vm_fs and vm_file_chunks both key on path, and there is no ON UPDATE CASCADE:
                     // moving one without the other leaves the content unreachable at the new name.
-                    self.conn.prepare_cached("UPDATE vm_fs SET path=?1 WHERE path=?2")?.execute(params![new_p, old_p])?;
-                    self.conn.prepare_cached("UPDATE vm_file_chunks SET path=?1 WHERE path=?2")?.execute(params![new_p, old_p])?;
+                    // vm_dirty follows vm_fs through its foreign key.
+                    self.conn.prepare_cached("UPDATE vm_fs SET path=?1 WHERE path=?2")?.execute(params![new_db, old_db])?;
+                    self.conn.prepare_cached("UPDATE vm_file_chunks SET path=?1 WHERE path=?2")?.execute(params![new_db, old_db])?;
                 }
-                self.conn.execute_batch("RELEASE fuse_rename;")?;
                 Ok(())
-            })();
-            if let Err(e) = res {
-                let _ = self.conn.execute_batch("ROLLBACK TO fuse_rename; RELEASE fuse_rename;");
-                reply.error(if crate::policy::is_refusal(&anyhow::anyhow!(e.to_string())) { libc::EACCES } else { libc::EIO });
-                return;
-            }
-            // the database committed: now move the in-memory view, dropping any replaced entry
-            if let Some(ino) = self.path_to_ino.remove(&new_path) {
-                self.ino_to_path.remove(&ino); self.ino_to_kind.remove(&ino); self.ino_to_attr.remove(&ino);
-            }
-            for (old_p, new_p) in moves {
-                if let Some(ino) = self.path_to_ino.remove(&old_p) {
-                    self.path_to_ino.insert(new_p.clone(), ino);
-                    self.ino_to_path.insert(ino, new_p);
-                }
+            });
+            if let Err(e) = res { reply.error(write_errno(&e)); return; }
+            if let Some(r) = replaced { self.remove_node(r); }
+            let old_parent = self.nodes[&ino].parent;
+            self.nodes.get_mut(&old_parent).unwrap().children.remove(&file_name(&old_view));
+            self.nodes.get_mut(&newparent).unwrap().children.insert(new_n.to_string(), ino);
+            self.nodes.get_mut(&ino).unwrap().parent = newparent;
+            for (i, _, db, view) in moves {
+                let n = self.nodes.get_mut(&i).unwrap();
+                n.db_path = db;
+                n.view = view;
             }
             reply.ok();
         }
         fn setattr(&mut self, _req: &Request, ino: u64, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, atime: Option<fuser::TimeOrNow>, mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
-            if !self.ino_to_attr.contains_key(&ino) { reply.error(libc::ENOENT); return; }
-            let path = self.ino_to_path.get(&ino).cloned().unwrap_or_default();
-            let conn = Some(&self.conn);
-            if let Some(m) = mode {
-                if let Some(ref c) = conn {
-                    if let Err(e) = c.prepare_cached("UPDATE vm_fs SET mode=?1 WHERE path=?2").and_then(|mut st| st.execute(params![m as i64, path.clone()])) {
-                        reply.error(Self::write_errno(&e));
-                        return;
-                    }
-                }
-                if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.perm = (m & 0o7777) as u16; }
-            }
+            let Some(path) = self.nodes.get(&ino).map(|n| n.db_path.clone()) else { reply.error(libc::ENOENT); return };
             // Ownership is fixed to the mounting process. A request to change it is refused with EPERM,
             // not silently ignored: a caller that believes its chown worked would be wrong. A request
             // that names the current owner is a no-op and succeeds.
@@ -665,69 +528,52 @@ pub mod fuse_impl {
                 reply.error(libc::EPERM);
                 return;
             }
+            if let Some(m) = mode {
+                if let Err(e) = self.conn.prepare_cached("UPDATE vm_fs SET mode=?1 WHERE path=?2").and_then(|mut st| st.execute(params![m as i64, path])) {
+                    reply.error(sql_errno(&e));
+                    return;
+                }
+                self.nodes.get_mut(&ino).unwrap().attr.perm = (m & 0o7777) as u16;
+            }
             if let Some(at) = atime {
-                let t = match at { fuser::TimeOrNow::SpecificTime(t)=> t, fuser::TimeOrNow::Now => SystemTime::now() };
-                if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.atime = t; }
+                let t = match at { fuser::TimeOrNow::SpecificTime(t) => t, fuser::TimeOrNow::Now => SystemTime::now() };
+                self.nodes.get_mut(&ino).unwrap().attr.atime = t;
             }
             if let Some(mt) = mtime {
-                let t = match mt { fuser::TimeOrNow::SpecificTime(t)=> t, fuser::TimeOrNow::Now => SystemTime::now() };
-                if let Some(attr) = self.ino_to_attr.get_mut(&ino) { attr.mtime = t; attr.ctime = t; }
-                if let Some(ref c) = conn {
-                    let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                    if let Err(e) = c.prepare_cached("UPDATE vm_fs SET mtime=?1 WHERE path=?2").and_then(|mut st| st.execute(params![secs, path.clone()])) {
-                        reply.error(Self::write_errno(&e));
-                        return;
-                    }
+                let t = match mt { fuser::TimeOrNow::SpecificTime(t) => t, fuser::TimeOrNow::Now => SystemTime::now() };
+                let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+                if let Err(e) = self.conn.prepare_cached("UPDATE vm_fs SET mtime=?1 WHERE path=?2").and_then(|mut st| st.execute(params![secs, path])) {
+                    reply.error(sql_errno(&e));
+                    return;
                 }
+                let a = &mut self.nodes.get_mut(&ino).unwrap().attr;
+                a.mtime = t;
+                a.ctime = t;
             }
             if let Some(sz) = size {
                 // Truncate through the database: only the chunks past the new end are touched.
-                let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                if let Err(e) = crate::vm::truncate_range(&self.conn, &path, sz, mtime) {
-                    eprintln!("vm-fuse truncate {}: {}", path, e);
-                    reply.error(libc::EIO);
-                    return;
-                }
-                if let Some(attr) = self.ino_to_attr.get_mut(&ino) {
-                    attr.size = sz;
-                    attr.blocks = if sz == 0 { 0 } else { (sz + 511) / 512 };
-                }
+                if let Err(e) = self.truncate_node(ino, sz) { reply.error(e); return; }
             }
-            let attr_copy = *self.ino_to_attr.get(&ino).unwrap();
-            reply.attr(&TTL, &attr_copy);
+            reply.attr(&TTL, &self.nodes[&ino].attr);
         }
         fn access(&mut self, _req: &Request, ino: u64, _mask: i32, reply: ReplyEmpty) {
-            if self.ino_to_attr.contains_key(&ino) { reply.ok(); } else { reply.error(libc::ENOENT); }
+            if self.nodes.contains_key(&ino) { reply.ok(); } else { reply.error(libc::ENOENT); }
         }
         fn mknod(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, _rdev: u32, reply: ReplyEntry) {
-            let new_path = match self.ensure_not_exists(parent, name) {
+            // only regular files are supported
+            let file_type = mode & libc::S_IFMT;
+            if file_type != 0 && file_type != libc::S_IFREG { reply.error(libc::ENOSYS); return; }
+            let (db_path, view) = match self.new_entry_paths(parent, name) {
                 Ok(p) => p,
-                Err(_) => { reply.error(libc::EEXIST); return; }
+                Err(e) => { reply.error(e); return; }
             };
             let perm = mode & 0o7777;
-            let file_type = mode & libc::S_IFMT as u32;
-            // only regular file supported; otherwise error
-            if file_type != 0 && file_type != libc::S_IFREG as u32 {
-                reply.error(libc::ENOSYS);
+            if let Err(e) = vm_add_bytes(&self.conn, &db_path, &[], perm as i64, now_secs()) {
+                eprintln!("vm-fuse mknod {}: {}", db_path, e);
+                reply.error(write_errno(&e));
                 return;
             }
-            let now = now_secs();
-            let conn = &self.conn;
-            if let Err(e) = vm_add_bytes(&conn, &new_path, &[], perm as i64, now) {
-                eprintln!("vm-fuse mknod {}: {}", new_path, e);
-                reply.error(if crate::policy::is_refusal(&e) { libc::EACCES } else { libc::EIO }); return;
-            }
-            let ino = self.next_ino;
-            self.next_ino += 1;
-            self.path_to_ino.insert(new_path.clone(), ino);
-            self.ino_to_path.insert(ino, new_path);
-            self.ino_to_kind.insert(ino, "file".to_string());
-            let now_sys = UNIX_EPOCH + Duration::from_secs(now as u64);
-            let attr = FileAttr {
-                ino, size: 0, blocks: 0, atime: now_sys, mtime: now_sys, ctime: now_sys, crtime: now_sys,
-                kind: FileType::RegularFile, perm: perm as u16, nlink: 1, uid: self.owner.uid, gid: self.owner.gid, rdev: 0, blksize: BLOCK_SIZE, flags: 0,
-            };
-            self.ino_to_attr.insert(ino, attr);
+            let attr = self.add_node(parent, db_path, view, FileType::RegularFile, perm as u16, 0);
             reply.entry(&TTL, &attr, 0);
         }
         fn getxattr(&mut self, _req: &Request, _ino: u64, _name: &OsStr, _size: u32, reply: fuser::ReplyXattr) {

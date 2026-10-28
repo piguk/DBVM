@@ -4,18 +4,19 @@
 //! under bwrap with that directory as its root -> sync the directory back -> diff against the
 //! snapshot -> record the step -> restore the snapshot if the step failed and rollback was asked.
 //!
-//! Isolation is bwrap's: a new PID namespace, a new network namespace (only a down loopback, so no
-//! outbound or inbound traffic, no host or tailnet services), /dev and /proc, and the materialized
-//! tree as root. A step is refused (not run unisolated) if bwrap is missing.
+//! The command runs in `sandbox` (bwrap or gVisor, no network, a cgroup with resource limits, a clean
+//! environment) with the materialized tree as root. A step is refused, not run unisolated, when the
+//! sandbox cannot be set up.
 
 use anyhow::{anyhow, Result};
 use rusqlite::params;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::sandbox::{self, Isolation, Outcome};
 use crate::vm;
+
+pub use crate::sandbox::Limits;
 
 #[derive(Debug, Clone)]
 pub struct StepOptions {
@@ -24,6 +25,15 @@ pub struct StepOptions {
     pub timeout_secs: u64,
     /// Keep at most this many bytes of each of stdout and stderr; the rest is read and dropped.
     pub max_output_bytes: usize,
+    pub limits: Limits,
+    pub isolation: Isolation,
+}
+
+impl StepOptions {
+    pub fn new(timeout_secs: u64) -> StepOptions {
+        StepOptions { rollback_on_fail: false, timeout_secs, max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+                      limits: Limits::default(), isolation: Isolation::Bwrap }
+    }
 }
 
 /// Default output cap per stream (1 MiB).
@@ -41,15 +51,81 @@ pub struct StepResult {
     pub stderr_truncated: bool,
     pub changes: vm::SnapDiff,
     pub duration_ms: u128,
+    /// For an agent run: summed time waiting for the model, and the number of model requests. The rest
+    /// of `duration_ms` is the sandbox, the tools and the agent's own work. Zero for a plain step.
+    pub model_ms: u128,
+    pub model_requests: u64,
+    /// What the run can be undone with.
+    pub restore: RestorePoint,
 }
 
-fn bwrap_available() -> bool {
-    Command::new("bwrap").arg("--help").output().map(|o| o.status.success()).unwrap_or(false)
+/// How a recorded run can be undone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestorePoint {
+    /// Content snapshots before and after the run (no "after" when it was rolled back).
+    Snapshots { before: String, after: Option<String> },
+    /// A session command's undo record (`vm::undo_apply`): the rows it changed, as they were before it.
+    Undo(i64),
+}
+
+impl RestorePoint {
+    /// The `snap_before` / `snap_after` / `undo_id` columns of agent_steps.
+    fn columns(&self) -> (String, Option<String>, Option<i64>) {
+        match self {
+            RestorePoint::Snapshots { before, after } => (before.clone(), after.clone(), None),
+            RestorePoint::Undo(id) => (format!("undo:{}", id), None, Some(*id)),
+        }
+    }
+}
+
+/// Record a run in agent_steps; returns its step id.
+pub(crate) fn insert_step(conn: &rusqlite::Connection, cmd: &str, o: &Outcome, rolled_back: bool, duration_ms: u128,
+                          restore: &RestorePoint, changes: &vm::SnapDiff) -> Result<i64> {
+    let (before, after, undo_id) = restore.columns();
+    conn.execute(
+        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json, undo_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![cmd, o.exit_code, o.timed_out as i64, rolled_back as i64, duration_ms as i64,
+                &o.stdout, &o.stderr, o.stdout_truncated as i64, o.stderr_truncated as i64, before, after, diff_to_json(changes), undo_id])?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// How a run is recorded once its sandbox has finished.
+pub(crate) struct Finish<'a> {
+    pub cmd: String,
+    pub before: &'a str,
+    pub rollback_on_fail: bool,
+    /// Name prefix and note of the snapshot taken after a run that is kept.
+    pub after_prefix: &'a str,
+    pub note: &'a str,
+    pub started: Instant,
+    /// (model wait in ms, model requests), zero for a plain step.
+    pub model: (u128, u64),
+}
+
+/// The common end of every run: diff against the snapshot taken before, roll back or snapshot the result,
+/// and record the run in agent_steps.
+pub(crate) fn finish_run(conn: &rusqlite::Connection, o: Outcome, f: Finish) -> Result<StepResult> {
+    let changes = vm::snapshot_diff_live(conn, f.before)?;
+    let rolled_back = (o.exit_code != 0 || o.timed_out) && f.rollback_on_fail;
+    let snap_after = if rolled_back {
+        vm::snapshot_restore(conn, f.before)?;
+        None
+    } else {
+        Some(vm::snapshot_create_named(conn, f.after_prefix, f.note)?.1)
+    };
+    let duration_ms = f.started.elapsed().as_millis();
+    let restore = RestorePoint::Snapshots { before: f.before.to_string(), after: snap_after };
+    let step_id = insert_step(conn, &f.cmd, &o, rolled_back, duration_ms, &restore, &changes)?;
+    Ok(StepResult {
+        step_id, exit_code: o.exit_code, timed_out: o.timed_out, rolled_back,
+        stdout: o.stdout, stderr: o.stderr, stdout_truncated: o.stdout_truncated, stderr_truncated: o.stderr_truncated,
+        changes, duration_ms, model_ms: f.model.0, model_requests: f.model.1, restore,
+    })
 }
 
 pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepResult> {
     if argv.is_empty() { return Err(anyhow!("empty command")); }
-    if !bwrap_available() { return Err(anyhow!("bwrap is required for agent-step; refusing to run unisolated")); }
     // one step at a time per database: the tree mirror would otherwise delete a concurrent step's writes
     let _lock = StepLock::acquire(db)?;
     let conn = vm::vm_open(db.to_str().ok_or_else(|| anyhow!("non-utf8 db path"))?)?;
@@ -60,7 +136,9 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
     let scratch = ScratchDir::create("agent-step-")?;
     let started = Instant::now();
     vm::vm_materialize_tree(&conn, scratch.path()).map_err(|e| anyhow!("materialize failed: {}", e))?;
-    let outcome = run_in(scratch.path(), argv, opts.timeout_secs, opts.max_output_bytes)?;
+    let mut spec = sandbox::Spec::new(scratch.path(), argv.to_vec());
+    spec.limits = opts.limits;
+    let outcome = sandbox::run_captured(&spec, opts.isolation, Duration::from_secs(opts.timeout_secs), opts.max_output_bytes)?;
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
 
     // Sync the scratch tree back, then diff against the snapshot taken before the step. A sync that
@@ -74,89 +152,9 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
         return Err(record_and_fail(&conn, &cmd, &stdout, &stderr, stdout_truncated, exit_code, timed_out,
             &before, &why, duration_ms));
     }
-    let changes = vm::snapshot_diff_live(&conn, &before)?;
-    // the guard removes the tree when this function returns
-
-    let failed = exit_code != 0 || timed_out;
-    let rolled_back = failed && opts.rollback_on_fail;
-    let after_name = if rolled_back {
-        vm::snapshot_restore(&conn, &before)?;
-        None
-    } else {
-        let (_, a) = vm::snapshot_create_named(&conn, "step-after", "agent-step")?;
-        Some(a)
-    };
-    let duration_ms = started.elapsed().as_millis();
-
-    let diff_json = diff_to_json(&changes);
-    conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![argv.join(" "), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
-    let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
-}
-
-/// Result of one sandboxed run.
-struct Outcome { exit_code: i32, timed_out: bool, stdout: Vec<u8>, stderr: Vec<u8>, stdout_truncated: bool, stderr_truncated: bool }
-
-/// Read a pipe to EOF, keeping the first `cap` bytes. Bytes past the cap are still read and dropped,
-/// so the child never blocks on a full pipe. Returns (kept bytes, truncated).
-fn drain_capped<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
-    let mut kept = Vec::new();
-    let mut truncated = false;
-    let mut buf = [0u8; 8192];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let room = cap.saturating_sub(kept.len());
-                if room > 0 { kept.extend_from_slice(&buf[..n.min(room)]); }
-                if n > room { truncated = true; }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        }
-    }
-    (kept, truncated)
-}
-
-/// Run argv under bwrap with `root` as /.
-fn run_in(root: &Path, argv: &[String], timeout_secs: u64, max_output: usize) -> Result<Outcome> {
-    let mut cmd = Command::new("bwrap");
-    cmd.arg("--bind").arg(root).arg("/")
-        .arg("--dev").arg("/dev")
-        .arg("--proc").arg("/proc")
-        .arg("--unshare-pid")
-        .arg("--unshare-net")
-        .arg("--die-with-parent")
-        .arg("--chdir").arg("/");
-    for a in argv { cmd.arg(a); }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| anyhow!("spawn bwrap: {}", e))?;
-
-    // drain both pipes on their own threads so a chatty command cannot block on a full pipe
-    let mut out_pipe = child.stdout.take().unwrap();
-    let mut err_pipe = child.stderr.take().unwrap();
-    let out_t = std::thread::spawn(move || drain_capped(&mut out_pipe, max_output));
-    let err_t = std::thread::spawn(move || drain_capped(&mut err_pipe, max_output));
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(st) = child.try_wait()? { break st; }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            let _ = child.kill();
-            break child.wait()?;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let (stdout, stdout_truncated) = out_t.join().unwrap_or_default();
-    let (stderr, stderr_truncated) = err_t.join().unwrap_or_default();
-    let exit_code = if timed_out { 124 } else { status.code().unwrap_or(128) };
-    Ok(Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated })
+    finish_run(&conn, Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated },
+               Finish { cmd: argv.join(" "), before: &before, rollback_on_fail: opts.rollback_on_fail, after_prefix: "step-after",
+                        note: "agent-step", started, model: (0, 0) })
 }
 
 /// Compact JSON for the change list, written with stable key order.
@@ -398,45 +396,39 @@ pub fn provision_agent_with(db: &Path, node: &Path, pi_dir: &Path, tools: ToolSe
     let node_s = node.to_str().ok_or_else(|| anyhow!("non-utf8 node path"))?;
     let pi_s = pi_dir.to_str().ok_or_else(|| anyhow!("non-utf8 pi path"))?;
     let objects = vm::vm_import_closure(&conn, node_s, "/")?;
-    // an agent runs shell commands, so a shell and its libraries must be there too
-    let mut shell_objects = 0usize;
+    // A tool that is present on the host but fails to import is an error, not a skip: skipping left
+    // VMs where the tool was missing or half-installed (gcc without its headers) and nothing said so.
+    // Tools absent from the host are skipped; the tool set lists what a typical host has.
+    let mut tool_objects = 0usize;
+    let mut tool_files = 0usize;
     // Single files the linker needs. `vm_pack_host_dir_parallel` only walks directories, so these are added
     // one by one; passing them as trees silently skipped every crt object (measured: ld could not find
     // Scrt1.o while gcc reported its version fine).
-    let mut single_files = 0usize;
     for f in tools.linker_inputs() {
         // Never touch a path the import already recorded: /usr/bin/as and /usr/bin/ld may already exist as
         // symlinks, and writing them as regular files made the binary unusable (measured: /bin/git gave
         // "Exec format error" because it had been overwritten with another file's bytes).
         let taken: i64 = conn.query_row("SELECT count(*) FROM vm_fs WHERE path=?1", params![f], |r| r.get(0))?;
-        if taken > 0 { continue; }
-        if std::path::Path::new(&f).is_file() && vm::vm_add_file(&conn, &f, &f).is_ok() { single_files += 1; }
+        if taken > 0 || !std::path::Path::new(&f).is_file() { continue; }
+        vm::vm_add_file(&conn, &f, &f).map_err(|e| anyhow!("provision linker input {}: {}", f, e))?;
+        tool_files += 1;
     }
-    let _ = single_files;
-    for prog in tools.compiler_helpers() {
-        if std::path::Path::new(prog).exists() {
-            shell_objects += vm::vm_import_closure(&conn, prog, "/").unwrap_or(0);
-        }
-    }
-    for prog in tools.commands() {
-        if std::path::Path::new(prog).exists() {
-            shell_objects += vm::vm_import_closure(&conn, prog, "/").unwrap_or(0);
-        }
+    // an agent runs shell commands, so a shell and its libraries must be there too
+    for prog in tools.compiler_helpers().iter().chain(tools.commands()) {
+        if !std::path::Path::new(prog).exists() { continue; }
+        tool_objects += vm::vm_import_closure(&conn, prog, "/").map_err(|e| anyhow!("provision {}: {}", prog, e))?;
     }
     // python3 refuses to start without its standard library, which the ELF closure does not include
-    let mut tree_files = 0usize;
     for (host, vm_prefix) in tools.trees() {
-        if std::path::Path::new(&host).exists() {
-            tree_files += vm::vm_pack_host_dir_parallel(&conn, &host, &vm_prefix).unwrap_or(0);
-        }
+        if !std::path::Path::new(&host).exists() { continue; }
+        tool_files += vm::vm_pack_host_dir_parallel(&conn, &host, &vm_prefix).map_err(|e| anyhow!("provision tree {}: {}", host, e))?;
     }
-    let _ = tree_files;
     let files = vm::vm_pack_host_dir_parallel(&conn, pi_s, "/opt/pi")?;
     // the names a command line inside the VM uses
     let node_real = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
     vm::vm_add_symlink(&conn, "/usr/bin/node", &node_real.to_string_lossy())?;
     vm::vm_add_symlink(&conn, "/usr/bin/pi", "/opt/pi/dist/bundle/cli.js")?;
-    Ok(ProvisionReport { objects: objects + shell_objects, files, node: node_real.to_string_lossy().to_string() })
+    Ok(ProvisionReport { objects: objects + tool_objects, files, tool_files, node: node_real.to_string_lossy().to_string() })
 }
 
 
@@ -448,7 +440,6 @@ pub fn provision_agent_with(db: &Path, node: &Path, pi_dir: &Path, tools: ToolSe
 #[cfg(feature = "fuse")]
 pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     if opts.task.trim().is_empty() { return Err(anyhow!("empty task")); }
-    if !bwrap_available() { return Err(anyhow!("bwrap is required for vm-agent; refusing to run unisolated")); }
     let api_key = std::env::var(&opts.key_env)
         .map_err(|_| anyhow!("{} is not set; the proxy needs the model credential", opts.key_env))?;
     if api_key.is_empty() { return Err(anyhow!("{} is empty", opts.key_env)); }
@@ -463,8 +454,9 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     let started = Instant::now();
 
     // A mount point and a working directory for the proxy socket: both outside the VM.
-    let work = scratch_base("vm-agent-fuse-")?;
-    let mnt = work.join("mnt");
+    // the mount point and the proxy's directory, both outside the VM; removed when this function returns
+    let work = ScratchDir::create("vm-agent-fuse-")?;
+    let mnt = work.path().join("mnt");
     std::fs::create_dir_all(&mnt)?;
     let mount = crate::fuse::fuse_impl::mount_vm_background(db.to_str().unwrap(), mnt.to_str().unwrap())?;
     // A fresh agent directory per run: pi writes its session transcript there, and a leftover transcript
@@ -478,13 +470,15 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         if let Some(par) = host.parent() { let _ = std::fs::create_dir_all(par); }
         std::fs::write(&host, body)?;
     }
-    let proxy_dir = work.join("proxy");
+    let proxy_dir = work.path().join("proxy");
     std::fs::create_dir_all(&proxy_dir)?;
     let sock = proxy_dir.join("proxy.sock");
     let (upstream, prefix) = crate::proxy::Upstream::from_base_url(&opts.model_base, &api_key)?;
     let proxy = crate::proxy::Proxy::bind_with(&sock, upstream, &prefix,
         crate::proxy::AllowList { hosts: opts.allow_hosts.clone() })?;
     let outcome = run_agent_in(&mnt, &sock, opts, &agent_dir);
+    let (model_wait, model_requests) = proxy.model_time();
+    let model_ms = model_wait.as_millis();
     drop(proxy);
     drop(mount);
     // remove the scaffolding the run itself created, so it does not show up as a task change
@@ -494,22 +488,10 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         let _ = std::fs::remove_dir_all(&host);
     }
     let outcome = outcome?;
-    let _ = std::fs::remove_dir_all(&work);
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
-    let changes = vm::snapshot_diff_live(&conn, &before)?;
-    let failed = exit_code != 0 || timed_out;
-    let rolled_back = failed && opts.rollback_on_fail;
-    let after_name = if rolled_back { vm::snapshot_restore(&conn, &before)?; None }
-        else { let (_, a) = vm::snapshot_create_named(&conn, "agent-after", "vm-agent")?; Some(a) };
-    let duration_ms = started.elapsed().as_millis();
-    let diff_json = diff_to_json(&changes);
-    conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![format!("vm-agent --fuse: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
-    let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+    finish_run(&conn, Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated },
+               Finish { cmd: format!("vm-agent --fuse: {}", opts.task), before: &before, rollback_on_fail: opts.rollback_on_fail, after_prefix: "agent-after",
+                        note: "vm-agent", started, model: (model_ms, model_requests) })
 }
 
 /// Milliseconds since the epoch, used to give each run its own agent directory.
@@ -524,9 +506,6 @@ fn allows_write(root: &Path) -> bool {
     match std::fs::write(&probe, b"x") { Ok(()) => { let _ = std::fs::remove_file(&probe); true } Err(_) => false }
 }
 
-/// A scratch directory that is removed by the caller (the fuse path keeps it until the mount is gone).
-#[cfg(feature = "fuse")]
-fn scratch_base(prefix: &str) -> Result<std::path::PathBuf> { vm::make_tmp_dir(prefix) }
 
 /// Run one task with `db` as a Delta over a read-only `base`.
 ///
@@ -536,7 +515,6 @@ fn scratch_base(prefix: &str) -> Result<std::path::PathBuf> { vm::make_tmp_dir(p
 pub fn run_agent_on_overlay(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     let base = opts.base.clone().ok_or_else(|| anyhow!("run_agent_on_overlay needs a base"))?;
     if opts.task.trim().is_empty() { return Err(anyhow!("empty task")); }
-    if !bwrap_available() { return Err(anyhow!("bwrap is required for vm-agent; refusing to run unisolated")); }
     let api_key = std::env::var(&opts.key_env)
         .map_err(|_| anyhow!("{} is not set; the proxy needs the model credential", opts.key_env))?;
     if api_key.is_empty() { return Err(anyhow!("{} is empty", opts.key_env)); }
@@ -566,26 +544,17 @@ pub fn run_agent_on_overlay(db: &Path, opts: &AgentOptions) -> Result<StepResult
     let proxy = crate::proxy::Proxy::bind_with(&sock, upstream, &prefix,
         crate::proxy::AllowList { hosts: opts.allow_hosts.clone() })?;
     let outcome = run_agent_in(scratch.path(), &sock, opts, "/opt/piagent");
+    let (model_wait, model_requests) = proxy.model_time();
+    let model_ms = model_wait.as_millis();
     drop(proxy);
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome?;
     for rel in ["opt/piagent/models.json", "opt/piagent/settings.json", "opt/fwd.cjs", "opt/run-agent.sh", "tmp/proxy.sock", "tmp/fwd.log"] {
         scratch.remove(rel);
     }
     ov.absorb_tree(scratch.path())?;
-    let changes = vm::snapshot_diff_live(conn, &before)?;
-    let failed = exit_code != 0 || timed_out;
-    let rolled_back = failed && opts.rollback_on_fail;
-    let after_name = if rolled_back { vm::snapshot_restore(conn, &before)?; None }
-        else { let (_, a) = vm::snapshot_create_named(conn, "agent-after", "vm-agent")?; Some(a) };
-    let duration_ms = started.elapsed().as_millis();
-    let diff_json = diff_to_json(&changes);
-    conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![format!("vm-agent: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
-    let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+    finish_run(conn, Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated },
+               Finish { cmd: format!("vm-agent: {}", opts.task), before: &before, rollback_on_fail: opts.rollback_on_fail, after_prefix: "agent-after",
+                        note: "vm-agent", started, model: (model_ms, model_requests) })
 }
 
 /// Record a run whose synced content could not be applied, then report the failure.
@@ -617,26 +586,19 @@ fn record_and_fail(conn: &rusqlite::Connection, cmd: &str, stdout: &[u8], stderr
 }
 
 
-/// Removes a scratch directory when it goes out of scope.
+/// A run's scratch directory: removed when it goes out of scope, and reclaimed by a later run if this
+/// process is killed (see `vm::WorkDir`).
 ///
 /// Every early return in a run must clean up. Writing `remove_dir_all` on each error path is easy to
 /// forget: measured, three failed agent runs left 539 MB of materialised trees under /tmp because the
 /// paths after the proxy was bound returned with `?` and never cleaned up.
-struct ScratchDir { path: std::path::PathBuf }
+struct ScratchDir { dir: vm::WorkDir }
 
 impl ScratchDir {
-    fn create(prefix: &str) -> Result<ScratchDir> {
-        Ok(ScratchDir { path: vm::make_tmp_dir(prefix)? })
-    }
-    fn path(&self) -> &Path { &self.path }
-    /// Keep a file that lives inside the tree: used before syncing, so the guard still removes it.
-    fn remove(&self, rel: &str) { let _ = std::fs::remove_file(self.path.join(rel)); }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        if !self.path.as_os_str().is_empty() { let _ = std::fs::remove_dir_all(&self.path); }
-    }
+    fn create(prefix: &str) -> Result<ScratchDir> { Ok(ScratchDir { dir: vm::WorkDir::create(prefix)? }) }
+    fn path(&self) -> &Path { self.dir.path() }
+    /// Remove a file the run itself created inside the tree, before the tree is synced.
+    fn remove(&self, rel: &str) { let _ = std::fs::remove_file(self.path().join(rel)); }
 }
 
 /// Options for one agent task.
@@ -659,6 +621,7 @@ pub struct AgentOptions {
     pub task: String,
     /// Resource limits for the sandbox. 0 disables that limit.
     pub limits: Limits,
+    pub isolation: Isolation,
     /// Run against a read-only Base with `db` as its Delta (one Delta per task). Empty means the database
     /// is standalone.
     pub base: Option<std::path::PathBuf>,
@@ -669,43 +632,26 @@ pub struct AgentOptions {
     pub allow_hosts: Vec<String>,
 }
 
-/// Resource limits applied inside the sandbox.
+/// Limits for an agent run: the sandbox defaults, plus an address-space limit for node.
 ///
-/// Measured on node 26 before choosing them: `RLIMIT_DATA` and small `RLIMIT_AS` make node fail to
-/// start at all (a shared library cannot be mapped), so the address-space limit must be at least
-/// ~1.5 GB and is a guard against runaway allocation, not a tight quota. With 2 GB a 2.5 GB
-/// allocation fails as a catchable `RangeError` instead of an OOM kill.
-#[derive(Debug, Clone, Copy)]
-pub struct Limits {
-    /// `RLIMIT_AS` in mebibytes; 0 = unlimited. Node needs >= ~1536.
-    pub address_space_mb: u32,
-    /// `RLIMIT_CPU` in seconds; 0 = unlimited.
-    pub cpu_secs: u32,
-    /// `RLIMIT_FSIZE` in mebibytes; 0 = unlimited.
-    pub file_size_mb: u32,
-    /// `RLIMIT_NPROC`; 0 = unlimited. Counts processes for the whole user, so it is off by default.
-    pub processes: u32,
-}
-
-impl Default for Limits {
-    fn default() -> Self { Limits { address_space_mb: 2048, cpu_secs: 0, file_size_mb: 1024, processes: 0 } }
-}
-
-impl Limits {
-    /// The `ulimit` prelude for the sandbox shell. Kept in one place so the CLI and the library agree.
-    pub fn ulimit_prelude(&self) -> String {
-        let mut out = String::new();
-        if self.address_space_mb > 0 { out.push_str(&format!("ulimit -v {} 2>/dev/null; ", self.address_space_mb as u64 * 1024)); }
-        if self.cpu_secs > 0 { out.push_str(&format!("ulimit -t {} 2>/dev/null; ", self.cpu_secs)); }
-        if self.file_size_mb > 0 { out.push_str(&format!("ulimit -f {} 2>/dev/null; ", self.file_size_mb as u64 * 1024)); }
-        if self.processes > 0 { out.push_str(&format!("ulimit -u {} 2>/dev/null; ", self.processes)); }
-        out
-    }
+/// Measured on node 26: with RLIMIT_AS at 2 GB a 2.5 GB allocation fails as a catchable RangeError instead
+/// of an OOM kill, so the agent sees memory pressure as an error it can report. Node needs at least
+/// ~1.5 GB of address space to start. The cgroup's memory.max is the hard limit for the whole sandbox.
+pub fn agent_limits() -> Limits {
+    Limits { memory_mb: 4096, address_space_mb: 2048, ..Limits::default() }
 }
 
 /// What `provision_agent` put in the database.
 #[derive(Debug)]
-pub struct ProvisionReport { pub objects: usize, pub files: usize, pub node: String }
+pub struct ProvisionReport {
+    /// ELF objects imported: node's closure plus every tool's closure.
+    pub objects: usize,
+    /// Entries packed from the pi tree at `/opt/pi`.
+    pub files: usize,
+    /// Tool data outside the ELF closures: linker inputs and packed trees (python stdlib, gcc headers).
+    pub tool_files: usize,
+    pub node: String,
+}
 
 /// Run one task with the pi agent inside the VM, recorded like a step.
 ///
@@ -718,7 +664,6 @@ pub struct ProvisionReport { pub objects: usize, pub files: usize, pub node: Str
 /// - mirror the tree back, diff it, and record the run in `agent_steps`.
 pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     if opts.task.trim().is_empty() { return Err(anyhow!("empty task")); }
-    if !bwrap_available() { return Err(anyhow!("bwrap is required for vm-agent; refusing to run unisolated")); }
     let api_key = std::env::var(&opts.key_env)
         .map_err(|_| anyhow!("{} is not set; the proxy needs the model credential", opts.key_env))?;
     if api_key.is_empty() { return Err(anyhow!("{} is empty", opts.key_env)); }
@@ -756,6 +701,8 @@ pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         crate::proxy::AllowList { hosts: opts.allow_hosts.clone() })?;
 
     let outcome = run_agent_in(scratch.path(), &sock, opts, "/opt/piagent");
+    let (model_wait, model_requests) = proxy.model_time();
+    let model_ms = model_wait.as_millis();
     drop(proxy);
     let outcome = outcome?;
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
@@ -771,27 +718,9 @@ pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         return Err(record_and_fail(&conn, &cmd, &stdout, &stderr, stdout_truncated, exit_code, timed_out,
             &before, &why, duration_ms));
     }
-    let changes = vm::snapshot_diff_live(&conn, &before)?;
-    // the guard removes the tree when this function returns
-
-    let failed = exit_code != 0 || timed_out;
-    let rolled_back = failed && opts.rollback_on_fail;
-    let after_name = if rolled_back {
-        vm::snapshot_restore(&conn, &before)?;
-        None
-    } else {
-        let (_, a) = vm::snapshot_create_named(&conn, "agent-after", "vm-agent")?;
-        Some(a)
-    };
-    let duration_ms = started.elapsed().as_millis();
-    let diff_json = diff_to_json(&changes);
-    conn.execute(
-        "INSERT INTO agent_steps(cmd, exit_code, timed_out, rolled_back, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, snap_before, snap_after, fs_diff_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![format!("vm-agent: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
-                &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
-    let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+    finish_run(&conn, Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated },
+               Finish { cmd: format!("vm-agent: {}", opts.task), before: &before, rollback_on_fail: opts.rollback_on_fail, after_prefix: "agent-after",
+                        note: "vm-agent", started, model: (model_ms, model_requests) })
 }
 
 /// pi's provider config: a local endpoint that the forwarder serves, with a placeholder key. The real
@@ -835,53 +764,25 @@ HOME=/opt/home PI_CODING_AGENT_DIR="$VM_AGENT_DIR" /usr/bin/node /opt/pi/dist/bu
 
 /// Run the agent in the sandbox: bind the proxy socket in, then run the script above.
 fn run_agent_in(root: &Path, proxy_sock: &Path, opts: &AgentOptions, agent_dir: &str) -> Result<Outcome> {
-    // The script must not be written into a FUSE-mounted root: bwrap cannot create files there (measured:
-    // "Can't create file /tmp/proxy.sock: Input/output error"). It is passed through the environment and
-    // written into /tmp by the shell instead, which works for both a mount and a materialised tree.
-    // The script is passed in through the environment (see below); a copy in the tree is only written
-    // when the tree accepts writes, which keeps the older materialised path unchanged.
+    // The script is passed through the environment and written into /tmp by the shell: it must not be
+    // written into a FUSE-mounted root, where bwrap could not create files (measured: "Can't create file
+    // /tmp/proxy.sock: Input/output error"). A copy in the tree is written only when the tree accepts
+    // writes, which keeps the materialised path unchanged.
     if allows_write(root) && root.join("opt").is_dir() { let _ = std::fs::write(root.join("opt/run-agent.sh"), RUN_AGENT_SH); }
-    let mut cmd = Command::new("bwrap");
-    cmd.arg("--bind").arg(root).arg("/")
-        .arg("--dev").arg("/dev")
-        .arg("--proc").arg("/proc")
-        .arg("--unshare-pid")
-        .arg("--unshare-net")
-        .arg("--die-with-parent")
-        // Bind the directory that holds the socket, not the socket itself: bwrap must create the mount
-        // point, and it cannot create files on a FUSE-mounted root (measured: "Can't create file
-        // /tmp/proxy.sock: Input/output error"). /tmp inside the sandbox is the proxy's own directory.
-        .arg("--bind").arg(proxy_sock.parent().unwrap_or(Path::new("/tmp"))).arg("/tmp")
-        .arg("--chdir").arg("/")
-        .arg("/bin/sh").arg("-c")
-        .arg(format!("printf '%s' \"$VM_AGENT_SCRIPT\" > /tmp/run-agent.sh; {}. /tmp/run-agent.sh",
-            opts.limits.ulimit_prelude()));
-    // a clean environment: nothing from the host leaks in, and the credential is not here at all
-    cmd.env_clear();
-    cmd.env("PATH", "/usr/bin:/bin");
-    cmd.env("VM_AGENT_TASK", &opts.task);
-    cmd.env("VM_AGENT_SCRIPT", RUN_AGENT_SH);
-    cmd.env("VM_AGENT_DIR", agent_dir);
-    cmd.env("VM_AGENT_PORT", opts.forward_port.to_string());
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| anyhow!("spawn bwrap: {}", e))?;
-    let mut out_pipe = child.stdout.take().unwrap();
-    let mut err_pipe = child.stderr.take().unwrap();
-    let max = opts.max_output_bytes;
-    let out_t = std::thread::spawn(move || drain_capped(&mut out_pipe, max));
-    let err_t = std::thread::spawn(move || drain_capped(&mut err_pipe, max));
-    let deadline = Instant::now() + Duration::from_secs(opts.timeout_secs);
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(st) = child.try_wait()? { break st; }
-        if Instant::now() >= deadline { timed_out = true; let _ = child.kill(); break child.wait()?; }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let (stdout, stdout_truncated) = out_t.join().unwrap_or_default();
-    let (stderr, stderr_truncated) = err_t.join().unwrap_or_default();
-    let exit_code = if timed_out { 124 } else { status.code().unwrap_or(128) };
-    Ok(Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated })
+    let mut spec = sandbox::Spec::new(root, vec!["/bin/sh".into(), "-c".into(),
+        "printf '%s' \"$VM_AGENT_SCRIPT\" > /tmp/run-agent.sh; . /tmp/run-agent.sh".into()]);
+    // Bind the directory that holds the socket, not the socket itself: the sandbox must create the mount
+    // point, and it cannot create files on a FUSE-mounted root. /tmp inside the sandbox is the proxy's
+    // own directory.
+    spec.binds.push(sandbox::Bind { host: proxy_sock.parent().unwrap_or(Path::new("/tmp")).to_path_buf(), dest: "/tmp".into(), writable: true });
+    // the environment is exactly this; the credential is not part of it
+    spec.env = vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("VM_AGENT_TASK".into(), opts.task.clone()),
+        ("VM_AGENT_SCRIPT".into(), RUN_AGENT_SH.into()),
+        ("VM_AGENT_DIR".into(), agent_dir.into()),
+        ("VM_AGENT_PORT".into(), opts.forward_port.to_string()),
+    ];
+    spec.limits = opts.limits;
+    sandbox::run_captured(&spec, opts.isolation, Duration::from_secs(opts.timeout_secs), opts.max_output_bytes)
 }
-
-/// The shell prelude that applies `limits`. Public so tests exercise the same code the sandbox runs.
-pub fn limits_prelude(limits: &Limits) -> String { limits.ulimit_prelude() }

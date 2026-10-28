@@ -41,13 +41,25 @@ pub fn inject(target: &Connection, pkg: &Path) -> Result<InjectReport> {
     {
         let ro = Connection::open_with_flags(pkg, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| anyhow!("open package {}: {}", pkg_str, e))?;
+        crate::vm::harden(&ro)?;
         let has_fs: i64 = ro.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='vm_fs'", [], |r| r.get(0))?;
         if has_fs == 0 { return Err(anyhow!("{} is not a VM database", pkg_str)); }
+        // a package may come from anyone: a damaged or crafted file is refused before anything reads it
+        let check: String = ro.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if check != "ok" { return Err(anyhow!("{} failed quick_check: {}", pkg_str, check)); }
     }
-    target.execute("ATTACH DATABASE ?1 AS pkg", params![pkg_str])
+    // read-only: SQLite refuses every write to the package, whatever the merge does
+    if pkg_str.contains('?') || pkg_str.contains('#') { return Err(anyhow!("package path must not contain '?' or '#'")); }
+    target.execute("ATTACH DATABASE ?1 AS pkg", params![format!("file:{}?mode=ro", pkg_str)])
         .map_err(|e| anyhow!("attach {}: {}", pkg_str, e))?;
-    let res = merge(target);
+    // the package's hashes are copied as they are, and a package is never written, so stale ones
+    // cannot be finalized here
+    let res = match crate::vm::pending_hashes(target, "pkg") {
+        Ok(0) => merge(target),
+        Ok(n) => Err(anyhow!("{} has {} files with pending hashes; open it read-write once (e.g. vm-verify) to finalize them", pkg_str, n)),
+        Err(e) => Err(e),
+    };
     let detach = target.execute_batch("DETACH DATABASE pkg;");
     let report = res?;
     detach?;
@@ -102,7 +114,9 @@ fn merge(target: &Connection) -> Result<InjectReport> {
                  FROM pkg.vm_fs WHERE path=?1", params![p])?;
             // this path's blobs, with dictionary ids remapped, before its chunk rows reference them
             let blobs_before: i64 = target.query_row("SELECT count(*) FROM main.vm_blobs", [], |r| r.get(0))?;
-            let blobs: Vec<(Vec<u8>, Vec<u8>, i64, i64, i64)> = {
+            // (hash, content, compressed, raw_size, dict_id)
+            type BlobRow = (Vec<u8>, Vec<u8>, i64, i64, i64);
+            let blobs: Vec<BlobRow> = {
                 let mut st = target.prepare(
                     "SELECT DISTINCT b.hash, b.content, b.compressed, b.raw_size, b.dict_id
                      FROM pkg.vm_file_chunks c JOIN pkg.vm_blobs b ON b.hash = c.hash WHERE c.path = ?1")?;

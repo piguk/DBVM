@@ -1,6 +1,6 @@
 //! VM store round-trip tests. Each test uses its own temp DB.
 use selfdb::vm;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn tmpdb(name: &str) -> (tempdir_guard::Guard, PathBuf) {
     let g = tempdir_guard::Guard::new(name);
@@ -23,7 +23,7 @@ mod tempdir_guard {
     impl Drop for Guard { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
 }
 
-fn open(db: &PathBuf) -> rusqlite::Connection {
+fn open(db: &Path) -> rusqlite::Connection {
     vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap()
 }
 
@@ -203,7 +203,7 @@ fn counters_match_raw_aggregates_through_mutations() {
     vm::vm_add_bytes(&c, "/b", &vec![2u8; 9000], 0o644, 1).unwrap();
     vm::vm_add_symlink(&c, "/l", "/a").unwrap();
     vm::vm_add_dir(&c, "/d", 0o755, 1).unwrap();
-    vm::vm_add_bytes(&c, "/a", &vec![3u8; 50], 0o644, 2).unwrap();
+    vm::vm_add_bytes(&c, "/a", &[3u8; 50], 0o644, 2).unwrap();
     c.execute("DELETE FROM vm_fs WHERE path='/b'", []).unwrap();
     let rep = vm::vm_verify(&c, true).unwrap();
     assert!(rep.contains("deep=ok"), "{}", rep);
@@ -224,6 +224,7 @@ fn legacy_v3_database_migrates_to_blob_keys() {
         c.execute_batch("DROP TRIGGER IF EXISTS vm_fc_ins; DROP TRIGGER IF EXISTS vm_fc_del; DROP TRIGGER IF EXISTS vm_fc_upd;
             DROP TRIGGER IF EXISTS vm_fs_del_chunks; DROP TABLE IF EXISTS vm_file_chunks;
             DROP TRIGGER IF EXISTS vm_snc_ins; DROP TRIGGER IF EXISTS vm_snc_del; DROP TABLE IF EXISTS vm_snapshot_chunks; DROP TABLE IF EXISTS vm_snapshot_fs;
+            DROP TRIGGER IF EXISTS vm_unc_ins; DROP TRIGGER IF EXISTS vm_unc_del; DROP TABLE IF EXISTS vm_undo_chunks; DROP TABLE IF EXISTS vm_undo_fs; DROP TABLE IF EXISTS vm_undo;
             DROP TABLE vm_blobs; DROP INDEX IF EXISTS idx_vm_blobs_refcnt;
             CREATE TABLE vm_blobs(hash TEXT PRIMARY KEY, content BLOB NOT NULL, compressed INTEGER NOT NULL DEFAULT 0,
               raw_size INTEGER NOT NULL, refcnt INTEGER NOT NULL DEFAULT 1);
@@ -301,7 +302,7 @@ fn overwrite_and_delete_release_chunk_references() {
     let (_g, db) = tmpdb("chunk-release");
     let c = open(&db);
     vm::vm_add_bytes(&c, "/f", &vec![1u8; 2 * CHUNK_SIZE + 5], 0o644, 1).unwrap();
-    vm::vm_add_bytes(&c, "/f", &vec![2u8; 10], 0o644, 2).unwrap();
+    vm::vm_add_bytes(&c, "/f", &[2u8; 10], 0o644, 2).unwrap();
     let n: i64 = c.query_row("SELECT count(*) FROM vm_blobs", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 1, "old chunks must be released on overwrite");
     c.execute("DELETE FROM vm_fs WHERE path='/f'", []).unwrap();
@@ -431,7 +432,7 @@ fn failed_stream_keeps_previous_version() {
     struct Bad { left: usize }
     impl std::io::Read for Bad {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-            if self.left == 0 { return Err(std::io::Error::new(std::io::ErrorKind::Other, "disk gone")); }
+            if self.left == 0 { return Err(std::io::Error::other("disk gone")); }
             let k = out.len().min(self.left);
             for b in &mut out[..k] { *b = 4; }
             self.left -= k;
@@ -546,7 +547,12 @@ fn recompress_runs_on_current_schema() {
 
 /// Snapshot of everything that defines a packed VM: per-file metadata + chunk keys, and the
 /// blob set with stored encodings. Two packs of the same tree must produce equal snapshots.
-fn pack_snapshot(c: &rusqlite::Connection) -> (Vec<(String, i64, i64, Vec<u8>, Vec<Vec<u8>>)>, Vec<(Vec<u8>, i64, i64, i64)>) {
+/// (path, mode, size, hash, chunk hashes)
+type PackedFile = (String, i64, i64, Vec<u8>, Vec<Vec<u8>>);
+/// (hash, compressed, raw_size, dict_id)
+type PackedBlob = (Vec<u8>, i64, i64, i64);
+
+fn pack_snapshot(c: &rusqlite::Connection) -> (Vec<PackedFile>, Vec<PackedBlob>) {
     let mut files = Vec::new();
     let mut st = c.prepare("SELECT path, mode, size, hash FROM vm_fs WHERE kind='file' ORDER BY path").unwrap();
     for r in st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?))).unwrap() {
@@ -587,7 +593,8 @@ fn parallel_pack_matches_serial_pack() {
         vm::vm_train_dict(&c, 16384).unwrap();
         let n = if parallel { vm::vm_pack_host_dir_parallel(&c, src.to_str().unwrap(), "/data").unwrap() }
                 else { vm::vm_pack_host_dir(&c, src.to_str().unwrap(), "/data").unwrap() };
-        assert_eq!(n, 44, "{} packed file count", name);
+        // 44 regular files + the directories sub/ and sub/deep/
+        assert_eq!(n, 46, "{} packed entry count", name);
         c
     };
     let serial = make("serial", false);
@@ -693,9 +700,9 @@ fn imported_interpreter_resolves_inside_vm() {
     let c = open(&db);
     vm::vm_import_closure(&c, host, "/").unwrap();
     let interp = elf_interp(host).expect("interpreter");
-    let (real, kind, content, _l, _m) = vm::vm_resolve(&c, &interp).expect("interpreter must resolve in the VM");
-    assert_eq!(kind, "file", "{} resolved to {} ({})", interp, real, kind);
-    assert!(content.map(|b| b.len() > 0).unwrap_or(false), "interpreter has no content");
+    let r = vm::vm_resolve(&c, &interp).expect("interpreter must resolve in the VM");
+    assert_eq!(r.kind, "file", "{} resolved to {} ({})", interp, r.path, r.kind);
+    assert!(r.content.map(|b| !b.is_empty()).unwrap_or(false), "interpreter has no content");
 }
 
 #[test]
@@ -963,4 +970,87 @@ fn editing_a_materialised_tree_cannot_change_what_the_next_materialise_returns()
         .count();
     assert_eq!(damaged, 0, "no cache entry may hold the tree edit");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tar_hard_link_is_a_copy_of_its_target() {
+    // A tar hard link names its target by archive path. Stored as a symlink, `/bin/sh -> ./usr/bin/busybox`
+    // resolved relative to /bin and pointed at a file that does not exist.
+    let (g, db) = tmpdb("tar-hardlink");
+    let c = open(&db);
+    let tar_path = g.path().join("root.tar");
+    {
+        let mut b = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
+        let body = b"#!busybox\n";
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(body.len() as u64);
+        h.set_mode(0o755);
+        h.set_mtime(7);
+        b.append_data(&mut h, "./usr/bin/busybox", &body[..]).unwrap();
+        let mut l = tar::Header::new_gnu();
+        l.set_entry_type(tar::EntryType::Link);
+        l.set_size(0);
+        l.set_mode(0o755);
+        l.set_mtime(7);
+        b.append_link(&mut l, "./bin/sh", "./usr/bin/busybox").unwrap();
+        b.finish().unwrap();
+    }
+    vm::vm_import_tar_filtered(&c, tar_path.to_str().unwrap(), "", None, None).unwrap();
+    let kind: String = c.query_row("SELECT kind FROM vm_fs WHERE path='/bin/sh'", [], |r| r.get(0)).unwrap();
+    assert_eq!(kind, "file");
+    assert_eq!(vm::vm_cat(&c, "/bin/sh").unwrap(), b"#!busybox\n");
+    assert!(vm::vm_verify(&c, true).unwrap().contains("deep=ok"));
+}
+
+#[test]
+fn a_damaged_cache_entry_is_not_materialized() {
+    // Cache entries are trusted by name. A 0-byte entry under the hash of /usr/bin/git produced an empty
+    // git in the VM (measured). The entry's length is checked before use and a damaged one is replaced.
+    let (g, db) = tmpdb("cache-damaged");
+    let c = open(&db);
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    vm::vm_add_bytes(&c, "/usr/bin/tool", &data, 0o755, 1).unwrap();
+    let hash: String = c.query_row("SELECT lower(hex(hash)) FROM vm_fs WHERE path='/usr/bin/tool'", [], |r| r.get(0)).unwrap();
+    let cache = g.path().join("cache");
+    let entry = cache.join(&hash[0..2]).join(&hash);
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    for damaged in [&b""[..], &data[..1000]] {
+        std::fs::write(&entry, damaged).unwrap();
+        let root = g.path().join("root");
+        let _ = std::fs::remove_dir_all(&root);
+        vm::vm_materialize_tree_with_cache(&c, &root, &cache).unwrap();
+        assert!(std::fs::read(root.join("usr/bin/tool")).unwrap() == data, "materialized from the database, not the damaged entry");
+        assert!(std::fs::read(&entry).unwrap() == data, "the damaged entry was replaced");
+    }
+}
+
+#[test]
+fn materializing_a_second_database_reads_that_database() {
+    // Worker threads kept a read connection to the first database they materialized and reused it for
+    // the next one, so files of a second VM were read from the first (an empty /usr/bin/git, measured).
+    let (g, _) = tmpdb("two-dbs");
+    let make = |name: &str, content: &[u8]| {
+        let p = g.path().join(name);
+        let c = open(&p);
+        for i in 0..64 { vm::vm_add_bytes(&c, &format!("/{}/f{}", name, i), content, 0o644, 1).unwrap(); }
+        c
+    };
+    let a = make("a", b"first database");
+    let b = make("b", b"second database");
+    let cache = g.path().join("cache");
+    vm::vm_materialize_tree_with_cache(&a, &g.path().join("ra"), &cache).unwrap();
+    vm::vm_materialize_tree_with_cache(&b, &g.path().join("rb"), &cache).unwrap();
+    for i in 0..64 {
+        assert_eq!(std::fs::read(g.path().join(format!("rb/b/f{}", i))).unwrap(), b"second database", "file {} of the second VM", i);
+    }
+}
+
+#[test]
+fn file_bytes_of_a_path_missing_from_the_database_is_an_error() {
+    let (_g, db) = tmpdb("fb-missing");
+    let c = open(&db);
+    vm::vm_add_bytes(&c, "/empty", b"", 0o644, 1).unwrap();
+    assert_eq!(vm::file_bytes(&c, "/empty").unwrap(), b"");
+    assert!(vm::file_bytes(&c, "/absent").is_err(), "an absent path is not an empty file");
 }

@@ -29,7 +29,7 @@ impl Owner {
     /// Whether a setattr request asks to change ownership to something other than this owner.
     /// Such a request is refused; a request naming the current owner is accepted as a no-op.
     pub fn is_owner_change(&self, uid: Option<u32>, gid: Option<u32>) -> bool {
-        uid.map_or(false, |u| u != self.uid) || gid.map_or(false, |g| g != self.gid)
+        uid.is_some_and(|u| u != self.uid) || gid.is_some_and(|g| g != self.gid)
     }
 
     /// The owner a node reports, given the uid/gid stored for it. Ignores the stored values.
@@ -83,8 +83,7 @@ pub fn mount_link_text(link_vm_path: &str, stored_target: &str) -> String {
     let to: Vec<&str> = split_components(stored_target);
     // common prefix of the two directory paths
     let common = from.iter().zip(to.iter()).take_while(|(a, b)| a == b).count();
-    let mut out: Vec<&str> = Vec::new();
-    for _ in common..from.len() { out.push(".."); }
+    let mut out: Vec<&str> = vec![".."; from.len() - common];
     out.extend(to[common..].iter().copied());
     if out.is_empty() { ".".to_string() } else { out.join("/") }
 }

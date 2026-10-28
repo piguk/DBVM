@@ -46,8 +46,9 @@ pub struct BypassFlag(Arc<AtomicU32>);
 pub fn register(conn: &Connection) -> Result<BypassFlag> {
     let flag = BypassFlag::default();
     let f = flag.clone();
-    // not SQLITE_DETERMINISTIC: the value changes while the bypass is entered and left
-    conn.create_scalar_function(BYPASS_FN, 0, FunctionFlags::SQLITE_UTF8, move |_| {
+    // not SQLITE_DETERMINISTIC: the value changes while the bypass is entered and left. INNOCUOUS: it has
+    // no side effects, and the policy triggers must be able to call it with trusted_schema off.
+    conn.create_scalar_function(BYPASS_FN, 0, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS, move |_| {
         Ok(f.0.load(Ordering::SeqCst) > 0)
     })?;
     Ok(flag)

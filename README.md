@@ -64,7 +64,7 @@ target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --help
 - `src/elf.rs` — ELF 解析（goblin）
 - `src/db.rs` — SELF 建库（表与视图：`segments/symbols/needed/dynamic_entries/...`，视图 `ldd/exports/imports`）
 - `src/closure.rs` — 依赖闭包寻库（RUNPATH/RPATH/LD_LIBRARY_PATH/调用方目录/系统目录）
-- `src/vm.rs` — VM 存储层（`vm_fs`/`vm_blobs` 去重、zstd 字典、快照、`vm_mem`、4K 稀疏块设备）
+- `src/vm/` — VM 存储层（`vm_fs`/`vm_blobs` 去重、zstd 字典、快照、`vm_mem`、4K 稀疏块设备），子模块划分见 `src/vm/mod.rs`
 - `src/fuse.rs` — FUSE 挂载 `vm_fs`（`--features fuse`）
 - `src/bin/self.rs` — 主 CLI（SELF 查询 + `vm-*` 子命令）
 - `src/bin/self-exec.rs` — 加载器：`memfd` + `execve` 委托宿主 `ld.so`，bundle 展开

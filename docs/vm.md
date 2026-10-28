@@ -8,7 +8,8 @@
 - `vm_meta`：O(1) 计数器（文件数、逻辑字节、blob 字节），由触发器维护，`vm-verify --deep` 可逐项对账
 - `vm_mem`：内存镜像；`vm_snapshots` / `vm_log`：checkpoint 与变更日志
 - `vm_disk_blocks(block_id PK, content, compressed, raw_size)`：4K 稀疏分页块设备；`vm_meta.disk_size` 记录逻辑大小
-- 库 `application_id = 0x564D5351 ("VMSQ")`，`user_version = 11`（当前 schema）。旧库在打开时按序迁移，每步一个事务；历史版本见 `src/vm.rs` 顶部注释。v8 起有快照表，v9 起有 `agent_steps`，v10 补截断列，v11 起有 `vm_policies`
+- `vm_dirty(path)`：整文件 hash 尚未更新的文件。经挂载的写入（`write_range_deferred`）只改 chunk、size、mtime，路径记入此表；读取 `vm_fs.hash` 的操作（快照、diff、物化、sync、verify、ls/stat）先调用 `finalize_dirty` 补算，`vm_open` 与卸载时也会补算。只读挂接的 Base 或 vm-inject 包若有未补算的行会被拒绝
+- 库 `application_id = 0x564D5351 ("VMSQ")`，`user_version = 13`（当前 schema）。旧库在打开时按序迁移，每步一个事务；历史版本见 `src/vm/mod.rs` 顶部注释。v8 起有快照表，v9 起有 `agent_steps`，v10 补截断列，v11 起有 `vm_policies`，v12 起有 `vm_dirty`，v13 起有 `vm_undo*`
 
 新库 `page_size 8192`, `auto_vacuum=INCREMENTAL`；`--vm-only` 跳过 SELF 专用表（`segments/symbols/self_blob/bundle_*` 等）。连接 PRAGMA：`journal_mode=WAL synchronous=NORMAL mmap_size=256M busy_timeout=5000 journal_size_limit=64M`。
 
@@ -31,19 +32,30 @@ self vm-status /tmp/alpine.vm.db
 ```sh
 self vm-chroot /tmp/alpine.vm.db                              # 交互 shell
 self vm-chroot /tmp/alpine.vm.db /bin/sh -c 'cat /etc/alpine-release; ls /'
-self vm-chroot /tmp/alpine.vm.db --ephemeral /bin/sh -c 'echo tmp-only'   # 不回写、不保存 history
-self vm-exec   /tmp/alpine.vm.db /bin/busybox -- --help                  # 单文件：仅 materialize 所需文件
+self vm-chroot /tmp/alpine.vm.db --ephemeral /bin/sh -c 'echo tmp-only'   # 丢弃本次会话的全部改动
+self vm-exec   /tmp/alpine.vm.db /bin/busybox -- --help                  # 单文件：root 只含该程序与库
 self vm-mount  /tmp/alpine.vm.db /tmp/mnt                                 # FUSE 挂载（需 /dev/fuse，--features fuse）
 ```
 
-`vm-chroot` 选择顺序：
+`vm-chroot`、`vm-exec`、`vm-step`、`vm-agent` 都通过同一个 sandbox（`src/sandbox.rs`）运行 VM 内容，隔离参数、syscall 过滤、资源限制与环境变量一致，见「安全边界」§1。无法建立 sandbox 时拒绝运行，不会退化为无隔离执行。
 
-1. 构建含 `fuse` 且 `/dev/fuse` 存在 → FUSE 挂载 `vm_fs`，再 `bwrap --bind <mnt> /`，不落盘到 `/tmp`。
-2. 否则 → `vm_materialize_tree` 到 `$TMPDIR/self-vm-XXXXXX`，`bwrap` 或 `unshare` 进入；退出后 `vm_sync_from_host` 把改动写回 DB。
+`vm-chroot` 的根：
 
-`bwrap` 缺失 → `unshare`；再缺失 → `chroot`（需 root）。
+1. 默认（持久）：构建含 `fuse` 且 `/dev/fuse` 存在 → FUSE 挂载 `vm_fs` 作为 sandbox 的根，写入当场落库。
+2. 否则或 `--ephemeral` → `vm_materialize_tree` 到临时目录作为根；持久会话退出后 `vm_sync_from_host` 回写，`--ephemeral` 不回写并删除目录。
 
-`--persist`（默认）：history 存 `<cache>/history/<db_hash>/.ash_history`。`--ephemeral`：不回写、不保存 history，删除临时目录。
+shell history 为 VM 内的 `/.ash_history`，随 VM 内容保存；`--ephemeral` 会话不保留。
+
+sandbox 参数（四个命令通用）：
+
+```sh
+--isolation bwrap|gvisor      # 隔离后端，默认 bwrap；也可用 $SELF_SANDBOX_ISOLATION
+--memory-mb N --pids N --cpu-percent N        # 整个 sandbox 的 cgroup 限制
+--address-space-mb N --cpu-secs N --file-mb N # 每个进程的 rlimit
+--no-limits                   # 不设任何限制，仅用于可信代码
+```
+
+默认值：内存 2048 MiB（`vm-agent` 为 4096）、进程数 1024、CPU 200%（两个核）、单文件 1024 MiB；`vm-agent` 另设地址空间 2048 MiB。
 
 ## 快照与维护
 
@@ -190,11 +202,13 @@ self vm-agent work.db --base base.db -- "任务"    # work.db 作为只读 base.
 self vm-policy work.db add-readonly /tests
 self vm-policy work.db add-max-size 1048576
 self vm-policy work.db add-disk-quota 536870912    # 逻辑总字节上限
-self vm-agent work.db --mem-mb 2048 --cpu-secs 120 --file-mb 256 "..."
+self vm-agent work.db --memory-mb 4096 --pids 512 --cpu-percent 200 --cpu-secs 120 --file-mb 256 "..."
 ```
 
-- `--mem-mb` 是 `RLIMIT_AS`，默认 2048。node 需要 ≥1536 才能启动（低于此共享库映射失败），
-  所以它是防失控的底线，不是紧配额。
+- `--memory-mb` 是整个 sandbox 的 cgroup `memory.max`（禁用 swap），超出时内核 OOM 结束 sandbox 内的进程。
+- `--address-space-mb` 是每个进程的 `RLIMIT_AS`，`vm-agent` 默认 2048：超出时 node 得到可捕获的 `RangeError`，
+  而不是被 kill。node 需要 ≥1536 才能启动（低于此共享库映射失败）。
+- 此前的 `--mem-mb`（即 `RLIMIT_AS`）已改名为 `--address-space-mb`。
 - `disk_quota` 在**单库**和 **Delta** 两种形态下都生效：Delta 没有自己的策略表，
   叠加层在写前检查 Base 的规则（含只读前缀、单文件上限、总配额）。
 
@@ -214,16 +228,100 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
 - guest 侧目前需要自己拼 `http://127.0.0.1:<port>/pkg/<host>/<path>`（VM 内没有
   `curl`，可用 python3 的 `http.client`）；没有 `HTTP_PROXY` 自动集成。
 
+## 长期 session
+
+一个 session 只物化一次树，并让一个 sandbox 在整个 session 期间常驻；sandbox 内的 supervisor（`src/session/init.c`，构建时静态链接）执行宿主发来的每条命令。命令留下的后台进程（dev server、watcher）在命令之间继续运行。
+
+```rust
+let mut s = selfdb::session::Session::start(&db, &SessionOptions { isolation, ..Default::default() })?;
+let r = s.exec(&argv, &ExecOptions { timeout_secs: 60, rollback_on_fail: true, ..Default::default() })?;
+s.close();
+```
+
+- 每条命令仍是一个记录在 `agent_steps` 的 step，代价与它改动的路径数成正比，而不是与树的大小成正比：
+  - inotify 监视树的每个目录（`src/session/watch.rs`），命令结束后只回写变化过的路径。事件队列溢出、目录被移动或无法添加监视时，该次回写整棵树，并重建监视。
+  - 每条命令有一条 undo 记录（schema v13 的 `vm_undo*`）：写入或删除任何行之前，先保存该行原来的内容（含 chunk 引用，blob 引用计数由触发器维护）。变更清单由 undo 记录与当前行比较得出；回滚即应用 undo 记录。`agent_steps.undo_id` 指向它，`snap_before` 记为 `undo:<id>`。
+  - `Session::rewind(undo_id)` 从最新一条到指定的那条依次应用 undo 记录，回到该命令之前的状态。
+  - 回滚后先删除树中被恢复的文件，再物化：物化按大小与秒级 mtime 判断是否重写，同一秒内的等长改写否则会留在树中（已有测试）。
+- 命令在独立的 session 中运行，超时结束其整个进程组；输出写入文件，后台进程持有输出不会阻塞请求。命令之间后台进程的写入计入下一条命令。
+- session 持有数据库的 step 锁，期间其他 step 与 session 等待。
+- gVisor 下以 `--file-access=shared` 运行：回滚时宿主恢复树，独占模式下 gVisor 看不到这一改动（已实测）。
+- 根为物化树而非 FUSE 挂载（挂载上文件密集负载慢 5–12 倍）。
+- 不覆盖：经硬链接修改另一名字的内容（inotify 只报告被打开的那个名字）；经 mmap 写入且不关闭的文件（在关闭时才报告）。
+- 实测（dev 工具集，49,328 个条目，3 次最小值）：
+
+  | 项 | bwrap | gVisor |
+  |---|---|---|
+  | 启动 session | 1.82 s | 2.20 s |
+  | 空命令 | 5 ms | 7 ms |
+  | 复制 2k 文件的目录树 | 158 ms | 306 ms |
+  | git add + commit 该树 | 331 ms | 823 ms |
+  | gcc 编译 ×20 | 421 ms | 884 ms |
+
+  改为增量之前（每条命令全量回写、全量快照、全量 diff），空命令为 1246 ms / 1283 ms。
+
 ## 安全边界
 
 本节说明每一层保证什么、不保证什么。这些是重要的，因为它们决定能把什么样的代码放进哪一层执行。
 
-### 1. 沙箱（bwrap，`agent-step`）
+### 1. 沙箱（`src/sandbox.rs`，所有运行 VM 内容的命令）
 
-- 隔离：独立 PID 命名空间（`--unshare-pid`）、独立网络命名空间（`--unshare-net`，只剩未启用的 `lo`）、`--die-with-parent`，根为物化树。
-- 验证：从沙箱内读取 `/proc/net/dev`，只看到 `lo`；去掉 `--unshare-net` 后看到宿主全部网卡（测试守护）。在宿主 `127.0.0.1` 与局域网地址上各放置一个服务，无隔离时可连通，隔离后不可连通。
-- 不保证：文件系统层面的 uid 隔离（沙箱内仍以调用者身份运行）；`/proc` 与 `/dev` 为宿主挂载，只是 bwrap 的默认提供。
-- 不保证：资源限制（CPU、内存、磁盘写量）。超时是唯一的时间限制。
+隔离后端二选一：
+
+| 后端 | 边界 | 状态 |
+|---|---|---|
+| bwrap（默认） | Linux 命名空间 + seccomp，与宿主共享内核 | 已测试 |
+| gVisor（`--isolation gvisor`） | 用户态内核 `runsc`，sandbox 的 syscall 由它处理 | 已测试（runsc release-20261019.0，rootless） |
+
+bwrap 后端的隔离：
+
+- 命名空间：user、pid、net、ipc、uts、cgroup（`--unshare-all --unshare-user`），`--disable-userns` 禁止在 sandbox 内再建 user namespace；网络命名空间只有未启用的 `lo`。
+- syscall 过滤：x86_64 seccomp 拒绝列表，包括模块加载、mount 系列、keyring、bpf、perf、userfaultfd、io_uring、namespace 创建（`unshare`、`setns`、带 `CLONE_NEW*` 的 `clone`）、时钟与系统状态修改；非 x86_64 的 syscall 表直接 kill。编号与内核头文件的一致性由测试检查。
+- 环境变量：只有调用方显式给出的变量（`--clearenv`），宿主环境（含凭据）不进入 sandbox。
+- 非交互运行使用 `--new-session`，sandbox 无法向调用方终端注入输入。
+- `--die-with-parent`；超时或结束时整个 cgroup 内的进程都被结束，包括后台进程。
+
+资源限制：
+
+- 每个 sandbox 一个 cgroup v2：`memory.max`（禁用 swap）、`pids.max`、`cpu.max`。来源二选一：`$SELF_SANDBOX_CGROUP` 指向的委托 cgroup（服务以 `Delegate=yes` 运行时；本进程会移入其下的 `supervisor` 子组），或 systemd 用户会话的临时 scope。两者都没有时，设置了限制的 sandbox 拒绝启动。
+- 每个进程的 rlimit：`RLIMIT_AS`、`RLIMIT_CPU`、`RLIMIT_FSIZE`。
+
+不保证：
+
+- bwrap 后端与宿主共享内核：seccomp 允许范围内的内核漏洞可越过边界。不可信的多租户场景应使用 gVisor 后端。
+
+gVisor 后端：
+
+- `runsc` 路径由 `$SELF_RUNSC` 指定，否则在 PATH 中查找。以 rootless 方式运行：`--network=none`、`--overlay2=none`（根目录的写入直接落到物化树，供回写）、`--host-uds=open`（agent 经绑定进来的 unix socket 访问宿主代理）。cgroup 限制与 bwrap 相同，施加在 runsc 外层；rlimit 写入 OCI 配置，由 gVisor 内核执行。
+- OCI 配置中不声明 user namespace：`--rootless` 自行建立，在配置中声明会使 gofer 启动失败。
+- 兼容性：git、python3（含 ssl/sqlite3）、gcc 编译运行、make、node、pi 均可运行（`tests/gvisor.rs`）。
+- 实测耗时（物化树为根，dev 工具集，每项取 3 次最小值）：
+
+  | 负载 | bwrap | gVisor | 倍数 |
+  |---|---|---|---|
+  | 启动 sandbox 并执行 `true` | 38 ms | 61 ms | 1.6 |
+  | python3 启动 ×20 | 189 ms | 319 ms | 1.7 |
+  | node 启动 ×20 | 1065 ms | 1698 ms | 1.6 |
+  | gcc 编译 ×20 | 461 ms | 882 ms | 1.9 |
+  | 复制 2k 文件的目录树 | 59 ms | 251 ms | 4.3 |
+  | git add + commit 该树 | 190 ms | 581 ms | 3.0 |
+  | tar 打包并解包 | 88 ms | 319 ms | 3.6 |
+  | 遍历 2k 文件 ×20 | 88 ms | 310 ms | 3.5 |
+
+  计算密集负载约慢 1.6–1.9 倍，文件密集负载约慢 3–4 倍。
+
+- 以 FUSE 挂载为根（`tests/gvisor.rs` 的 `workload_timings_mount_vs_materialized`）：文件密集负载比物化树慢 5–12 倍，gVisor 在挂载上又比 bwrap 慢 1.5–2 倍；git add+commit 2k 文件：bwrap/物化树 189 ms，gVisor/挂载 1828 ms。因此长期 session 应以物化树为根，每步回写变更，而不是以挂载为根。
+- 端到端 agent 任务（`tests/e2e_isolation.rs`，每项 2 次，均由外部重跑测试确认完成）：
+
+  | 任务 | 隔离 | 总耗时 | 等待模型 | 其余（sandbox、工具、物化与回写、agent） |
+  |---|---|---|---|---|
+  | node 修 bug | bwrap | 24.0–24.9 s | 20.2–21.3 s | 3.7–3.8 s |
+  | node 修 bug | gVisor | 25.7–27.4 s | 21.6–23.4 s | 4.0–4.1 s |
+  | C 项目修编译错误 | bwrap | 20.6–25.3 s | 16.9–21.6 s | 3.7 s |
+  | C 项目修编译错误 | gVisor | 19.8–21.5 s | 15.1–17.0 s | 4.5–4.7 s |
+
+  gVisor 比 bwrap 每个任务多 0.3–1.0 s，约占总耗时的 1–4%；同一配置两次运行之间，模型等待时间的差异（最大 4.7 s）大于隔离方式带来的差异。
+- 文件系统层面的 uid 隔离：sandbox 内仍以调用者身份访问其根目录。
 
 ### 2. 挂载（FUSE，`vm-mount`、`vm-chroot` 的 FUSE 路径）
 
@@ -234,20 +332,17 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
   - 符号链接改写只作用于 `readlink` 返回的文本。其他读取链接目标的接口未做改写，也未做测试。
   - 挂载内再挂载（嵌套挂载）未测试，其行为不作保证。
   - 进程仍可访问宿主的网络、进程表与其他文件。
-- 结论：挂载用于检视与人工操作。**不可信代码应只在 bwrap 沙箱中运行**，并以物化树为根，不应以挂载为根。
+- 结论：挂载本身不隔离任何东西。`vm-chroot` 以挂载为根时，进程运行在 §1 的 sandbox 内，隔离由 sandbox 提供；直接在宿主上访问挂载点的进程不受任何限制。
 
-### 3. 不一致之处（需要注意）
+### 3. 数据库文件
 
-`vm-chroot` 的 FUSE 路径与 `agent-step` 的隔离参数不同：
+VM 数据库、Base、vm-inject 的包都可能来自他人。所有连接都启用 SQLite 的防御设置：
 
-| 项 | `agent-step`（bwrap） | `vm-chroot`（FUSE 路径） |
-|---|---|---|
-| PID 命名空间 | 是 | 是 |
-| 网络命名空间 | 是（`--unshare-net`） | **否** |
-| `--die-with-parent` | 是 | **否** |
-| 根 | 物化树 | FUSE 挂载 |
+- `SQLITE_DBCONFIG_DEFENSIVE`：禁止 `writable_schema` 与直接改写影子表。
+- `trusted_schema=OFF`：文件中的触发器与视图只能调用标记为无副作用的函数。
+- `cell_size_check=ON`：读取时检查页内 cell 边界。
 
-因此经 `vm-chroot` 运行的程序仍与宿主共享网络。在它上面运行不可信代码是不安全的，应改用 `agent-step`。
+`vm-inject` 以只读方式挂接包，合并前运行 `quick_check`，损坏的包被拒绝。
 
 ### 4. 策略与数据完整性
 
@@ -260,10 +355,22 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
 - `compress_bytes` 按大小选 zstd 级别（≤16K:3，≤100K:6，其余:19），仅对 >1K 且有收益者压缩；小文件可走字典（`compressed=3`）。
 - 实测 Alpine minirootfs：7.79M logical → 3.09M blob（lvl19）→ 3.2M db 文件。
 - FUSE `statfs` 报告 `blocks = sum(blob)/4096`，因此 VM 内 `df` 显示压缩后大小。
+- 经挂载的写入按 zstd level 3 压缩，不写宿主内容缓存（每次 write 都会重写所触及的 chunk）；`vm-recompress` 之后可把这些 blob 提到 level 19。
+- FUSE 挂载实测（`/usr/include`，30,700 条目，312 MB；与原生文件系统对比）：
+
+  | 操作 | 原生 | 挂载 |
+  |---|---|---|
+  | `find` 遍历 | 29 ms | 107 ms |
+  | 读全部文件，首次 / 第二次 | 419 ms | 1.9 s / 1.0 s |
+  | 写 2000 个小文件 | 28 ms | 401 ms |
+  | 写一个 200 MB 文件 | 68 ms | 0.66 s |
+  | 解包 30k 文件（tar） | 379 ms | 15 s |
+
+  解包每个文件约 0.5 ms，其中数据库操作约 0.1 ms，其余是 FUSE 请求往返（守护进程单线程处理请求）。
 
 ## 实现位置
 
-- `src/vm.rs`：存储层、导入导出、压缩、快照、磁盘块
+- `src/vm/`：存储层，按职责分为 `schema`/`codec`/`store`/`read`/`import`/`tree`/`snapshot`/`maint`/`cache`/`mem`/`disk`（模块说明见 `src/vm/mod.rs`）
 - `src/fuse.rs`：`VmFuse`（fuser，`--features fuse`）
 - `src/owner.rs`：挂载所有者、符号链接的挂载视图改写
 - `src/policy.rs`：写入策略（触发器与叠加层检查）
@@ -277,8 +384,8 @@ self vm-agent work.db --base base.db --allow-hosts registry.npmjs.org -- "..."
 - `vm-mem-trace` 依赖宿主 `strace`，仅 Linux。
 - `vm-chroot` 回落路径会物化整个 rootfs 到临时目录，大镜像慢。
 - FUSE 写入路径未做挂载端到端测试：本机无 root，挂载在用户命名空间内只能把挂载者映射为 uid 0，无法验证以非 0 uid 写入。见「安全边界」§2。
-- 挂载不是隔离边界；`vm-chroot` 的 FUSE 路径与 `agent-step` 的隔离参数不一致，且网络未隔离（已实测）。见「安全边界」§2、§3。
-- `vm-agent --fuse` 是实验性的：能挂载、能启动 agent、/tmp 不留物化树，但 pi 以 `O_EXCL` 打开会话文件时本 FUSE 层报错，因此默认仍走物化路径。
+- gVisor 后端以 FUSE 挂载为根的组合未测试；`tests/gvisor.rs` 的兼容性与性能测试为 `#[ignore]`，需设置 `SELF_RUNSC` 后运行。
+- `vm-agent --fuse` 是实验性的：能挂载、能启动 agent、/tmp 不留物化树。此前 pi 以 `O_EXCL` 打开会话文件失败，原因是 `create` 把 open(2) 的 flags 当作回复的 `FOPEN_*` flags 返回（`O_EXCL` 与 `FOPEN_PASSTHROUGH` 同为 bit 7），已修复；完整的 agent 运行尚未在挂载上验证，因此默认仍走物化路径。
 - Delta 上跑 agent 时，快照 diff 只比较 Delta 自身，所以一个被修改的既有文件会显示为 `created` 而不是 `modified`（内容正确）。
 - 包下载通道没有 guest 侧代理变量集成，VM 内也没有 `curl`；需自行发 `http://127.0.0.1:<port>/pkg/<host>/<path>`。
 - 注入不检查目标是否正在使用；注入与一个正在运行的步骤同时进行时，行为未定义。

@@ -30,7 +30,7 @@ fn step_records_output_exit_code_and_changes() {
     let (d, db) = make("record");
     let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(),
         "echo hello-out; echo hello-err >&2; echo after > /work/change.txt; echo new > /work/added.txt; rm /work/keep.txt".into()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES, ..agent::StepOptions::new(0) }).unwrap();
     assert_eq!(r.exit_code, 0);
     assert!(String::from_utf8_lossy(&r.stdout).contains("hello-out"));
     assert!(String::from_utf8_lossy(&r.stderr).contains("hello-err"));
@@ -50,7 +50,7 @@ fn failing_step_with_rollback_restores_state() {
     let (d, db) = make("rollback");
     let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(),
         "echo damage > /work/change.txt; rm /work/keep.txt; exit 3".into()],
-        &agent::StepOptions { rollback_on_fail: true, timeout_secs: 30, max_output_bytes: selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+        &agent::StepOptions { rollback_on_fail: true, timeout_secs: 30, max_output_bytes: selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES, ..agent::StepOptions::new(0) }).unwrap();
     assert_eq!(r.exit_code, 3);
     assert!(r.rolled_back, "a failing step with rollback must be rolled back");
     let c = vm::vm_open(db.to_str().unwrap()).unwrap();
@@ -67,7 +67,7 @@ fn failing_step_without_rollback_keeps_changes() {
     if !step_available() { eprintln!("skip: bwrap not available"); return; }
     let (d, db) = make("keep");
     let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "echo changed > /work/change.txt; exit 1".into()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES, ..agent::StepOptions::new(0) }).unwrap();
     assert_eq!(r.exit_code, 1);
     assert!(!r.rolled_back);
     let c = vm::vm_open(db.to_str().unwrap()).unwrap();
@@ -80,7 +80,7 @@ fn timeout_kills_the_step_and_is_recorded() {
     if !step_available() { eprintln!("skip: bwrap not available"); return; }
     let (d, db) = make("timeout");
     let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "sleep 30".into()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 1, max_output_bytes: selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 1, max_output_bytes: selfdb::agent::DEFAULT_MAX_OUTPUT_BYTES, ..agent::StepOptions::new(0) }).unwrap();
     assert!(r.timed_out, "the step must be reported as timed out");
     assert_ne!(r.exit_code, 0);
     let _ = std::fs::remove_dir_all(&d);
@@ -94,7 +94,7 @@ fn oversized_output_is_capped_and_the_child_still_finishes() {
     // full pipe: it has to run to completion and report its own exit code.
     let script = "i=0; while [ $i -lt 4000 ]; do echo 0123456789012345678901234567890123456789012345678901234; echo e0123456789012345678901234567890123456789012345678901234 >&2; i=$((i+1)); done; echo done-marker; exit 7";
     let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), script.into()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: 1024 }).unwrap();
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: 1024, ..agent::StepOptions::new(0) }).unwrap();
     assert_eq!(r.exit_code, 7, "child must finish and report its own exit code");
     assert!(!r.timed_out);
     assert!(r.stdout_truncated && r.stderr_truncated, "both streams exceed the cap");
@@ -115,7 +115,7 @@ fn output_under_the_cap_is_kept_whole_and_not_flagged() {
     if !step_available() { eprintln!("skip: bwrap not available"); return; }
     let (d, db) = make("nocap");
     let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "echo small-out; echo small-err >&2".into()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: 1024 }).unwrap();
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: 1024, ..agent::StepOptions::new(0) }).unwrap();
     assert_eq!(r.stdout, b"small-out\n");
     assert_eq!(r.stderr, b"small-err\n");
     assert!(!r.stdout_truncated && !r.stderr_truncated);
@@ -130,7 +130,7 @@ fn step_runs_in_its_own_network_namespace() {
     // loopback, not the host's interfaces (the host has at least one non-loopback NIC here).
     let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(),
         "while read l; do echo \"IF:$l\"; done < /proc/net/dev".into()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES, ..agent::StepOptions::new(0) }).unwrap();
     assert_eq!(r.exit_code, 0);
     let out = String::from_utf8_lossy(&r.stdout);
     let ifaces: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("IF:"))
@@ -148,7 +148,7 @@ fn agent_log_json_is_valid_and_keeps_exact_paths() {
     let odd = "/odd\nname\"q.txt";
     let script = "printf y > \"$(printf '/odd\\nname\"q.txt')\"; exit 3".to_string();
     let r1 = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), script.clone()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES, ..agent::StepOptions::new(0) }).unwrap();
     assert_eq!(r1.exit_code, 3);
     let rows = agent::list_steps(&db, None).unwrap();
     assert_eq!(rows.len(), 1);
@@ -169,7 +169,7 @@ fn list_steps_limit_keeps_the_most_recent() {
     let (d, db) = make("alimit");
     for i in 0..3 {
         agent::run_step(&db, &["/bin/sh".into(), "-c".into(), format!("exit {}", i)],
-            &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES }).unwrap();
+            &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES, ..agent::StepOptions::new(0) }).unwrap();
     }
     let all = agent::list_steps(&db, None).unwrap();
     assert_eq!(all.iter().map(|r| r.exit_code).collect::<Vec<_>>(), vec![0, 1, 2], "oldest first");
@@ -192,7 +192,7 @@ fn a_write_the_policy_refuses_does_not_look_like_success() {
         selfdb::policy::add(&c, &selfdb::policy::Rule::ReadonlyPrefix("/etc".into())).unwrap();
     }
     let r = agent::run_step(&db, &["/bin/sh".into(), "-c".into(), "echo tampered > /etc/app.conf".into()],
-        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES });
+        &agent::StepOptions { rollback_on_fail: false, timeout_secs: 30, max_output_bytes: agent::DEFAULT_MAX_OUTPUT_BYTES, ..agent::StepOptions::new(0) });
     let content = {
         let c = vm::vm_open(db.to_str().unwrap()).unwrap();
         vm::vm_cat(&c, "/etc/app.conf").unwrap()

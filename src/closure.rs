@@ -12,8 +12,8 @@ fn expand_runpath(raw: &str, bdir: &Path) -> Vec<PathBuf> {
             else { tok.replace("$ORIGIN", &bdir_str) }
         } else { tok.to_string() };
         if expanded=="." || expanded=="./" || expanded.is_empty() { out.push(bdir.to_path_buf()); continue; }
-        if expanded.starts_with("./") {
-            out.push(bdir.join(&expanded[2..]));
+        if let Some(rest) = expanded.strip_prefix("./") {
+            out.push(bdir.join(rest));
         } else {
             out.push(PathBuf::from(expanded));
         }
