@@ -94,3 +94,32 @@ fn templates_tasks_rollouts_judge_fork_and_tenants() {
         .filter(|e| e.path().parent().map(|p| p.ends_with("layers")).unwrap_or(false)).count();
     assert_eq!(left, 0, "unused layers are removed");
 }
+
+#[test]
+fn deep_fork_chains_and_directories_the_agent_locked() {
+    if !bwrap_ok() { return; }
+    let s = start("chain");
+    let image = s.svc.store().import_image(s.svc.control(), "mini", &rootfs(&s.dir)).unwrap();
+    let a = tenant(&s, "a", Quotas { max_session_disk_bytes: 1 << 20, ..Quotas::default() });
+    let mut sid = a.ok("POST", "/v1/sessions", Some(json!({"template_id": image.id})))["session_id"].as_str().unwrap().to_string();
+    // a directory the host user cannot read: forks, freezes and the disk quota must still see into it
+    let r = a.bash(&sid, "mkdir -p /w/locked/in && echo x > /w/locked/in/f && echo 0 > /w/g0 && chmod 000 /w/locked/in /w/locked");
+    assert_eq!(r["exit_code"], 0, "{}", r);
+    // each generation forks the previous one, which then ends: one more layer per generation unless merged
+    for g in 1..=20 {
+        let kid = a.ok("POST", &format!("/v1/sessions/{}/fork", sid), Some(json!({"variants": [{}]})))["session_ids"][0].as_str().unwrap().to_string();
+        a.ok("DELETE", &format!("/v1/sessions/{}", sid), None);
+        sid = kid;
+        let r = a.bash(&sid, &format!("echo {} > /w/g{}; rm -f /w/g{}", g, g, g - 1));
+        assert_eq!(r["changes"]["created"], json!([format!("/w/g{}", g)]), "generation {}: {}", g, r);
+    }
+    let r = a.bash(&sid, "ls /w; chmod 700 /w/locked /w/locked/in && cat /w/locked/in/f");
+    assert_eq!(r["output"], "g20\nlocked\nx\n", "{}", r);
+    let mounts = a.bash(&sid, "cat /proc/self/mountinfo")["output"].as_str().unwrap().to_string();
+    let root = mounts.lines().find(|l| l.split(' ').nth(4) == Some("/")).unwrap();
+    let lowers = root.split("lowerdir=").nth(1).unwrap().split(',').next().unwrap().split(':').count();
+    assert!(lowers <= 1 + selfdb::env::store::MAX_LAYERS, "the template's layer and at most MAX_LAYERS of the forks', not one per generation: {}", root);
+    // written, then locked: still counted against the disk quota
+    let (code, body) = a.req("POST", &format!("/v1/sessions/{}/actions", sid), Some(json!({"tool": "bash", "command": "mkdir /w/h && head -c 2097152 /dev/zero > /w/h/big && chmod 000 /w/h"})));
+    assert_eq!(code, 429, "{}", body);
+}

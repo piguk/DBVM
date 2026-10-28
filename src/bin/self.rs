@@ -351,6 +351,8 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(code?);
         },
         Cmd::EnvServe{data, listen, node} => {
+            // before any thread starts: access to everything the sandboxes write, whatever its modes
+            selfdb::access::enter_owner_namespace()?;
             let svc = selfdb::env::service::Service::open(Path::new(&data), &node)?;
             eprintln!("environment service on {} (data {}, node {})", listen, data, node);
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;

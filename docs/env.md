@@ -7,7 +7,7 @@
 | 名称 | 含义 |
 |---|---|
 | 模板（template） | 不可变：一个 VM 数据库（`base.db`）加一组有序的只读层。系统模板由服务商导入，所有租户可用；租户模板由 freeze 产生，只有该租户可见 |
-| 层（layer） | 只读目录，作为 overlay 的 lower 被多个 rollout 共享。第一层是物化后的树，之后每层是一次 freeze 或 fork 冻结下来的 upper |
+| 层（layer） | 只读目录，作为 overlay 的 lower 被多个 rollout 共享。第一层是物化后的树，之后每层是一次 freeze 或 fork 冻结下来的 upper；fork 链超过 16 层时，子 rollout 的 fork 层合并为一层 |
 | build session | 基于模板、用于定制环境的 session；可以开放出站白名单（pip、npm、git） |
 | rollout | 基于任务的 session；无网络，只读路径由 mount 强制 |
 | 任务（task） | 模板 + 只读路径 + 判分命令 + 资源限制 + 种子变量 |
@@ -27,6 +27,7 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 - 以 systemd 服务运行，`Delegate=yes`，并设置 `SELF_SANDBOX_CGROUP` 为服务自身的 cgroup：每个 sandbox 一个子 cgroup（见 `docs/vm.md`「安全边界」）。
 - 数据目录布局见 `src/env/store.rs`；`run/` 为运行中 rollout 的 upper，服务重启时清空。
 - `env-admin` 只打开控制库与存储，不影响运行中的服务。
+- `env-serve` 启动时进入一个只映射自身 uid/gid 的 user namespace，保留 `CAP_DAC_OVERRIDE`、`CAP_DAC_READ_SEARCH`、`CAP_FOWNER`（只对本用户的文件有效）。原因：agent 在 sandbox 内是 root，可以把目录设为 000；没有这些权限，宿主侧的复制、diff 和磁盘配额统计会读不到这些目录。在该 namespace 中 setuid 程序不生效，因此 bwrap 不能依赖 setuid 安装。
 - 节点 id（`--node`）是所有对象 id 的前缀，为多节点路由预留。
 
 ## 接口（`/v1`）
@@ -43,7 +44,7 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 | POST | `/v1/rollouts` | `{"task_id", "variants": [{"label", "seed"}, ...]}`：同一起点的多个 rollout |
 | POST | `/v1/sessions/{id}/actions` | 执行一个动作 |
 | POST | `/v1/actions` | `[{"session_id", "action"}, ...]`：多个 session 各执行一个动作，并发进行 |
-| POST | `/v1/sessions/{id}/fork` | `{"variants": [...]}`：从当前状态分叉；父 session 继续运行 |
+| POST | `/v1/sessions/{id}/fork` | `{"variants": [...]}`：从当前文件系统状态分叉；父 session 继续运行（见下文「fork」） |
 | POST | `/v1/sessions/{id}/freeze` | `{"name"}`：保存为本租户模板 |
 | POST | `/v1/sessions/{id}/judge` | 判分 |
 | GET | `/v1/sessions/{id}/trajectory` | 轨迹（JSON lines），session 结束后仍可获取 |
@@ -77,10 +78,17 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 ```
 
 - `readonly`：rollout 开始前以只读方式挂载（模板中的原内容）；模板中不存在的路径挂载为空的只读目录，agent 也无法创建。
-- `judge`：在新的 sandbox 中运行，根为原始模板加上 rollout 在 `sees` 路径下的改动，其他路径一律来自原始模板；agent 改动 `/usr` 或留下的后台进程影响不到判分。命令输出一个 JSON 对象，含数值 `reward`（整个 stdout，或最后一个非空行）；退出码非 0、超时或没有 `reward` 时 `reward` 为 null 并给出 `error`。
+- `judge`：在新的 sandbox 中运行，根为原始模板加上 rollout 在 `sees` 路径下的改动，其他路径一律来自原始模板；agent 改动 `/usr` 或留下的后台进程影响不到判分。`sees` 路径下的内容会被判分命令读取甚至执行（例如 `/repo/conftest.py`），任务设计需要考虑这一点：隔离只排除环境污染，判分规则本身的漏洞仍需任务作者处理。命令输出一个 JSON 对象，含数值 `reward`（整个 stdout，或最后一个非空行）；退出码非 0、超时或没有 `reward` 时 `reward` 为 null 并给出 `error`。
 - 可复现：rollout 的 seed 写入 `seed_env` 与 `PYTHONHASHSEED`；固定 `TZ=UTC`、`LANG=LC_ALL=C.UTF-8`、hostname `vm`；独立 PID namespace。系统时钟不虚拟化。
 - 不带 `judge` 时，训练方可根据轨迹与 diff 自行计算奖励。
 - `limits` 每项都有上限（例如内存 32 GiB），0 不被接受为"不限"。
+
+### fork
+
+- 复制的是文件系统状态。进程、内存、打开的文件和 socket 不复制：子 rollout 从父 rollout 的文件重新开始，父 rollout 的后台服务需要在子 rollout 中重新启动。
+- 复制期间父 rollout 的所有进程被冻结（cgroup v2 freezer），复制结果是某一时刻的完整状态，不会混入复制过程中新写的文件。冻结不保证应用自身的一致性：例如某个进程正处在两次写入之间，这个中间状态会被原样复制。需要应用级一致性时，应在 fork 前让应用到达安全点。
+- 只能从当前状态分叉。要从轨迹中较早的某一步分叉，需要在那一步时做 fork 并保留该子 session。
+- 每次 fork 请求复制一次父 rollout 的 upper（自它启动以来写入的内容），同一请求中的多个子 rollout 共用这一层。
 
 ### 出站
 
@@ -103,12 +111,12 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 
 | 指标 | 结果 |
 |---|---|
-| 启动一个 rollout | p50 21.9 ms，p95 28.2 ms |
-| fork 一个子 rollout | p50 21.1 ms，p95 28.7 ms |
-| 空动作（服务内 / 经 HTTP） | p50 1.37 ms / 1.55 ms |
-| 500 个空闲 rollout | 依次启动共 11.2 s，每个约 0.84 MB 内存 |
-| 64 个 session 并发、每个 20 次写读动作 | 6886 动作/秒 |
+| 启动一个 rollout | p50 20.8 ms，p95 26.1 ms |
+| fork 一个子 rollout（含冻结父 rollout） | p50 18.2 ms，p95 24.9 ms |
+| 空动作（服务内 / 经 HTTP） | p50 1.36 ms / 1.53 ms |
+| 500 个空闲 rollout | 依次启动共 11.4 s；每个 0.84–1.25 MB 内存（两次运行。整机 `MemTotal − MemAvailable` 的增量除以 500：含内核内存，不含可回收的 page cache，受宿主上其他进程影响） |
+| 64 个 session 并发、每个 20 次写读动作 | 6917 动作/秒 |
 
 ## 不在当前范围内
 
-多节点调度与模板分发、gVisor 下的 overlay rollout（gVisor 的 overlay 以自有格式保存写入，宿主无法逐路径读取）、rollout 的逐步 undo（以 fork 代替）、从 Docker 镜像导入、计费与支付、虚拟时钟、PTY 与端口暴露。批量创建 rollout 目前依次启动。
+多节点调度与模板分发、gVisor 下的 overlay rollout（gVisor 的 overlay 以自有格式保存写入，宿主无法逐路径读取）、rollout 的逐步 undo 与从历史步骤分叉（以 fork 代替）、运行态（进程与内存）的 fork、从 Docker 镜像导入、计费与支付、虚拟时钟、PTY 与端口暴露。批量创建 rollout 目前依次启动。

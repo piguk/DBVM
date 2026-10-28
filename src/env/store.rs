@@ -23,9 +23,14 @@ pub const MAX_LAYERS: usize = 16;
 
 pub struct Store { pub root: PathBuf, pub node: String }
 
-/// Total size of the regular files below `path`.
-pub fn dir_bytes(path: &Path) -> i64 {
-    walkdir::WalkDir::new(path).into_iter().flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len() as i64).sum()
+/// Total size of the regular files below `path` (a layer: nothing changes it).
+pub fn dir_bytes(path: &Path) -> Result<i64> {
+    let mut n = 0;
+    for e in walkdir::WalkDir::new(path).follow_links(false) {
+        let md = e?.metadata()?;
+        if md.is_file() { n += md.len() as i64; }
+    }
+    Ok(n)
 }
 
 impl Store {
@@ -53,16 +58,19 @@ impl Store {
         ids.iter().map(|id| control.layer(id)?.map(|l| l.path).ok_or_else(|| anyhow!("missing layer {}", id))).collect()
     }
 
-    /// A new layer holding a copy of `src` (an upper directory), owned by `tenant`.
-    pub fn new_layer(&self, control: &ControlDb, tenant: Option<&str>, src: &Path) -> Result<Layer> {
+    /// A new layer owned by `tenant`, filled by `fill` (given a path that does not exist yet).
+    pub fn new_layer(&self, control: &ControlDb, tenant: Option<&str>, fill: &dyn Fn(&Path) -> Result<()>) -> Result<Layer> {
         let id = self.new_id("lyr")?;
         let dir = self.owner_dir(tenant).join("layers");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(&id);
-        crate::rollout::copy_layer(src, &path)?;
-        let layer = Layer { id, tenant_id: tenant.map(String::from), bytes: dir_bytes(&path), path };
-        control.insert_layer(&layer)?;
-        Ok(layer)
+        let r = fill(&path).and_then(|()| {
+            let layer = Layer { id, tenant_id: tenant.map(String::from), bytes: dir_bytes(&path)?, path: path.clone() };
+            control.insert_layer(&layer)?;
+            Ok(layer)
+        });
+        if r.is_err() { let _ = crate::vm::remove_tree(&path); }
+        r
     }
 
     /// A layer that is `db`'s tree, materialized.
@@ -70,7 +78,7 @@ impl Store {
         let id = self.new_id("lyr")?;
         let path = self.owner_dir(tenant).join("layers").join(&id);
         vm::vm_materialize_tree_with_cache(db, &path, &self.root.join("cache"))?;
-        let layer = Layer { id, tenant_id: tenant.map(String::from), bytes: dir_bytes(&path), path };
+        let layer = Layer { id, tenant_id: tenant.map(String::from), bytes: dir_bytes(&path)?, path };
         control.insert_layer(&layer)?;
         Ok(layer)
     }
@@ -97,17 +105,17 @@ impl Store {
         r
     }
 
-    /// A template from a session: `base` plus the session's own layers (`extra`, from forks) plus a copy of
-    /// its upper directory. The database is `base`'s with each of those layers applied; past MAX_LAYERS the
+    /// A template from a session: `base` plus the session's own layers (`extra`, from forks) plus its
+    /// upper directory, copied by `snapshot`. The database is `base`'s with each of those layers applied; past MAX_LAYERS the
     /// layers are squashed into one materialized tree.
-    pub fn freeze(&self, control: &ControlDb, tenant: &str, name: &str, base: &Template, extra: &[String], upper: &Path) -> Result<Template> {
+    pub fn freeze(&self, control: &ControlDb, tenant: &str, name: &str, base: &Template, extra: &[String], snapshot: &dyn Fn(&Path) -> Result<()>) -> Result<Template> {
         let id = self.new_id("tpl")?;
         let dir = self.owner_dir(Some(tenant)).join("templates").join(&id);
         std::fs::create_dir_all(&dir)?;
         let db_path = dir.join("base.db");
         let mut created_layers: Vec<String> = Vec::new();
         let r = (|| -> Result<Template> {
-            let top = self.new_layer(control, Some(tenant), upper)?;
+            let top = self.new_layer(control, Some(tenant), snapshot)?;
             created_layers.push(top.id.clone());
             std::fs::copy(&base.db_path, &db_path)?;
             let conn = vm::vm_open(db_path.to_str().ok_or_else(|| anyhow!("non-utf8 path"))?)?;

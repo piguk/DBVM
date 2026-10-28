@@ -76,6 +76,9 @@ impl Supervisor {
     /// CPU time of everything in the sandbox so far (see `Sandbox::cpu_usec`).
     pub fn cpu_usec(&mut self) -> Option<u64> { self.sandbox.cpu_usec() }
 
+    /// Stop everything in the sandbox until the guard drops (see `Sandbox::freeze`).
+    pub fn freeze(&self) -> Result<sandbox::Frozen> { self.sandbox.freeze() }
+
     pub fn log_tail(&self) -> String {
         let log = std::fs::read_to_string(&self.log).unwrap_or_default();
         log.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ")

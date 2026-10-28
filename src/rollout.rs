@@ -17,7 +17,7 @@
 //! how a fork turns a running rollout's state into a layer.
 
 use anyhow::{anyhow, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -103,6 +103,16 @@ fn is_opaque(dir: &Path) -> bool {
     n == 1 && v[0] == b'y'
 }
 
+/// A walk entry, None if it vanished meanwhile (the rollout's processes may be deleting files while the
+/// upper is scanned); any other error is one.
+fn vanished_ok(e: walkdir::Result<walkdir::DirEntry>) -> Result<Option<walkdir::DirEntry>> {
+    match e {
+        Ok(e) => Ok(Some(e)),
+        Err(err) if err.io_error().map(|i| i.kind()) == Some(std::io::ErrorKind::NotFound) => Ok(None),
+        Err(err) => Err(anyhow!("scan the upper directory: {}", err)),
+    }
+}
+
 fn host(dir: &Path, vm_path: &str) -> PathBuf { dir.join(vm_path.trim_start_matches('/')) }
 
 /// What the read-only layers show at `vm_path` (top layer first, whiteouts and opaque directories applied):
@@ -166,16 +176,17 @@ fn layers_of_dir(layers: &[PathBuf], vm_path: &str) -> Vec<PathBuf> {
 }
 
 /// Every path below directory `vm_path` as the layers show it.
-fn lower_tree(layers: &[PathBuf], vm_path: &str) -> BTreeSet<String> {
+fn lower_tree(layers: &[PathBuf], vm_path: &str) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for dir in layers_of_dir(layers, vm_path) {
-        for e in walkdir::WalkDir::new(&dir).min_depth(1).into_iter().flatten() {
+        for e in walkdir::WalkDir::new(&dir).min_depth(1) {
+            let e = e?;
             let rel = e.path().strip_prefix(&dir).unwrap_or(e.path()).to_string_lossy().to_string();
             let p = vm::normalize_vm_path(&format!("{}/{}", vm_path, rel));
             if lower_lookup(layers, &p).is_some() { out.insert(p); }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Whether two files hold the same bytes.
@@ -228,7 +239,7 @@ impl Rollout {
         }
         let mut r = Rollout { work, layers: layers.to_vec(), sup: Some(sup), env, scan: BTreeMap::new() };
         // the sandbox's own mount points (/.selfdb, read-only paths) are not the rollout's changes
-        r.scan = r.scan_upper();
+        r.scan = r.scan_upper()?;
         Ok(r)
     }
 
@@ -241,9 +252,17 @@ impl Rollout {
     pub fn cpu_usec(&mut self) -> Option<u64> { self.sup.as_mut().and_then(|s| s.cpu_usec()) }
 
     /// Bytes the rollout has written so far (the size of its upper directory).
-    pub fn upper_bytes(&self) -> u64 {
-        walkdir::WalkDir::new(self.upper()).into_iter().flatten()
-            .filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
+    pub fn upper_bytes(&self) -> Result<u64> {
+        let mut n = 0;
+        for e in walkdir::WalkDir::new(self.upper()).follow_links(false) {
+            let Some(e) = vanished_ok(e)? else { continue };
+            match e.metadata() {
+                Ok(md) => if md.is_file() { n += md.len(); },
+                Err(err) if err.io_error().map(|i| i.kind()) == Some(std::io::ErrorKind::NotFound) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(n)
     }
 
     /// Run a command.
@@ -251,7 +270,7 @@ impl Rollout {
         let started = Instant::now();
         let env = self.env.clone();
         let outcome = self.sup()?.exec(argv, &env, cwd, timeout, max_output)?;
-        Ok(self.finish(outcome, started))
+        self.finish(outcome, started)
     }
 
     /// Write a file (parent directories created). A refused write is a failed action with the message in stderr.
@@ -261,7 +280,7 @@ impl Rollout {
             Ok(()) => Outcome::default(),
             Err(msg) => Outcome { exit_code: 1, stderr: msg.into_bytes(), ..Outcome::default() },
         };
-        Ok(self.finish(outcome, started))
+        self.finish(outcome, started)
     }
 
     pub fn read_file(&mut self, path: &str, offset: u64, len: u64) -> Result<std::result::Result<Vec<u8>, String>> {
@@ -272,27 +291,32 @@ impl Rollout {
         self.sup()?.list(path)
     }
 
-    fn finish(&mut self, outcome: Outcome, started: Instant) -> ActionResult {
-        let cur = self.scan_upper();
-        let changes = self.diff(&cur);
+    fn finish(&mut self, outcome: Outcome, started: Instant) -> Result<ActionResult> {
+        let cur = self.scan_upper()?;
+        let changes = self.diff(&cur)?;
         self.scan = cur;
-        ActionResult { outcome, changes, duration_ms: started.elapsed().as_millis() }
+        Ok(ActionResult { outcome, changes, duration_ms: started.elapsed().as_millis() })
     }
 
-    fn scan_upper(&self) -> BTreeMap<String, Entry> {
+    fn scan_upper(&self) -> Result<BTreeMap<String, Entry>> {
         let upper = self.upper();
         let mut out = BTreeMap::new();
-        for e in walkdir::WalkDir::new(&upper).min_depth(1).follow_links(false).into_iter().flatten() {
+        for e in walkdir::WalkDir::new(&upper).min_depth(1).follow_links(false) {
+            let Some(e) = vanished_ok(e)? else { continue };
             let rel = e.path().strip_prefix(&upper).unwrap_or(e.path()).to_string_lossy().to_string();
             let p = vm::normalize_vm_path(&format!("/{}", rel));
             if vm::is_reserved_vm_path(&p) { continue; }
-            if let Ok(md) = std::fs::symlink_metadata(e.path()) { out.insert(p, entry_of(e.path(), &md)); }
+            match std::fs::symlink_metadata(e.path()) {
+                Ok(md) => { out.insert(p, entry_of(e.path(), &md)); }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(anyhow!("scan {}: {}", e.path().display(), err)),
+            }
         }
-        out
+        Ok(out)
     }
 
     /// The changes between the previous scan and `cur`, as the rollout's merged view sees them.
-    fn diff(&self, cur: &BTreeMap<String, Entry>) -> SnapDiff {
+    fn diff(&self, cur: &BTreeMap<String, Entry>) -> Result<SnapDiff> {
         let mut created = BTreeSet::new();
         let mut modified = BTreeSet::new();
         let mut deleted = BTreeSet::new();
@@ -305,14 +329,14 @@ impl Rollout {
             if e.kind == Kind::Whiteout {
                 if was_visible { deleted.insert(p.clone()); }
                 // everything the layers had below a deleted directory is gone with it
-                if lower.as_ref().map(|l| l.is_dir()).unwrap_or(false) { deleted.extend(lower_tree(&self.layers, p)); }
+                if lower.as_ref().map(|l| l.is_dir()).unwrap_or(false) { deleted.extend(lower_tree(&self.layers, p)?); }
                 continue;
             }
             if !was_visible { created.insert(p.clone()); }
             else if self.changed_from(prev, e, &host(&upper, p), lower.as_deref()) { modified.insert(p.clone()); }
             // a directory made opaque hides what the layers had below it
             if e.kind == Kind::Dir && e.opaque && !prev.map(|pe| pe.opaque).unwrap_or(false) {
-                for below in lower_tree(&self.layers, p) {
+                for below in lower_tree(&self.layers, p)? {
                     if !cur.contains_key(&below) { deleted.insert(below); }
                 }
             }
@@ -323,7 +347,7 @@ impl Rollout {
             deleted.insert(p.clone());
         }
         for p in &deleted { created.remove(p); modified.remove(p); }
-        SnapDiff { created: created.into_iter().collect(), modified: modified.into_iter().collect(), deleted: deleted.into_iter().collect() }
+        Ok(SnapDiff { created: created.into_iter().collect(), modified: modified.into_iter().collect(), deleted: deleted.into_iter().collect() })
     }
 
     /// Whether an upper entry changed what the path shows. A directory copied up only because something below
@@ -349,8 +373,12 @@ impl Rollout {
     }
 
     /// Copy the upper directory to `dest`, keeping whiteouts and opaque markers: the rollout's state as a
-    /// layer, for forks and freezes. The rollout keeps running.
+    /// layer, for forks and freezes. Every process of the rollout is frozen during the copy, so background
+    /// processes that keep writing cannot leave a mix of older and newer files in it; the rollout then keeps
+    /// running. Only files are captured: processes and their memory are not.
     pub fn snapshot_upper(&self, dest: &Path) -> Result<()> {
+        let sup = self.sup.as_ref().ok_or_else(|| anyhow!("the rollout is closed"))?;
+        let _frozen = sup.freeze()?;
         copy_layer(&self.upper(), dest)
     }
 
@@ -364,14 +392,134 @@ impl Drop for Rollout {
     }
 }
 
-/// Copy a layer directory to `dest` (which must not exist), keeping whiteouts, xattrs, modes and links.
+/// Merge `layers` (bottom first; each an upper directory over the ones below) into one new layer at `dest`
+/// that shows the same tree over whatever lies below the bottom one: a fork of a fork of ... would otherwise
+/// add one overlay layer per generation.
+pub fn merge_layers(layers: &[PathBuf], dest: &Path) -> Result<()> {
+    let (first, rest) = layers.split_first().ok_or_else(|| anyhow!("nothing to merge"))?;
+    copy_layer(first, dest)?;
+    for layer in rest { copy_into(layer, dest, Onto::Layer)?; }
+    Ok(())
+}
+
+/// Copy a layer directory (or one entry of it) to `dest`, which must not exist: whiteouts, `user.*` xattrs
+/// (overlay markers among them), modes, times, links and hard links kept. In-process, so the copy has the
+/// service's access to modes the sandbox set (see `access`); unreadable entries are an error, not skipped.
 pub fn copy_layer(src: &Path, dest: &Path) -> Result<()> {
-    if dest.exists() { return Err(anyhow!("{} exists", dest.display())); }
-    std::fs::create_dir_all(dest)?;
-    let st = std::process::Command::new("cp").arg("-a").arg("--no-target-directory")
-        .arg(src).arg(dest).stderr(std::process::Stdio::piped()).output()?;
-    if !st.status.success() {
-        return Err(anyhow!("copy layer {}: {}", src.display(), String::from_utf8_lossy(&st.stderr).trim()));
+    if std::fs::symlink_metadata(dest).is_ok() { return Err(anyhow!("{} exists", dest.display())); }
+    if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent)?; }
+    copy_into(src, dest, Onto::Empty)
+}
+
+/// What `copy_into` writes over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Onto {
+    /// Nothing: `dest` does not exist.
+    Empty,
+    /// A layer that `src` is stacked on: the result shows what the two stacked showed.
+    Layer,
+}
+
+fn copy_into(src: &Path, dest: &Path, onto: Onto) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut links: HashMap<(u64, u64), PathBuf> = HashMap::new();
+    // directories get their modes, times and markers after their contents are in
+    let mut dirs: Vec<(PathBuf, PathBuf, std::fs::Metadata, bool)> = Vec::new();
+    for e in walkdir::WalkDir::new(src).follow_links(false) {
+        let e = e.map_err(|err| anyhow!("read {}: {}", src.display(), err))?;
+        let rel = e.path().strip_prefix(src).unwrap_or(e.path());
+        let d = if rel.as_os_str().is_empty() { dest.to_path_buf() } else { dest.join(rel) };
+        let md = std::fs::symlink_metadata(e.path())?;
+        let below = std::fs::symlink_metadata(&d).ok();
+        let ft = md.file_type();
+        if ft.is_dir() {
+            let opaque = is_opaque(e.path());
+            let mut make_opaque = false;
+            match below {
+                // an opaque directory hides what was below it; a plain one merges with a directory below
+                Some(b) if b.is_dir() && !opaque => {}
+                Some(b) => {
+                    remove_entry(&d, &b)?;
+                    // a directory over a whiteout or a file hid everything further down too
+                    make_opaque = onto == Onto::Layer && !b.is_dir() && !opaque;
+                    std::fs::create_dir(&d)?;
+                }
+                None => std::fs::create_dir(&d)?,
+            }
+            dirs.push((e.path().to_path_buf(), d, md, make_opaque));
+            continue;
+        }
+        if let Some(b) = below { remove_entry(&d, &b)?; }
+        if !ft.is_symlink() && md.nlink() > 1 {
+            if let Some(first) = links.get(&(md.dev(), md.ino())) {
+                std::fs::hard_link(first, &d)?;
+                continue;
+            }
+            links.insert((md.dev(), md.ino()), d.clone());
+        }
+        if ft.is_file() {
+            std::fs::copy(e.path(), &d).map_err(|err| anyhow!("copy {}: {}", e.path().display(), err))?;
+        } else if ft.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(e.path())?, &d)?;
+        } else {
+            let kind = if ft.is_char_device() && md.rdev() == 0 { libc::S_IFCHR }
+                else if ft.is_fifo() { libc::S_IFIFO } else if ft.is_socket() { libc::S_IFSOCK }
+                else { return Err(anyhow!("{}: device nodes are not copied", e.path().display())) };
+            let c = std::ffi::CString::new(d.as_os_str().as_encoded_bytes())?;
+            if unsafe { libc::mknod(c.as_ptr(), kind | (md.mode() & 0o7777), 0) } != 0 {
+                return Err(anyhow!("mknod {}: {}", d.display(), std::io::Error::last_os_error()));
+            }
+        }
+        copy_attrs(e.path(), &d, &md)?;
+    }
+    for (s, d, md, make_opaque) in dirs.iter().rev() {
+        copy_attrs(s, d, md)?;
+        if *make_opaque { set_opaque(d)?; }
+    }
+    Ok(())
+}
+
+/// `user.*` xattrs, mode and times of `src` onto `dest` (a symlink: xattrs and times only).
+fn copy_attrs(src: &Path, dest: &Path, md: &std::fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let (cs, cd) = (std::ffi::CString::new(src.as_os_str().as_encoded_bytes())?, std::ffi::CString::new(dest.as_os_str().as_encoded_bytes())?);
+    let size = unsafe { libc::llistxattr(cs.as_ptr(), std::ptr::null_mut(), 0) };
+    let mut names = vec![0u8; size.max(0) as usize];
+    let n = if names.is_empty() { 0 } else { unsafe { libc::llistxattr(cs.as_ptr(), names.as_mut_ptr().cast(), names.len()) } };
+    if size < 0 || n < 0 { return Err(anyhow!("list xattrs of {}: {}", src.display(), std::io::Error::last_os_error())); }
+    for name in names[..n as usize].split(|b| *b == 0).filter(|n| n.starts_with(b"user.")) {
+        let cname = std::ffi::CString::new(name)?;
+        // XATTR_SIZE_MAX
+        let mut v = vec![0u8; 65536];
+        let len = unsafe { libc::lgetxattr(cs.as_ptr(), cname.as_ptr(), v.as_mut_ptr().cast(), v.len()) };
+        if len < 0 { return Err(anyhow!("read xattr of {}: {}", src.display(), std::io::Error::last_os_error())); }
+        if unsafe { libc::lsetxattr(cd.as_ptr(), cname.as_ptr(), v.as_ptr().cast(), len as usize, 0) } != 0 {
+            return Err(anyhow!("set xattr on {}: {}", dest.display(), std::io::Error::last_os_error()));
+        }
+    }
+    if !md.file_type().is_symlink() {
+        std::fs::set_permissions(dest, std::os::unix::fs::PermissionsExt::from_mode(md.mode() & 0o7777))?;
+    }
+    let times = [
+        libc::timespec { tv_sec: md.atime(), tv_nsec: md.atime_nsec() },
+        libc::timespec { tv_sec: md.mtime(), tv_nsec: md.mtime_nsec() },
+    ];
+    if unsafe { libc::utimensat(libc::AT_FDCWD, cd.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(anyhow!("set times on {}: {}", dest.display(), std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn remove_entry(path: &Path, md: &std::fs::Metadata) -> Result<()> {
+    if md.is_dir() { vm::remove_tree(path)?; } else { std::fs::remove_file(path)?; }
+    Ok(())
+}
+
+fn set_opaque(dir: &Path) -> Result<()> {
+    let p = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())?;
+    let name = std::ffi::CString::new("user.overlay.opaque")?;
+    if unsafe { libc::lsetxattr(p.as_ptr(), name.as_ptr(), b"y".as_ptr().cast(), 1, 0) } != 0 {
+        return Err(anyhow!("mark {} opaque: {}", dir.display(), std::io::Error::last_os_error()));
     }
     Ok(())
 }

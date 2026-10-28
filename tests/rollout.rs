@@ -5,13 +5,21 @@ use selfdb::vm;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Before the test harness starts its threads: the access a service has (see `selfdb::access`).
+#[used]
+#[link_section = ".init_array"]
+static ENTER_OWNER_NAMESPACE: extern "C" fn() = {
+    extern "C" fn enter() { let _ = selfdb::access::enter_owner_namespace(); }
+    enter
+};
+
 fn bwrap_ok() -> bool {
     std::process::Command::new("bwrap").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// A template: a database with a shell and tools, and its materialized tree as the first layer.
 struct Template { dir: PathBuf, db: PathBuf, layer: PathBuf }
-impl Drop for Template { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); } }
+impl Drop for Template { fn drop(&mut self) { let _ = vm::remove_tree(&self.dir); } }
 
 fn template(name: &str) -> Template {
     let dir = std::env::temp_dir().join(format!("rollout-test-{}-{}", name, std::process::id()));
@@ -19,7 +27,8 @@ fn template(name: &str) -> Template {
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("base.db");
     let c = vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap();
-    for prog in ["/bin/sh", "/bin/cat", "/bin/rm", "/bin/mkdir", "/bin/mv", "/bin/sleep"] {
+    for prog in ["/bin/sh", "/bin/cat", "/bin/rm", "/bin/mkdir", "/bin/mv", "/bin/sleep", "/bin/ln", "/bin/chmod",
+                 "/usr/bin/find", "/usr/bin/stat", "/usr/bin/md5sum", "/usr/bin/sort"] {
         if Path::new(prog).exists() { vm::vm_import_closure(&c, prog, "/").unwrap(); }
     }
     vm::vm_add_bytes(&c, "/etc/conf", b"original\n", 0o644, 1).unwrap();
@@ -166,4 +175,68 @@ fn a_closed_rollout_leaves_nothing_behind() {
     assert!(left.is_empty(), "the rollout's directory and lock are removed: {:?}", left);
     vm::remove_tree(&frozen).unwrap();
     assert!(!frozen.exists(), "a layer with unreadable directories is removable too");
+}
+
+#[test]
+fn a_snapshot_is_one_moment_of_a_rollout_that_keeps_writing() {
+    // a background process rewrites f0..f9 in order with a rising counter; a copy taken while it runs
+    // finds the files out of that order unless the rollout is frozen during the copy (measured: without
+    // the freeze every round failed)
+    if !bwrap_ok() { return; }
+    let t = template("consistent");
+    let mut r = Rollout::start(std::slice::from_ref(&t.layer), &RolloutOptions::default()).unwrap();
+    sh(&mut r, "mkdir /work/c; i=0; while :; do for f in 0 1 2 3 4 5 6 7 8 9; do echo $i > /work/c/f$f; done; i=$((i+1)); done > /dev/null 2>&1 &");
+    std::thread::sleep(Duration::from_millis(200));
+    for round in 0..10 {
+        let snap = t.dir.join(format!("snap{}", round));
+        r.snapshot_upper(&snap).unwrap();
+        let all: Vec<Option<u64>> = (0..10).map(|i| std::fs::read_to_string(snap.join(format!("work/c/f{}", i))).unwrap().trim().parse().ok()).collect();
+        // at any one moment the writer is inside one round: a prefix holds i, the rest i-1, and at most one
+        // file is being written (truncated, still empty)
+        let v: Vec<u64> = all.iter().flatten().copied().collect();
+        let ok = all.len() - v.len() <= 1 && v.windows(2).all(|w| w[0] == w[1] || w[0] == w[1] + 1) && v[0] <= v[v.len() - 1] + 1;
+        assert!(ok, "round {}: a torn snapshot {:?}", round, all);
+    }
+    // thawed: the writer goes on
+    let a = std::fs::read_to_string(t.dir.join("snap9/work/c/f9")).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let b = String::from_utf8_lossy(&sh(&mut r, "cat /work/c/f9").outcome.stdout).to_string();
+    assert_ne!(a.trim(), b.trim(), "the rollout runs again after the snapshot");
+}
+
+/// What the rollout shows below /etc, /data and /work: type, mode, size, link target and content per path.
+fn view(r: &mut Rollout) -> String {
+    let o = sh(r, "cd / && find etc data work 2>/dev/null | sort | while read p; do \
+        stat -c '%n %F %a %s %N' \"$p\"; test -f \"$p\" && test ! -L \"$p\" && md5sum \"$p\"; done");
+    String::from_utf8_lossy(&o.outcome.stdout).to_string()
+}
+
+#[test]
+fn merged_fork_layers_show_the_same_tree() {
+    if !bwrap_ok() || !Path::new("/usr/bin/find").exists() { return; }
+    let t = template("merge");
+    // one generation per script, each over the layers of the ones before: whiteouts of lower and upper
+    // entries, directories over whiteouts and files (opaque), files over directories, links, modes
+    let gens = [
+        "echo 1 > /data/a; mkdir -p /work/x/y; echo y > /work/x/y/f; rm /etc/other; ln -s /data/a /work/link",
+        "rm -rf /data; echo again > /etc/other; rm -rf /work/x; rm /work/link; ln -s /etc/conf /work/link",
+        "mkdir /data; echo new > /data/n; mkdir /work/x; echo z > /work/x/z",
+        "rm /etc/conf; mkdir /etc/conf; echo c > /etc/conf/c; echo t > /work/x/t; mkdir -p /work/x/y",
+        "rm -rf /etc/conf; echo file > /etc/conf; chmod 700 /work; echo y2 > /work/x/y/g",
+    ];
+    let mut layers = vec![t.layer.clone()];
+    for (i, g) in gens.iter().enumerate() {
+        let mut r = Rollout::start(&layers, &RolloutOptions::default()).unwrap();
+        let out = sh(&mut r, g);
+        assert_eq!(out.outcome.exit_code, 0, "generation {}: {}", i, String::from_utf8_lossy(&out.outcome.stderr));
+        let l = t.dir.join(format!("gen{}", i));
+        r.snapshot_upper(&l).unwrap();
+        layers.push(l);
+    }
+    let merged = t.dir.join("merged");
+    rollout::merge_layers(&layers[1..], &merged).unwrap();
+    let stacked = view(&mut Rollout::start(&layers, &RolloutOptions::default()).unwrap());
+    let flat = view(&mut Rollout::start(&[t.layer.clone(), merged], &RolloutOptions::default()).unwrap());
+    assert!(stacked.contains("work/x/z") && stacked.contains("etc/other") && !stacked.contains("data/a"), "{}", stacked);
+    assert_eq!(flat, stacked);
 }

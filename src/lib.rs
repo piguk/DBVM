@@ -9,6 +9,7 @@ pub mod policy;
 pub mod inject;
 pub mod owner;
 pub mod proxy;
+pub mod access;
 pub mod sandbox;
 pub mod session;
 pub mod rollout;

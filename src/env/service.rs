@@ -4,7 +4,6 @@
 //! A tenant sees system templates and its own objects. Anything else answers "not found", never
 //! "forbidden": the API does not confirm that another tenant's id exists.
 
-use anyhow::anyhow;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write;
@@ -13,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::control::{ControlDb, Quotas, SessionUsage, Template, Tenant};
-use super::store::Store;
+use super::store::{Store, MAX_LAYERS};
 use super::task::{Action, ActionResponse, DirItem, JudgeResult, TaskSpec};
 use crate::egress::{EgressPolicy, EgressProxy};
 use crate::rollout::{ActionResult, Rollout, RolloutOptions};
@@ -143,16 +142,18 @@ fn copy_seen(src: &Path, sees: &[String], dest: &Path) -> anyhow::Result<()> {
         let rel = p.trim_start_matches('/');
         let s = src.join(rel);
         if std::fs::symlink_metadata(&s).is_err() { continue; }
-        let d = dest.join(rel);
-        if let Some(parent) = d.parent() { std::fs::create_dir_all(parent)?; }
-        let out = std::process::Command::new("cp").arg("-a").arg("--no-target-directory").arg(&s).arg(&d).output()?;
-        if !out.status.success() { return Err(anyhow!("copy {}: {}", s.display(), String::from_utf8_lossy(&out.stderr).trim())); }
+        crate::rollout::copy_layer(&s, &dest.join(rel))?;
     }
     Ok(())
 }
 
 impl Service {
+    /// The service reads and copies what rollouts write, whatever modes the agent gave it: the process must
+    /// have entered its owner namespace first (`access::enter_owner_namespace`).
     pub fn open(data: &Path, node: &str) -> anyhow::Result<Arc<Service>> {
+        if !crate::access::has_owner_access() {
+            return Err(anyhow::anyhow!("the environment service needs access to its own files whatever their modes: call access::enter_owner_namespace at startup"));
+        }
         let store = Store::open(data, node)?;
         let control = ControlDb::open(&data.join("control.db"))?;
         control.end_orphaned_sessions()?;
@@ -337,7 +338,7 @@ impl Service {
         resp.entries = entries;
         let line = serde_json::json!({"step": l.steps, "ts": crate::vm::now_secs(), "label": l.label, "seed": l.seed, "action": action, "response": resp});
         writeln!(l.trajectory, "{}", line)?;
-        let over = l.rollout.upper_bytes() as i64 > l.tenant.max_session_disk_bytes;
+        let over = l.rollout.upper_bytes()? as i64 > l.tenant.max_session_disk_bytes;
         drop(l);
         if over {
             self.close(t, id, "disk quota")?;
@@ -356,12 +357,17 @@ impl Service {
         let live = self.live(t, id)?;
         let (kind, template, task, mut extra, egress, parent_seed) = {
             let l = live.lock().unwrap();
-            let layer = self.store.new_layer(&self.control, Some(&t.id), &l.rollout.upper())?;
+            let layer = self.store.new_layer(&self.control, Some(&t.id), &|dest| l.rollout.snapshot_upper(dest))?;
             let mut extra = l.extra_layers.clone();
             extra.push(layer.id);
             (l.kind, l.template.clone(), l.task.clone(), extra, l.egress.clone(), l.seed)
         };
-        extra.shrink_to_fit();
+        if extra.len() > MAX_LAYERS {
+            // each generation of forks adds a layer; past the limit the children get them merged into one
+            let paths = self.store.layer_paths(&self.control, &extra)?;
+            let merged = self.store.new_layer(&self.control, Some(&t.id), &|dest| crate::rollout::merge_layers(&paths, dest))?;
+            extra = vec![merged.id];
+        }
         let mut ids = Vec::new();
         for v in variants {
             match self.start(t, kind, template.clone(), task.clone(), extra.clone(), v.label, v.seed.or(parent_seed), egress.clone(), Some(id)) {
@@ -380,12 +386,12 @@ impl Service {
     pub fn freeze(&self, t: &Tenant, id: &str, name: &str) -> EnvResult<Template> {
         let live = self.live(t, id)?;
         let l = live.lock().unwrap();
-        let need = l.rollout.upper_bytes() as i64 + l.template.bytes;
+        let need = l.rollout.upper_bytes()? as i64 + l.template.bytes;
         if self.control.storage_bytes(&t.id)? + need > t.max_storage_bytes {
             return Err(EnvError::Quota(format!("storing this template would exceed {} bytes", t.max_storage_bytes)));
         }
         let _g = self.layers_lock.lock().unwrap();
-        Ok(self.store.freeze(&self.control, &t.id, name, &l.template, &l.extra_layers, &l.rollout.upper())?)
+        Ok(self.store.freeze(&self.control, &t.id, name, &l.template, &l.extra_layers, &|dest| l.rollout.snapshot_upper(dest))?)
     }
 
     /// Score `id` with its task's judge (see `JudgeSpec`).

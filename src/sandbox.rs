@@ -335,17 +335,37 @@ impl Sandbox {
     /// CPU time used by everything in the sandbox so far, in microseconds, from its cgroup. None without
     /// a cgroup, or when it cannot be read.
     pub fn cpu_usec(&mut self) -> Option<u64> {
-        let path = match &self.cgroup {
-            Some(SandboxCgroup::Dir(dir)) => dir.clone(),
+        let stat = std::fs::read_to_string(self.cgroup_dir()?.join("cpu.stat")).ok()?;
+        stat.lines().find_map(|l| l.strip_prefix("usage_usec ")).and_then(|v| v.trim().parse().ok())
+    }
+
+    /// The sandbox's cgroup directory, None without a cgroup.
+    fn cgroup_dir(&self) -> Option<PathBuf> {
+        match &self.cgroup {
+            Some(SandboxCgroup::Dir(dir)) => Some(dir.clone()),
             Some(SandboxCgroup::Unit(_)) => {
                 // the scope's cgroup is the one the sandbox's top process runs in
                 let line = std::fs::read_to_string(format!("/proc/{}/cgroup", self.child.id())).ok()?;
-                PathBuf::from(format!("/sys/fs/cgroup{}", line.trim().strip_prefix("0::")?))
+                Some(PathBuf::from(format!("/sys/fs/cgroup{}", line.trim().strip_prefix("0::")?)))
             }
-            None => return None,
-        };
-        let stat = std::fs::read_to_string(path.join("cpu.stat")).ok()?;
-        stat.lines().find_map(|l| l.strip_prefix("usage_usec ")).and_then(|v| v.trim().parse().ok())
+            None => None,
+        }
+    }
+
+    /// Stop every process of the sandbox where it is (cgroup v2 freezer) until the returned guard drops, so
+    /// that nothing in the sandbox changes its files meanwhile. Errors without a cgroup.
+    pub fn freeze(&self) -> Result<Frozen> {
+        let dir = self.cgroup_dir().ok_or_else(|| anyhow!("the sandbox has no cgroup to freeze"))?;
+        std::fs::write(dir.join("cgroup.freeze"), "1").map_err(|e| anyhow!("freeze {}: {}", dir.display(), e))?;
+        let frozen = Frozen { dir };
+        // writing cgroup.freeze only starts freezing; cgroup.events says when every task has stopped
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let events = std::fs::read_to_string(frozen.dir.join("cgroup.events"))?;
+            if events.lines().any(|l| l == "frozen 1") { return Ok(frozen); }
+            if Instant::now() > deadline { return Err(anyhow!("the sandbox did not freeze in time")); }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Whether the sandbox's top process is still running.
@@ -363,6 +383,13 @@ impl Sandbox {
             None => {}
         }
     }
+}
+
+/// A frozen sandbox; dropping this thaws it.
+pub struct Frozen { dir: PathBuf }
+
+impl Drop for Frozen {
+    fn drop(&mut self) { let _ = std::fs::write(self.dir.join("cgroup.freeze"), "0"); }
 }
 
 impl Drop for Sandbox {
