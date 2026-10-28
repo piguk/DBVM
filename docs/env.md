@@ -34,6 +34,7 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 - 所有 rollout 共用进程内的一个 inotify 实例；每个 rollout 的 upper 中每个目录占用一个 watch。`fs.inotify.max_user_watches` 用尽后，无法再添加 watch 的 rollout 改为每步遍历 upper（结果不变，变慢），需要时调大该值。
 - 节点 id（`--node`）是所有对象 id 的前缀，多节点时据此路由。
 - `--max-sessions N`：本节点同时运行的 session 上限（所有租户合计），超出返回 503。
+- `--max-memory-mb`、`--max-pids`、`--max-cpu-percent`、`--max-file-size-mb`、`--max-action-secs`：任务可申请的资源上限（默认 32768、8192、1600、16384、3600）；任务申请超出时取上限。
 - `--metrics-listen ADDR`：在 `http://ADDR/metrics` 提供 Prometheus 指标（动作与 session 启动耗时分布、各类操作计数、session 结束原因、运行中的 session、存储与层），不鉴权，应只监听内网地址。
 - `self env-admin --data DIR support-bundle out.tar.gz`：诊断包，含宿主检查、版本、数据目录大小与控制库摘要，不含 API key、token、名称、label 与任务内容。
 
@@ -68,7 +69,7 @@ self env-admin --data /srv/env image eda eda.tar --oci       # 镜像导入到�
 | POST | `/v1/tasks` | 创建任务，返回 `task_id` |
 | GET | `/v1/tasks/{id}` | 任务定义 |
 | DELETE | `/v1/tasks/{id}` | 删除任务 |
-| POST | `/v1/sessions` | `{"template_id", "egress": [...]}` 创建 build session；`{"task_id", "label", "seed"}` 创建 rollout |
+| POST | `/v1/sessions` | `{"template_id", "egress": [...], "limits": {...}}` 创建 build session（`limits` 同任务的写法，受部署方上限约束；编译、安装依赖时常需更多内存）；`{"task_id", "label", "seed"}` 创建 rollout（资源与出站来自任务） |
 | POST | `/v1/rollouts` | `{"task_id", "variants": [{"label", "seed"}, ...]}`：同一起点的多个 rollout，并行启动；全部成功或全部不启动，返回顺序与 `variants` 一致 |
 | POST | `/v1/sessions/{id}/actions` | 执行一个动作 |
 | POST | `/v1/actions` | `[{"session_id", "action"}, ...]`：多个 session 各执行一个动作，并发进行 |
@@ -109,11 +110,19 @@ self env-admin --data /srv/env image eda eda.tar --oci       # 镜像导入到�
   "step_timeout_secs": 120,
   "env": {"PYTHONPATH": "/repo"},
   "seed_env": "SEED",
-  "files": [{"path": "/repo/tests/test_x.py", "content": "...", "mode": 420}, {"path": "/repo/data.bin", "content": "<base64>", "encoding": "base64"}]
+  "files": [{"path": "/repo/tests/test_x.py", "content": "...", "mode": 420}, {"path": "/repo/data.bin", "content": "<base64>", "encoding": "base64"}],
+  "egress": ["license.internal:27000"],
+  "services": [{"name": "db", "run": "exec postgres -D /var/lib/pg", "ready": "pg_isready", "ready_timeout_secs": 30}]
 }
 ```
 
+判分可以带只有判分可见的文件：`"judge": {"cmd": [...], "sees": [...], "services": false, "files": [{"path": "/judge/expected.csv", "content": "..."}]}`。
+
 - `files`：任务的文件（代码、数据、测试），创建任务时做成一个只读层，该任务的所有 rollout 共用；rollout 启动后它们已在原位，不计入 agent 的改动；判分时完整可见；freeze 时写入新模板。最多 32 MiB。这样同一个工具模板可以承载大量任务，每个任务只多一个小层。
+- `judge.files`：只在判分 sandbox 中出现的文件（隐藏测试、期望结果），rollout 中看不到；位于判分 sandbox 的最上层，agent 在 `sees` 路径下写的同名文件不会覆盖它们。
+- `judge.services`：为 true 时，判分 sandbox 先启动任务的服务（例如查询 rollout 留下的数据库状态）。
+- `egress`：该任务的 rollout 可以访问的主机（写法同出站白名单），例如 license server、内部 API；不写则无网络。
+- `services`：与 agent 并行运行的进程（数据库、内部 API 的替身）：每个 rollout（含 fork 与从 checkpoint 分叉出的）在第一个动作之前启动它们，并等待 `ready` 命令成功（超时则 rollout 启动失败，错误中附带服务日志末尾）；输出在 `/tmp/selfdb-services/<name>.log`；服务启动时写入的文件不计入 agent 的改动。fork 不复制进程，子 rollout 中服务重新启动。
 - 删除任务（`DELETE /v1/tasks/{id}`）：有运行中的 session 或 checkpoint 使用时返回 400；被任务使用的模板不能删除。
 
 - `readonly`：rollout 开始前以只读方式挂载（模板中的原内容）；模板中不存在的路径挂载为空的只读目录，agent 也无法创建。
@@ -151,7 +160,24 @@ self env-admin --data /srv/env image eda eda.tar --oci       # 镜像导入到�
 
 ## 任务包
 
-`packs/eda/`：Verilator（RTL 修复）与 ngspice（电路参数）两类任务的生成、校验与判分，见其 README。
+任务包用 `packs/packkit` 生成与检查（候选任务 → 起始状态与解答校验 → 作弊用例检查），见其 README。
+
+| 包 | 内容 |
+|---|---|
+| `packs/eda/` | Verilator（RTL 修复）与 ngspice（电路参数） |
+| `packs/data/` | 公司数据上的 SQL / CSV 分析与报表，期望结果为判分专用文件 |
+| `packs/ops/` | 日志排障、服务配置修复、经 API 操作有状态服务（任务服务） |
+
+## 个人使用
+
+```sh
+self env-local --image rootfs.tar --image-name python    # ~/.local/share/selfdb/local；首次运行生成租户与 key（local-key，0600）
+PYTHONPATH=packs:sdk/python python3 -m packkit build packs/data http://127.0.0.1:8650 <template-id> --per-family 5
+python3 sdk/python/examples/local_agent.py tasks.json --model http://127.0.0.1:8080/v1 --group 8 --out rollouts.jsonl
+```
+
+- `self env-local` 只监听本机地址；SDK 的 `Client.local()` 读取它的地址与 key。
+- `local_agent.py`：用任何 OpenAI 兼容的本地推理服务（llama.cpp、vLLM、ollama）对每个任务采样一组 rollout，模型通过工具调用执行动作、调用 `submit` 后判分，输出含消息、reward 与组内相对 advantage 的 JSON lines，可直接用于 GRPO 一类的训练。
 
 ## 接入训练框架
 

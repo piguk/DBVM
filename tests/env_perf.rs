@@ -48,7 +48,7 @@ fn service_timings() {
     let c = tenant(&s, "perf", Quotas { max_sessions: 2000, ..Quotas::default() });
     let task = calc_task(&s, &c);
     let t = s.svc.authenticate(&c.key).unwrap();
-    let create = || s.svc.create_session(&t, CreateSession { template_id: None, task_id: Some(task.clone()), egress: vec![], label: None, seed: Some(1) }).unwrap();
+    let create = || s.svc.create_session(&t, CreateSession { template_id: None, task_id: Some(task.clone()), egress: vec![], limits: None, label: None, seed: Some(1) }).unwrap();
 
     // rollout start
     let mut starts = Vec::new();

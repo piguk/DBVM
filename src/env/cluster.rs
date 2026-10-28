@@ -327,13 +327,13 @@ impl Coordinator {
         self.visible_template(t, &spec.template_id)?;
         check_task(&spec)?;
         let id = format!("{}-tsk-{}", self.id, super::control::random_hex(8)?);
-        self.control.insert_task(&id, &t.id, &serde_json::to_string(&spec)?, &[])?;
+        self.control.insert_task(&id, &t.id, &serde_json::to_string(&spec)?, &[], &[])?;
         Ok(id)
     }
 
     fn task(&self, t: &Tenant, id: &str) -> EnvResult<TaskSpec> {
         match self.control.task(id)? {
-            Some((owner, spec, _)) if owner == t.id => Ok(serde_json::from_str(&spec)?),
+            Some(row) if row.tenant == t.id => Ok(serde_json::from_str(&row.spec)?),
             _ => Err(EnvError::NotFound(format!("task {}", id))),
         }
     }

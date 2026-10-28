@@ -15,6 +15,7 @@ that drive many rollouts with asyncio.
 
 import asyncio
 import json
+import os
 import urllib.error
 import urllib.request
 
@@ -30,11 +31,28 @@ class EnvError(Exception):
         self.message = message
 
 
+def _local_key(data=None):
+    """The API key `self env-local` made: SELFDB_ENV_API_KEY, or the local-key file of its data directory."""
+    key = os.environ.get("SELFDB_ENV_API_KEY")
+    if key:
+        return key
+    if data is None:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+        data = os.path.join(base, "selfdb", "local")
+    with open(os.path.join(data, "local-key")) as f:
+        return f.read().strip()
+
+
 class Client:
     def __init__(self, base_url, api_key, timeout=3700):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+
+    @classmethod
+    def local(cls, data=None, base_url=None, timeout=3700):
+        """The service `self env-local` runs on this machine (SELFDB_ENV_URL, else http://127.0.0.1:8650)."""
+        return cls(base_url or os.environ.get("SELFDB_ENV_URL", "http://127.0.0.1:8650"), _local_key(data), timeout)
 
     def _request(self, method, path, body=None, raw=False):
         data = None if body is None else json.dumps(body).encode()
@@ -75,9 +93,12 @@ class Client:
 
     # sessions
 
-    def session(self, template_id=None, task_id=None, egress=None, label=None, seed=None):
-        """A build session over a template (``egress`` lists the hosts it may reach), or a rollout of a task."""
+    def session(self, template_id=None, task_id=None, egress=None, label=None, seed=None, limits=None):
+        """A build session over a template (``egress`` lists the hosts it may reach, ``limits`` its sandbox's
+        limits, e.g. {"memory_mb": 8192}), or a rollout of a task."""
         body = {"template_id": template_id, "task_id": task_id, "egress": egress or [], "label": label, "seed": seed}
+        if limits is not None:
+            body["limits"] = limits
         return Session(self, self._request("POST", "/v1/sessions", body)["session_id"])
 
     def rollouts(self, task_id, variants):
@@ -241,6 +262,11 @@ class AsyncSession:
 class AsyncClient:
     def __init__(self, base_url, api_key, timeout=3700):
         self._sync = Client(base_url, api_key, timeout)
+
+    @classmethod
+    def local(cls, data=None, base_url=None, timeout=3700):
+        c = Client.local(data, base_url, timeout)
+        return cls(c.base_url, c.api_key, timeout)
 
     templates = _wrap(Client.templates)
     delete_template = _wrap(Client.delete_template)

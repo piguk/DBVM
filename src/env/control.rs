@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS tasks(
     tenant_id TEXT NOT NULL,
     spec TEXT NOT NULL,
     layers TEXT NOT NULL DEFAULT '[]',
+    -- the layer of the files only the judge sees
+    judge_layers TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE TABLE IF NOT EXISTS sessions(
@@ -88,6 +90,9 @@ CREATE TABLE IF NOT EXISTS checkpoints(
 );
 CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id);
 ";
+
+/// A task as the control database has it.
+pub struct TaskRow { pub tenant: String, pub spec: String, pub layers: Vec<String>, pub judge_layers: Vec<String> }
 
 /// A session's files at one step, kept as layers: new sessions start from it after the session has moved
 /// on or ended.
@@ -288,7 +293,8 @@ impl ControlDb {
         self.with(|c| {
             let mut out = std::collections::HashSet::new();
             let mut st = c.prepare("SELECT layers FROM templates UNION ALL SELECT extra_layers FROM sessions WHERE ended_at IS NULL
-                                    UNION ALL SELECT layers FROM checkpoints UNION ALL SELECT layers FROM tasks")?;
+                                    UNION ALL SELECT layers FROM checkpoints UNION ALL SELECT layers FROM tasks
+                                    UNION ALL SELECT judge_layers FROM tasks")?;
             for r in st.query_map([], |r| r.get::<_, String>(0))? {
                 for id in serde_json::from_str::<Vec<String>>(&r?).unwrap_or_default() { out.insert(id); }
             }
@@ -353,18 +359,21 @@ impl ControlDb {
             params![tenant], |r| r.get(0))?))
     }
 
-    /// A task: its spec (JSON) and the layers of its files, above its template's.
-    pub fn insert_task(&self, id: &str, tenant: &str, spec: &str, layers: &[String]) -> Result<()> {
+    /// A task: its spec (JSON), the layers of its files (above its template's) and of its judge's files.
+    pub fn insert_task(&self, id: &str, tenant: &str, spec: &str, layers: &[String], judge_layers: &[String]) -> Result<()> {
         self.with(|c| {
-            c.execute("INSERT INTO tasks(id, tenant_id, spec, layers) VALUES (?1,?2,?3,?4)", params![id, tenant, spec, serde_json::to_string(layers)?])?;
+            c.execute("INSERT INTO tasks(id, tenant_id, spec, layers, judge_layers) VALUES (?1,?2,?3,?4,?5)",
+                      params![id, tenant, spec, serde_json::to_string(layers)?, serde_json::to_string(judge_layers)?])?;
             Ok(())
         })
     }
 
-    /// (tenant, spec JSON, layers)
-    pub fn task(&self, id: &str) -> Result<Option<(String, String, Vec<String>)>> {
-        self.with(|c| Ok(c.query_row("SELECT tenant_id, spec, layers FROM tasks WHERE id=?1", params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default()))).optional()?))
+    pub fn task(&self, id: &str) -> Result<Option<TaskRow>> {
+        self.with(|c| Ok(c.query_row("SELECT tenant_id, spec, layers, judge_layers FROM tasks WHERE id=?1", params![id], |r| Ok(TaskRow {
+            tenant: r.get(0)?, spec: r.get(1)?,
+            layers: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(),
+            judge_layers: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
+        })).optional()?))
     }
 
     pub fn delete_task(&self, id: &str) -> Result<()> {

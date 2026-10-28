@@ -172,7 +172,16 @@ enum Cmd {
               /// A file holding the cluster token (readable by its owner only).
               #[arg(long)] token_file: Option<String>,
               /// Serve Prometheus metrics at http://ADDR/metrics (no authentication: an internal address).
-              #[arg(long)] metrics_listen: Option<String> },
+              #[arg(long)] metrics_listen: Option<String>,
+              /// The most memory (MiB), processes, CPU (percent of one core) and file size (MiB) a task's sandbox
+              /// may have, and the longest an action may run (seconds); defaults: 32768, 8192, 1600, 16384, 3600.
+              #[arg(long)] max_memory_mb: Option<u64>, #[arg(long)] max_pids: Option<u64>, #[arg(long)] max_cpu_percent: Option<u64>,
+              #[arg(long)] max_file_size_mb: Option<u64>, #[arg(long)] max_action_secs: Option<u64> },
+    /// The environment service for one person on one machine: a data directory under ~/.local/share, a tenant
+    /// and an API key made on first use (the key in <data>/local-key, readable by its owner only), on 127.0.0.1.
+    EnvLocal{ #[arg(long)] data: Option<String>, #[arg(long, default_value="127.0.0.1:8650")] listen: String,
+              /// Import this image (a rootfs tarball, or with --oci an OCI image) as a template first, if none has its name.
+              #[arg(long)] image: Option<String>, #[arg(long, default_value="default")] image_name: String, #[arg(long)] oci: bool },
     /// Check whether this host can run the environment service (exits 1 if a check fails).
     EnvDoctor{ #[arg(long)] data: Option<String> },
     /// The coordinator of a cluster of environment nodes (see docs/env.md).
@@ -382,14 +391,20 @@ fn main() -> anyhow::Result<()> {
             }
             std::process::exit(code?);
         },
-        Cmd::EnvServe{data, listen, node, max_sessions, coordinator, advertise, token_file, metrics_listen} => {
+        Cmd::EnvServe{data, listen, node, max_sessions, coordinator, advertise, token_file, metrics_listen,
+                      max_memory_mb, max_pids, max_cpu_percent, max_file_size_mb, max_action_secs} => {
             // before any thread starts: access to everything the sandboxes write, whatever its modes
             selfdb::access::enter_owner_namespace()?;
             let cluster_token = token_file.as_deref().map(read_token).transpose()?;
             if coordinator.is_some() && (advertise.is_none() || cluster_token.is_none()) {
                 anyhow::bail!("--coordinator needs --advertise and --token-file");
             }
-            let cfg = selfdb::env::service::NodeConfig { max_sessions, cluster_token: cluster_token.clone() };
+            let mut cfg = selfdb::env::service::NodeConfig { max_sessions, cluster_token: cluster_token.clone(), ..Default::default() };
+            let m = &mut cfg.max_limits;
+            for (v, slot) in [(max_memory_mb, &mut m.memory_mb), (max_pids, &mut m.pids), (max_cpu_percent, &mut m.cpu_percent), (max_file_size_mb, &mut m.file_size_mb)] {
+                if let Some(v) = v { if v == 0 { anyhow::bail!("a limit of 0 would be no limit"); } *slot = v; }
+            }
+            if let Some(v) = max_action_secs { cfg.max_action_secs = v.max(1); }
             let svc = selfdb::env::service::Service::open_node(Path::new(&data), &node, cfg)?;
             eprintln!("environment service on {} (data {}, node {})", listen, data, node);
             if let (Some(c), Some(url), Some(token)) = (coordinator, advertise, cluster_token) {
@@ -415,6 +430,37 @@ fn main() -> anyhow::Result<()> {
                 }
                 selfdb::env::cluster::serve(c, &listen).await
             })?;
+        },
+        Cmd::EnvLocal{data, listen, image, image_name, oci} => {
+            // before any thread starts: access to everything the sandboxes write, whatever its modes
+            selfdb::access::enter_owner_namespace()?;
+            let data = match data {
+                Some(d) => std::path::PathBuf::from(d),
+                None => std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from)
+                    .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share")))
+                    .ok_or_else(|| anyhow::anyhow!("no HOME: give --data"))?.join("selfdb/local"),
+            };
+            let svc = selfdb::env::service::Service::open(&data, "n1")?;
+            let key_file = data.join("local-key");
+            if !key_file.exists() {
+                let t = svc.create_tenant("local", &selfdb::env::control::Quotas::default())?;
+                let key = svc.control().create_key(&t.id)?;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_file)?;
+                writeln!(f, "{}", key)?;
+                eprintln!("made a tenant and an API key: {} (readable by you only)", key_file.display());
+            }
+            if let Some(img) = image {
+                if !svc.control().all_templates()?.iter().any(|t| t.name == image_name && t.tenant_id.is_none()) {
+                    let t = if oci { svc.store().import_oci(svc.control(), &image_name, Path::new(&img))? }
+                            else { svc.store().import_image(svc.control(), &image_name, Path::new(&img))? };
+                    eprintln!("imported {} as template {} ({})", img, image_name, t.id);
+                }
+            }
+            eprintln!("environment service on http://{} (data {}); the key: {}", listen, data.display(), key_file.display());
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(selfdb::env::api::serve(svc, &listen))?;
         },
         Cmd::EnvDoctor{data} => {
             let (text, ok) = selfdb::env::doctor::report(&selfdb::env::doctor::checks(data.as_deref().map(Path::new)));

@@ -22,14 +22,19 @@ pub struct Server { pub base: String, pub svc: Arc<Service>, pub dir: PathBuf }
 impl Drop for Server { fn drop(&mut self) { let _ = vm::remove_tree(&self.dir); } }
 
 /// A small root filesystem (a shell and a few tools) as a tarball.
-pub fn rootfs(dir: &Path) -> PathBuf {
-    let c = vm::init_vm_db_with_opts(dir.join("img.db").to_str().unwrap(), true, true).unwrap();
-    for prog in ["/bin/sh", "/bin/cat", "/bin/mkdir", "/bin/rm", "/bin/ls", "/bin/chmod", "/usr/bin/head", "/bin/ln", "/usr/bin/readlink", "/usr/bin/cut", "/bin/sleep", "/bin/bash", "/usr/bin/tee", "/usr/bin/tail"] {
+pub fn rootfs(dir: &Path) -> PathBuf { rootfs_with(dir, "rootfs", &[]) }
+
+/// A small root filesystem (a shell and a few tools, and `extra` programs) as a tarball named `name`.tar.
+pub fn rootfs_with(dir: &Path, name: &str, extra: &[&str]) -> PathBuf {
+    let c = vm::init_vm_db_with_opts(dir.join(format!("{}.db", name)).to_str().unwrap(), true, true).unwrap();
+    let base = ["/bin/sh", "/bin/cat", "/bin/mkdir", "/bin/rm", "/bin/ls", "/bin/chmod", "/usr/bin/head", "/bin/ln", "/usr/bin/readlink",
+                "/usr/bin/cut", "/bin/sleep", "/bin/bash", "/usr/bin/tee", "/usr/bin/tail"];
+    for prog in base.iter().chain(extra) {
         if Path::new(prog).exists() { vm::vm_import_closure(&c, prog, "/").unwrap(); }
     }
-    let tree = dir.join("img-tree");
+    let tree = dir.join(format!("{}-tree", name));
     vm::vm_materialize_tree(&c, &tree).unwrap();
-    let tar_path = dir.join("rootfs.tar");
+    let tar_path = dir.join(format!("{}.tar", name));
     let mut b = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
     b.follow_symlinks(false);
     b.append_dir_all(".", &tree).unwrap();

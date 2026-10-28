@@ -285,6 +285,14 @@ impl Rollout {
     /// CPU time used by the rollout's sandbox so far, in microseconds.
     pub fn cpu_usec(&mut self) -> Option<u64> { self.sup.as_mut().and_then(|s| s.cpu_usec()) }
 
+    /// Take the upper directory as it is now as the starting point: the next action's changes are those
+    /// after this (what a task's services wrote while starting is not the agent's).
+    pub fn rebase(&mut self) -> Result<()> {
+        let _ = self.watch.take();
+        self.rescan_all()?;
+        Ok(())
+    }
+
     /// Bytes the rollout has written, as of the end of its last action (the regular files of its upper
     /// directory).
     pub fn upper_bytes(&self) -> u64 { self.bytes }

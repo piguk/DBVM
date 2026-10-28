@@ -322,3 +322,93 @@ fn task_files_are_where_every_rollout_starts() {
         assert_eq!(a.req("POST", "/v1/tasks", Some(json!({"template_id": image.id, "files": bad}))).0, 400, "{}", bad);
     }
 }
+
+#[test]
+fn task_services_and_egress() {
+    if !bwrap_ok() { return; }
+    let s = start("services");
+    let image = s.svc.store().import_image(s.svc.control(), "mini", &rootfs(&s.dir)).unwrap();
+    let a = tenant(&s, "a", Quotas::default());
+    // a service that writes its state and keeps running
+    let judge = "#!/bin/sh\nif [ -f /srv/state ]; then echo '{\"reward\": 1}'; else echo '{\"reward\": 0}'; fi\n";
+    let spec = |judge_services: bool| json!({
+        "template_id": image.id, "readonly": ["/tests"],
+        "files": [{"path": "/tests/judge.sh", "content": judge, "mode": 0o755}],
+        "services": [{"name": "db", "run": "mkdir -p /srv && echo up > /srv/state && exec sleep 3600", "ready": "test -f /srv/state"}],
+        "judge": {"cmd": ["/tests/judge.sh"], "sees": ["/work"], "services": judge_services},
+    });
+    let task = a.ok("POST", "/v1/tasks", Some(spec(true)))["task_id"].as_str().unwrap().to_string();
+    let sid = a.ok("POST", "/v1/sessions", Some(json!({"task_id": task})))["session_id"].as_str().unwrap().to_string();
+    let r = a.bash(&sid, "cat /srv/state; ls /tmp/selfdb-services");
+    assert_eq!(r["output"], "up\ndb.log\n", "{}", r);
+    assert_eq!(r["changes"], json!({"created": [], "modified": [], "deleted": []}), "the service's start is not the agent's change");
+    // a fork starts the service again over the parent's files
+    a.bash(&sid, "rm /srv/state");
+    let kid = a.ok("POST", &format!("/v1/sessions/{}/fork", sid), Some(json!({"variants": [{}]})))["session_ids"][0].as_str().unwrap().to_string();
+    assert_eq!(a.bash(&kid, "cat /srv/state")["output"], "up\n");
+    // the judge starts the services when asked to, else sees only the pristine template and /work
+    assert_eq!(a.ok("POST", &format!("/v1/sessions/{}/judge", sid), None)["reward"], 1.0);
+    let plain = a.ok("POST", "/v1/tasks", Some(spec(false)))["task_id"].as_str().unwrap().to_string();
+    let p = a.ok("POST", "/v1/sessions", Some(json!({"task_id": plain})))["session_id"].as_str().unwrap().to_string();
+    assert_eq!(a.ok("POST", &format!("/v1/sessions/{}/judge", p), None)["reward"], 0.0);
+    // a service that never becomes ready: the rollout does not start, and says why
+    let broken = a.ok("POST", "/v1/tasks", Some(json!({"template_id": image.id,
+        "services": [{"name": "slow", "run": "echo starting; exec sleep 3600", "ready": "false", "ready_timeout_secs": 1}]})))["task_id"].as_str().unwrap().to_string();
+    let (code, body) = a.req("POST", "/v1/sessions", Some(json!({"task_id": broken})));
+    assert_eq!(code, 400);
+    assert!(body["error"].as_str().unwrap().contains("not ready") && body["error"].as_str().unwrap().contains("starting"), "{}", body);
+    assert_eq!(a.req("POST", "/v1/tasks", Some(json!({"template_id": image.id, "services": [{"name": "a b", "run": "x"}]}))).0, 400);
+
+    // a task's rollouts reach the hosts it lists, through the egress proxy (bash's /dev/tcp to the proxy, an
+    // absolute-URI request), and nothing else
+    let serve = |body: &'static str| {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || for c in l.incoming().flatten() {
+            use std::io::{Read, Write};
+            let mut c = c;
+            let _ = c.read(&mut [0u8; 4096]);
+            let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes());
+        });
+        port
+    };
+    let (license, other) = (serve("LICENSE OK"), serve("SECRET"));
+    let get = |port: u16| format!("exec 3<>/dev/tcp/127.0.0.1/3128 && printf 'GET http://127.0.0.1:{}/ HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3", port);
+    let net = a.ok("POST", "/v1/tasks", Some(json!({"template_id": image.id, "egress": [format!("127.0.0.1:{}", license)]})))["task_id"].as_str().unwrap().to_string();
+    let r = a.ok("POST", "/v1/sessions", Some(json!({"task_id": net})))["session_id"].as_str().unwrap().to_string();
+    let bash = |sid: &str, cmd: String| a.act(sid, json!({"tool": "bash", "command": format!("bash -c {:?}", cmd)}));
+    assert!(bash(&r, get(license))["output"].as_str().unwrap().ends_with("LICENSE OK"), "{}", bash(&r, get(license)));
+    let refused = bash(&r, get(other));
+    assert!(!refused["output"].as_str().unwrap().contains("SECRET") && refused["output"].as_str().unwrap().contains("403"), "{}", refused);
+    assert_ne!(bash(&p, get(license))["exit_code"], 0, "a task without egress has no proxy to reach");
+}
+
+#[test]
+fn the_operator_bounds_what_a_task_asks_for() {
+    use selfdb::env::task::LimitsSpec;
+    let max = selfdb::sandbox::Limits { memory_mb: 256, pids: 64, ..selfdb::env::task::DEFAULT_MAX_LIMITS };
+    let l = LimitsSpec { memory_mb: Some(4096), pids: Some(10), ..LimitsSpec::default() }.resolve(&max);
+    assert_eq!((l.memory_mb, l.pids), (256, 10));
+}
+
+#[test]
+fn judge_files_are_the_judges_alone() {
+    if !bwrap_ok() { return; }
+    let s = start("judgefiles");
+    let image = s.svc.store().import_image(s.svc.control(), "mini", &rootfs(&s.dir)).unwrap();
+    let a = tenant(&s, "a", Quotas::default());
+    let check = "#!/bin/sh\nif [ \"$(cat /work/answer)\" = \"$(cat /judge/expected)\" ]; then echo '{\"reward\": 1}'; else echo '{\"reward\": 0}'; fi\n";
+    // sees includes /judge on purpose: what the agent writes there must not replace the judge's files
+    let task = a.ok("POST", "/v1/tasks", Some(json!({
+        "template_id": image.id,
+        "judge": {"cmd": ["/judge/check.sh"], "sees": ["/work", "/judge"],
+                  "files": [{"path": "/judge/check.sh", "content": check, "mode": 0o755}, {"path": "/judge/expected", "content": "42\n"}]},
+    })))["task_id"].as_str().unwrap().to_string();
+    let ids: Vec<String> = a.ok("POST", "/v1/rollouts", Some(json!({"task_id": task, "variants": [{}, {}]})))["session_ids"]
+        .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert!(a.bash(&ids[0], "ls /judge 2>&1 || echo HIDDEN")["output"].as_str().unwrap().contains("HIDDEN"), "the rollout does not see them");
+    a.bash(&ids[0], "mkdir -p /work /judge && echo 41 > /work/answer && echo 41 > /judge/expected");
+    assert_eq!(a.ok("POST", &format!("/v1/sessions/{}/judge", ids[0]), None)["reward"], 0.0, "the agent's /judge/expected does not count");
+    a.bash(&ids[1], "mkdir -p /work && echo 42 > /work/answer");
+    assert_eq!(a.ok("POST", &format!("/v1/sessions/{}/judge", ids[1]), None)["reward"], 1.0);
+}

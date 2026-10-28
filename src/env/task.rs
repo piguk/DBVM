@@ -33,6 +33,12 @@ pub struct TaskSpec {
     /// become one read-only layer the rollouts share; they are not the agent's changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<TaskFile>,
+    /// Hosts the task's rollouts may reach (`host`, `host:port`, `.domain`), through the egress proxy: a
+    /// license server, an internal API. None: no network.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<ServiceSpec>,
 }
 
 /// A file of a task: its content as text or (`encoding: base64`) base64, its mode (default 0644).
@@ -61,7 +67,31 @@ pub struct JudgeSpec {
     pub timeout_secs: u64,
     #[serde(default)]
     pub sees: Vec<String>,
+    /// Start the task's services in the judge's sandbox first (to query the state the rollout left).
+    #[serde(default)]
+    pub services: bool,
+    /// Files only the judge sees (hidden tests, expected results): never in a rollout, and above everything
+    /// else in the judge's sandbox, so nothing the agent writes replaces them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<TaskFile>,
 }
+
+/// A process a task's rollouts run beside the agent (a database, a mock of an internal API): started
+/// before the agent's first action, in every rollout and fork, and given `ready_timeout_secs` for `ready`
+/// (a shell command) to succeed. Its output goes to /tmp/selfdb-services/<name>.log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSpec {
+    pub name: String,
+    /// A shell command line that runs the service (in the foreground: it is started in the background).
+    pub run: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
+    #[serde(default = "default_ready_timeout")]
+    pub ready_timeout_secs: u64,
+}
+
+fn default_ready_timeout() -> u64 { 30 }
 
 fn default_judge_timeout() -> u64 { 300 }
 
@@ -76,25 +106,26 @@ pub struct LimitsSpec {
     pub file_size_mb: Option<u64>,
 }
 
-/// The largest limits a task may ask for. A tenant's quotas bound sessions and storage; these bound one
-/// sandbox, so a task cannot claim a whole node.
-const MAX: Limits = Limits { memory_mb: 32 * 1024, pids: 8192, cpu_percent: 1600, address_space_mb: 64 * 1024, cpu_secs: 24 * 3600, file_size_mb: 16 * 1024 };
+/// The largest limits a task may ask for, unless the node's operator sets others (`NodeConfig`). A tenant's
+/// quotas bound sessions and storage; these bound one sandbox, so a task cannot claim a whole node.
+pub const DEFAULT_MAX_LIMITS: Limits = Limits { memory_mb: 32 * 1024, pids: 8192, cpu_percent: 1600, address_space_mb: 64 * 1024, cpu_secs: 24 * 3600, file_size_mb: 16 * 1024 };
 
 impl LimitsSpec {
-    /// The sandbox defaults with this spec's values, each capped. 0 (no limit) is not accepted for a
+    /// The sandbox defaults with this spec's values, each capped at `max`. 0 (no limit) is not accepted for a
     /// sandbox-wide limit: it would let one rollout exhaust the node.
-    pub fn resolve(&self) -> Limits {
+    pub fn resolve(&self, max: &Limits) -> Limits {
         let d = Limits::default();
-        let pick = |v: Option<u64>, def: u64, max: u64| v.filter(|x| *x > 0).unwrap_or(def).min(max);
+        let pick = |v: Option<u64>, def: u64, cap: u64| v.filter(|x| *x > 0).unwrap_or(def).min(cap);
         Limits {
-            memory_mb: pick(self.memory_mb, d.memory_mb, MAX.memory_mb),
-            pids: pick(self.pids, d.pids, MAX.pids),
-            cpu_percent: pick(self.cpu_percent, d.cpu_percent, MAX.cpu_percent),
-            address_space_mb: self.address_space_mb.unwrap_or(d.address_space_mb).min(MAX.address_space_mb),
-            cpu_secs: self.cpu_secs.unwrap_or(d.cpu_secs).min(MAX.cpu_secs),
-            file_size_mb: pick(self.file_size_mb, d.file_size_mb, MAX.file_size_mb),
+            memory_mb: pick(self.memory_mb, d.memory_mb, max.memory_mb),
+            pids: pick(self.pids, d.pids, max.pids),
+            cpu_percent: pick(self.cpu_percent, d.cpu_percent, max.cpu_percent),
+            address_space_mb: self.address_space_mb.unwrap_or(d.address_space_mb).min(max.address_space_mb),
+            cpu_secs: self.cpu_secs.unwrap_or(d.cpu_secs).min(max.cpu_secs),
+            file_size_mb: pick(self.file_size_mb, d.file_size_mb, max.file_size_mb),
         }
     }
+
 }
 
 /// One action of an agent.

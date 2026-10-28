@@ -34,7 +34,6 @@ pub type EnvResult<T> = std::result::Result<T, EnvError>;
 const MAX_OUTPUT: usize = 1 << 20;
 const MAX_READ: u64 = 16 << 20;
 /// The longest a single action may run.
-const MAX_ACTION_SECS: u64 = 3600;
 const MAX_EGRESS_HOSTS: usize = 64;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +45,9 @@ pub struct CreateSession {
     pub task_id: Option<String>,
     #[serde(default)]
     pub egress: Vec<String>,
+    /// A build session's limits (a rollout's come from its task), capped as a task's are.
+    #[serde(default)]
+    pub limits: Option<super::task::LimitsSpec>,
     pub label: Option<String>,
     pub seed: Option<u64>,
 }
@@ -84,18 +86,29 @@ struct Live {
 
 /// A task as its sessions use it: its spec and the layers of its files.
 #[derive(Clone)]
-struct TaskRef { id: String, spec: TaskSpec, layers: Vec<String> }
+struct TaskRef { id: String, spec: TaskSpec, layers: Vec<String>, judge_layers: Vec<String> }
 
 /// At most this many bytes of files in a task (they are kept in the control database too).
 const MAX_TASK_FILES_BYTES: usize = 32 << 20;
 
-/// How a service runs as a node of a cluster (see `cluster`). The default is a single node on its own.
-#[derive(Debug, Clone, Default)]
+/// How a service runs: as a node of a cluster (see `cluster`), and with what bounds. The default is a single
+/// node on its own, with the default bounds.
+#[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// At most this many sessions on the node, all tenants together.
     pub max_sessions: Option<i64>,
     /// The cluster's shared token: the coordinator and the other nodes present it. None: not in a cluster.
     pub cluster_token: Option<String>,
+    /// The largest limits a task's sandboxes may have.
+    pub max_limits: Limits,
+    /// The longest an action (or a judge run) may take.
+    pub max_action_secs: u64,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        NodeConfig { max_sessions: None, cluster_token: None, max_limits: super::task::DEFAULT_MAX_LIMITS, max_action_secs: 3600 }
+    }
 }
 
 /// What a node reports to the coordinator.
@@ -120,6 +133,8 @@ struct Plan<'a> {
     extra: &'a [String],
     egress: &'a [String],
     parent: Option<&'a str>,
+    /// The sandbox's limits; None: the task's (or the defaults).
+    limits: Option<Limits>,
 }
 
 /// Places in a tenant's session limit, held for sessions being started (`Service::reserve`). Each session
@@ -214,8 +229,37 @@ fn check_path(p: &str) -> EnvResult<()> {
     Ok(())
 }
 
+/// Start `services` in `r` (in the background), each given its time to become ready.
+fn start_services(r: &mut Rollout, services: &[super::task::ServiceSpec]) -> EnvResult<()> {
+    let sh = |r: &mut Rollout, cmd: String, secs: u64| r.exec(&["/bin/sh".into(), "-c".into(), cmd], "/", Duration::from_secs(secs), 64 << 10);
+    for svc in services {
+        let log = format!("/tmp/selfdb-services/{}.log", svc.name);
+        let o = sh(r, format!("mkdir -p /tmp/selfdb-services && ({}) > {} 2>&1 < /dev/null &", svc.run, log), 30)?.outcome;
+        if o.exit_code != 0 { return Err(EnvError::BadRequest(format!("service {} did not start: {}", svc.name, String::from_utf8_lossy(&o.stderr)))); }
+        let Some(ready) = &svc.ready else { continue };
+        let deadline = Instant::now() + Duration::from_secs(svc.ready_timeout_secs.clamp(1, 600));
+        loop {
+            if sh(r, ready.clone(), 30)?.outcome.exit_code == 0 { break; }
+            if Instant::now() > deadline {
+                let tail = sh(r, format!("tail -c 2000 {}", log), 10).map(|a| String::from_utf8_lossy(&a.outcome.stdout).into_owned()).unwrap_or_default();
+                return Err(EnvError::BadRequest(format!("service {} was not ready within {} s; its log ends:\n{}", svc.name, svc.ready_timeout_secs, tail)));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a task is well formed (its template aside).
 pub fn check_task(spec: &TaskSpec) -> EnvResult<()> {
+    if spec.egress.len() > MAX_EGRESS_HOSTS { return Err(EnvError::BadRequest(format!("at most {} egress hosts", MAX_EGRESS_HOSTS))); }
+    let mut names = std::collections::HashSet::new();
+    for svc in &spec.services {
+        if svc.name.is_empty() || svc.name.len() > 64 || !svc.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || !names.insert(&svc.name) {
+            return Err(EnvError::BadRequest(format!("services: {:?} is not a name (letters, digits, - and _), or is given twice", svc.name)));
+        }
+        if svc.run.trim().is_empty() { return Err(EnvError::BadRequest(format!("services: {} has no run command", svc.name))); }
+    }
     for p in &spec.readonly { check_path(p)?; }
     if let Some(j) = &spec.judge {
         if j.cmd.is_empty() { return Err(EnvError::BadRequest("judge.cmd is empty".into())); }
@@ -236,11 +280,22 @@ pub fn same_secret(a: &str, b: &str) -> bool {
 }
 
 /// A task's files, decoded and checked: (path, bytes, mode).
-fn task_files(spec: &TaskSpec) -> EnvResult<Vec<(String, Vec<u8>, u32)>> {
+/// Files decoded from a task: (path, bytes, mode).
+type Files = Vec<(String, Vec<u8>, u32)>;
+
+/// A task's files and its judge's, decoded and checked.
+fn task_files(spec: &TaskSpec) -> EnvResult<(Files, Files)> {
+    let mut size = 0usize;
+    let files = decode_files(&spec.files, &mut size)?;
+    let judge = decode_files(spec.judge.as_ref().map(|j| j.files.as_slice()).unwrap_or(&[]), &mut size)?;
+    Ok((files, judge))
+}
+
+/// Files as given in a task, decoded and checked; `size` counts their bytes against MAX_TASK_FILES_BYTES.
+fn decode_files(files: &[super::task::TaskFile], size: &mut usize) -> EnvResult<Files> {
     let mut out: Vec<(String, Vec<u8>, u32)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut size = 0usize;
-    for f in &spec.files {
+    for f in files {
         check_path(&f.path)?;
         let p = crate::vm::normalize_vm_path(&f.path);
         if p == "/" || !seen.insert(p.clone()) { return Err(EnvError::BadRequest(format!("files: {:?} is not a file path, or is given twice", f.path))); }
@@ -248,8 +303,8 @@ fn task_files(spec: &TaskSpec) -> EnvResult<Vec<(String, Vec<u8>, u32)>> {
             Encoding::Utf8 => f.content.as_bytes().to_vec(),
             Encoding::Base64 => B64.decode(&f.content).map_err(|e| EnvError::BadRequest(format!("files: {}: not base64: {}", f.path, e)))?,
         };
-        size += data.len();
-        if size > MAX_TASK_FILES_BYTES { return Err(EnvError::BadRequest(format!("a task's files may hold at most {} bytes", MAX_TASK_FILES_BYTES))); }
+        *size += data.len();
+        if *size > MAX_TASK_FILES_BYTES { return Err(EnvError::BadRequest(format!("a task's files may hold at most {} bytes", MAX_TASK_FILES_BYTES))); }
         out.push((p, data, f.mode.unwrap_or(0o644) & 0o7777));
     }
     // a file cannot also be a directory of another
@@ -468,16 +523,17 @@ impl Service {
 
     /// Record a checked task as `id`, with the layer of its files.
     fn store_task(&self, id: &str, t: &Tenant, spec: &TaskSpec) -> EnvResult<()> {
-        let files = task_files(spec)?;
-        let size: usize = files.iter().map(|(_, d, _)| d.len()).sum();
+        let (files, judge_files) = task_files(spec)?;
+        let size: usize = files.iter().chain(&judge_files).map(|(_, d, _)| d.len()).sum();
         if self.control.storage_bytes(&t.id)? + size as i64 > t.max_storage_bytes {
             return Err(EnvError::Quota(format!("storing this task would exceed {} bytes", t.max_storage_bytes)));
         }
         let _g = self.layers_lock.lock().unwrap();
-        let layers = if files.is_empty() { Vec::new() } else {
-            vec![self.store.new_layer(&self.control, Some(&t.id), &|dest| write_task_files(dest, &files))?.id]
+        let layer = |files: &[(String, Vec<u8>, u32)]| -> EnvResult<Vec<String>> {
+            Ok(if files.is_empty() { Vec::new() } else { vec![self.store.new_layer(&self.control, Some(&t.id), &|dest| write_task_files(dest, files))?.id] })
         };
-        self.control.insert_task(id, &t.id, &serde_json::to_string(spec)?, &layers)?;
+        let (layers, judge_layers) = (layer(&files)?, layer(&judge_files)?);
+        self.control.insert_task(id, &t.id, &serde_json::to_string(spec)?, &layers, &judge_layers)?;
         Ok(())
     }
 
@@ -485,7 +541,7 @@ impl Service {
 
     fn own_task(&self, t: &Tenant, id: &str) -> EnvResult<TaskRef> {
         match self.control.task(id)? {
-            Some((owner, spec, layers)) if owner == t.id => Ok(TaskRef { id: id.to_string(), spec: serde_json::from_str(&spec)?, layers }),
+            Some(row) if row.tenant == t.id => Ok(TaskRef { id: id.to_string(), spec: serde_json::from_str(&row.spec)?, layers: row.layers, judge_layers: row.judge_layers }),
             _ => Err(EnvError::NotFound(format!("task {}", id))),
         }
     }
@@ -532,16 +588,18 @@ impl Service {
                 let tp = self.visible_template(t, tid)?;
                 if req.egress.len() > MAX_EGRESS_HOSTS { return Err(EnvError::BadRequest(format!("at most {} egress hosts", MAX_EGRESS_HOSTS))); }
                 let slots = self.reserve(t, 1)?;
-                let plan = Plan { kind: Kind::Build, template: &tp, task: &None, extra: &[], egress: &req.egress, parent: None };
+                let limits = req.limits.as_ref().map(|l| l.resolve(&self.node.max_limits));
+                let plan = Plan { kind: Kind::Build, template: &tp, task: &None, extra: &[], egress: &req.egress, parent: None, limits };
                 self.start(t, &slots, &plan, Variant { label: req.label, seed: req.seed })
             }
             (None, Some(task_id)) => {
-                if !req.egress.is_empty() { return Err(EnvError::BadRequest("rollouts have no network; egress is for build sessions".into())); }
+                if !req.egress.is_empty() { return Err(EnvError::BadRequest("a rollout's network is its task's egress; egress here is for build sessions".into())); }
+                if req.limits.is_some() { return Err(EnvError::BadRequest("a rollout's limits are its task's".into())); }
                 let task = self.own_task(t, task_id)?;
                 let tp = self.visible_template(t, &task.spec.template_id)?;
                 let slots = self.reserve(t, 1)?;
                 let task = Some(task);
-                let plan = Plan { kind: Kind::Rollout, template: &tp, task: &task, extra: &[], egress: &[], parent: None };
+                let plan = Plan { kind: Kind::Rollout, template: &tp, task: &task, extra: &[], egress: &[], parent: None, limits: None };
                 self.start(t, &slots, &plan, Variant { label: req.label, seed: req.seed })
             }
             _ => Err(EnvError::BadRequest("give exactly one of template_id and task_id".into())),
@@ -560,14 +618,16 @@ impl Service {
     }
 
     fn start_inner(&self, t: &Tenant, slots: &Reservation, plan: &Plan, v: Variant) -> EnvResult<String> {
-        let Plan { kind, template, task, extra: extra_layers, egress, parent } = *plan;
+        let Plan { kind, template, task, extra: extra_layers, egress, parent, limits: plan_limits } = *plan;
         let (label, seed) = (v.label, v.seed);
         let task_layers: &[String] = task.as_ref().map(|k| k.layers.as_slice()).unwrap_or(&[]);
         let ids: Vec<String> = template.layers.iter().chain(task_layers).chain(extra_layers.iter()).cloned().collect();
         let layers = self.store.layer_paths(&self.control, &ids)?;
         let spec = task.as_ref().map(|k| &k.spec);
         let env = base_env(template, spec, seed);
-        let limits = spec.map(|s| s.limits.resolve()).unwrap_or_default();
+        let limits = plan_limits.or_else(|| spec.map(|s| s.limits.resolve(&self.node.max_limits))).unwrap_or_default();
+        // a rollout reaches what its task lists, a build session what it was started with
+        let egress: Vec<String> = match spec { Some(s) => s.egress.clone(), None => egress.to_vec() };
         let proxy = if !egress.is_empty() {
             let dir = WorkDir::create_in(&self.store.run_dir(), "egress-")?;
             Some((EgressProxy::start(dir.path(), EgressPolicy { allow: egress.to_vec() })?, dir))
@@ -576,7 +636,14 @@ impl Service {
             limits, env: env.clone(), readonly: spec.map(|s| s.readonly.clone()).unwrap_or_default(),
             egress: proxy.as_ref().map(|(_, d)| d.path().to_path_buf()), work_root: Some(self.store.run_dir()), ..RolloutOptions::default()
         };
-        let rollout = Rollout::start(&layers, &opts)?;
+        let mut rollout = Rollout::start(&layers, &opts)?;
+        if let Some(s) = spec {
+            if !s.services.is_empty() {
+                start_services(&mut rollout, &s.services)?;
+                // what the services wrote while starting is where the agent starts, not its change
+                rollout.rebase()?;
+            }
+        }
         let id = self.store.new_id("ses")?;
         let traj_path = self.store.trajectory_path(&t.id, &id);
         if let Some(p) = traj_path.parent() { std::fs::create_dir_all(p)?; }
@@ -585,7 +652,7 @@ impl Service {
                                     label.as_deref(), seed, extra_layers)?;
         let entry = Entry { tenant: t.id.clone(), template: template.id.clone(), started: Instant::now(), max_secs: t.max_session_secs, live: Arc::new(Mutex::new(Live {
             tenant: t.clone(), kind, template: template.clone(), task: task.clone(), extra_layers: extra_layers.to_vec(), label, seed, env, limits,
-            egress: egress.to_vec(), rollout, _proxy: proxy, steps: 0, started: Instant::now(), trajectory })) };
+            egress, rollout, _proxy: proxy, steps: 0, started: Instant::now(), trajectory })) };
         let mut map = self.sessions.lock().unwrap();
         map.insert(id.clone(), entry);
         slots.admit();
@@ -646,7 +713,7 @@ impl Service {
             Action::Bash { command, timeout_secs, cwd } => {
                 let cwd = cwd.clone().unwrap_or_else(|| l.template.workdir.clone());
                 check_path(&cwd)?;
-                let secs = timeout_secs.unwrap_or(step_timeout).clamp(1, MAX_ACTION_SECS);
+                let secs = timeout_secs.unwrap_or(step_timeout).clamp(1, self.node.max_action_secs);
                 l.rollout.exec(&["/bin/sh".into(), "-c".into(), command.clone()], &cwd, Duration::from_secs(secs), MAX_OUTPUT)?
             }
             Action::ReadFile { path, offset, limit, encoding } => {
@@ -734,13 +801,13 @@ impl Service {
         let slots = self.reserve(t, variants.len())?;
         let g = self.layers_lock.lock().unwrap();
         let live = self.live(t, id)?;
-        let (kind, template, task, extra, egress, parent_seed) = {
+        let (kind, template, task, extra, egress, parent_seed, limits) = {
             let l = live.lock().unwrap();
             let (extra, _) = self.capture(t, &l)?;
-            (l.kind, l.template.clone(), l.task.clone(), extra, l.egress.clone(), l.seed)
+            (l.kind, l.template.clone(), l.task.clone(), extra, l.egress.clone(), l.seed, l.limits)
         };
         let variants = variants.into_iter().map(|v| Variant { label: v.label, seed: v.seed.or(parent_seed) }).collect();
-        let plan = Plan { kind, template: &template, task: &task, extra: &extra, egress: &egress, parent: Some(id) };
+        let plan = Plan { kind, template: &template, task: &task, extra: &extra, egress: &egress, parent: Some(id), limits: Some(limits) };
         let results = self.start_many(t, &slots, &plan, variants);
         // closing a failed batch collects layers, which takes the layers lock
         drop(g);
@@ -791,7 +858,7 @@ impl Service {
         // deleted meanwhile: its layers may be gone
         if self.control.checkpoint(id)?.is_none() { return Err(EnvError::NotFound(format!("checkpoint {}", id))); }
         let variants = variants.into_iter().map(|v| Variant { label: v.label, seed: v.seed.or(k.seed) }).collect();
-        let plan = Plan { kind: Kind::parse(&k.kind), template: &template, task: &task, extra: &k.layers, egress: &k.egress, parent: Some(&k.session_id) };
+        let plan = Plan { kind: Kind::parse(&k.kind), template: &template, task: &task, extra: &k.layers, egress: &k.egress, parent: Some(&k.session_id), limits: None };
         let results = self.start_many(t, &slots, &plan, variants);
         drop(g);
         self.all_started(t, results, "fork failed")
@@ -849,8 +916,11 @@ impl Service {
             }
         }
         let opts = RolloutOptions { limits: l.limits, env: l.env.clone(), readonly: Vec::new(), egress: None, work_root: Some(self.store.run_dir()), ..RolloutOptions::default() };
+        // the judge's own files last: nothing the agent wrote under `sees` replaces them
+        layers.extend(self.store.layer_paths(&self.control, &task.judge_layers)?);
         let mut sandbox = Rollout::start(&layers, &opts)?;
-        let outcome = sandbox.exec(&judge.cmd, &l.template.workdir, Duration::from_secs(judge.timeout_secs.clamp(1, MAX_ACTION_SECS)), MAX_OUTPUT)?.outcome;
+        if judge.services { start_services(&mut sandbox, &spec.services)?; }
+        let outcome = sandbox.exec(&judge.cmd, &l.template.workdir, Duration::from_secs(judge.timeout_secs.clamp(1, self.node.max_action_secs)), MAX_OUTPUT)?.outcome;
         drop(sandbox);
         let verdict = JudgeResult::parse(&outcome);
         let line = serde_json::json!({"step": l.steps, "ts": crate::vm::now_secs(), "label": l.label, "seed": l.seed, "judge": verdict});
@@ -889,7 +959,7 @@ impl Service {
         let tp = self.visible_template(t, &task.spec.template_id)?;
         let slots = self.reserve(t, variants.len())?;
         let task = Some(task);
-        let plan = Plan { kind: Kind::Rollout, template: &tp, task: &task, extra: &[], egress: &[], parent: None };
+        let plan = Plan { kind: Kind::Rollout, template: &tp, task: &task, extra: &[], egress: &[], parent: None, limits: None };
         let results = self.start_many(t, &slots, &plan, variants);
         self.all_started(t, results, "rollouts failed")
     }

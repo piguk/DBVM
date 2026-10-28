@@ -33,7 +33,7 @@ fn cluster(name: &str) -> Cluster {
     let _ = vm::remove_tree(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let token = selfdb::env::control::random_hex(24).unwrap();
-    let node = |id: &str| Service::open_node(&dir.join(id), id, NodeConfig { max_sessions: Some(2), cluster_token: Some(token.clone()) }).unwrap();
+    let node = |id: &str| Service::open_node(&dir.join(id), id, NodeConfig { max_sessions: Some(2), cluster_token: Some(token.clone()), ..Default::default() }).unwrap();
     let (n1, n2) = (node("n1"), node("n2"));
     let (u1, u2) = (serve(selfdb::env::api::router(n1.clone())), serve(selfdb::env::api::router(n2.clone())));
     let coord = Coordinator::open(&dir.join("coord"), "c1", token).unwrap();
