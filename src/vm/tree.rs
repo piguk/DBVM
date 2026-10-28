@@ -68,6 +68,16 @@ pub(crate) fn resolve_parent_in_vm(p: &str, links: &std::collections::HashMap<St
 
 /// Materialize with an explicit content-cache root (tests and callers that manage their own cache).
 pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root: &Path) -> Result<usize> {
+    materialize(conn, dest, Some(cache_root))
+}
+
+/// Materialize without the content cache: for a tree that is kept (a template's layer), where a cached copy
+/// of every file would double the disk it takes (measured: 628 MB of cache beside a 645 MB layer).
+pub fn vm_materialize_tree_uncached(conn: &Connection, dest: &Path) -> Result<usize> {
+    materialize(conn, dest, None)
+}
+
+fn materialize(conn: &Connection, dest: &Path, cache_root: Option<&Path>) -> Result<usize> {
     use rayon::prelude::*;
     // the content cache is keyed by vm_fs.hash: a stale hash would materialize the old content
     finalize_dirty(conn)?;
@@ -151,10 +161,10 @@ pub fn vm_materialize_tree_with_cache(conn: &Connection, dest: &Path, cache_root
         };
         if let Some(par)=host.parent(){ let _ = std::fs::create_dir_all(par); }
         let key = t.hash.clone().unwrap_or_else(|| fx_hash_u64(&data));
-        let cache_p = cache_root.join(&key[0..2.min(key.len())]).join(&key);
-        if !cache_copy_out(&cache_p, data.len() as u64, &host) {
+        let cache_p = cache_root.map(|r| r.join(&key[0..2.min(key.len())]).join(&key));
+        if !cache_p.as_ref().map(|c| cache_copy_out(c, data.len() as u64, &host)).unwrap_or(false) {
             if let Err(e) = std::fs::write(&host, &data) { failures.lock().unwrap().push(format!("{}: write {}: {}", t.path, host.display(), e)); return; }
-            cache_put(&cache_p, &data);
+            if let Some(c) = &cache_p { cache_put(c, &data); }
         }
         #[cfg(unix)]
         {

@@ -343,6 +343,22 @@ fn tar_vm_path(archive_path: &str, strip_prefix: &str) -> String {
     normalize_vm_path(p)
 }
 
+/// A tar hard link `vm_path` to `target` (an earlier member): the same content, or for a link to a symlink the
+/// same symlink. A member that names itself (tar writes that for a path listed twice) is already there.
+pub fn hard_link(conn: &Connection, vm_path: &str, target: &str, mode: i64, mtime: i64) -> Result<()> {
+    if vm_path == target { return Ok(()); }
+    let link: Option<(String, Option<String>)> = conn.prepare_cached("SELECT kind, link_target FROM vm_fs WHERE path=?1")?
+        .query_row(params![target], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    match link {
+        Some((kind, Some(t))) if kind == "symlink" => vm_add_symlink(conn, vm_path, &t),
+        Some((kind, _)) if kind == "file" => {
+            let data = vm_cat(conn, target).map_err(|e| anyhow!("hard link {} -> {}: {}", vm_path, target, e))?;
+            vm_add_bytes(conn, vm_path, &data, mode, mtime)
+        }
+        _ => Err(anyhow!("hard link {} -> {}: not a file or symlink in the archive", vm_path, target)),
+    }
+}
+
 pub fn vm_import_tar_filtered(conn: &Connection, tar_path: &str, strip_prefix: &str, whitelist: Option<&[String]>, exclude: Option<&[String]>) -> Result<usize> {
     use std::io::Read;
     let file = std::fs::File::open(tar_path).map_err(|e| anyhow!("open tar {}: {}", tar_path, e))?;
@@ -378,8 +394,7 @@ pub fn vm_import_tar_filtered(conn: &Connection, tar_path: &str, strip_prefix: &
             // pointed at the wrong file: the path is relative to the archive root, not to the link.
             let Some(t) = entry.link_name()? else { continue };
             let target = tar_vm_path(&t.to_string_lossy(), strip_prefix);
-            let data = vm_cat(conn, &target).map_err(|e| anyhow!("hard link {} -> {}: {}", vm_path, target, e))?;
-            vm_add_bytes(conn, &vm_path, &data, mode, mtime)?;
+            hard_link(conn, &vm_path, &target, mode, mtime)?;
         }
         else if kind.is_file() { let mut data = Vec::new(); entry.read_to_end(&mut data)?; vm_add_bytes(conn, &vm_path, &data, mode, mtime)?; }
         else { continue; }
