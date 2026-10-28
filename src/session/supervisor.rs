@@ -147,8 +147,11 @@ impl Supervisor {
     }
 
     /// Write `data` to `path` inside the sandbox, creating parent directories.
-    pub fn write(&mut self, path: &str, data: &[u8], mode: u32) -> Result<std::result::Result<(), String>> {
-        Ok(self.file_op("write", &[("path", path.as_bytes()), ("mode", format!("{:o}", mode).as_bytes()), ("in", data)])?.map(|_| ()))
+    /// Write `path` (parent directories created). With `mode` the file gets exactly that mode; without, a new
+    /// file is 0644 and an existing one keeps its mode.
+    pub fn write(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<std::result::Result<(), String>> {
+        let mode = match mode { Some(m) => format!("={:o}", m & 0o7777), None => "644".into() };
+        Ok(self.file_op("write", &[("path", path.as_bytes()), ("mode", mode.as_bytes()), ("in", data)])?.map(|_| ()))
     }
 
     /// The entries of directory `path` inside the sandbox, sorted by name.

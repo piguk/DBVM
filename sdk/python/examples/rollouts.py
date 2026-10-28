@@ -1,11 +1,15 @@
-"""Run a task as several seeded rollouts concurrently, judge them, and fork the best one.
+"""Run a task as several seeded rollouts concurrently, judge them, fork the best one, and start again from
+a checkpoint.
 
-    python3 rollouts.py BASE_URL API_KEY TASK_ID
+    SELFDB_ENV_API_KEY=... python3 rollouts.py BASE_URL TASK_ID
+
+The key comes from the environment, not the command line, where other users could read it.
 
 The task is expected to judge on /app/calc.sh (as in tests/env_api.rs); each rollout tries a different fix.
 """
 
 import asyncio
+import os
 import sys
 
 from selfdb_env import AsyncClient, Client
@@ -38,10 +42,20 @@ async def main(base, key, task_id):
     kids = a.fork([{"label": "k%d" % i} for i in range(3)])
     assert all(k.judge()["reward"] == 1.0 for k in kids)
     assert [s["step"] for s in a.trajectory() if "response" in s] == [1, 2]
-    for s in [a, b] + kids:
+
+    # a checkpoint after a wrong edit: the session moves on and ends, new attempts start from that step
+    b.edit_file("/app/calc.sh", "2 - 3", "2 * 3")
+    ckpt = b.checkpoint()
+    b.edit_file("/app/calc.sh", "2 * 3", "2 + 3")
+    b.close()
+    retries = sync.fork_checkpoint(ckpt["id"], [{"label": "retry-%d" % i} for i in range(2)])
+    assert [r.bash("cat /app/calc.sh")["output"] for r in retries] == ["echo $((2 * 3))\n"] * 2
+    assert [k["step"] for k in sync.checkpoints(b.id)] == [ckpt["step"]] == [2]
+    sync.delete_checkpoint(ckpt["id"])
+    for s in [a] + kids + retries:
         s.close()
     print("ok")
 
 
 if __name__ == "__main__":
-    asyncio.run(main(*sys.argv[1:4]))
+    asyncio.run(main(sys.argv[1], os.environ["SELFDB_ENV_API_KEY"], sys.argv[2]))

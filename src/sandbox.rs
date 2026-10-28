@@ -467,7 +467,8 @@ fn write_cgroup_limits(dir: &Path, l: &Limits) -> Result<()> {
 
 /// How sandboxes get their cgroups on this host.
 enum Cgroups {
-    /// `$SELF_SANDBOX_CGROUP`: a cgroup this process owns (a service with `Delegate=yes`). Each sandbox is
+    /// `$SELF_SANDBOX_CGROUP`: a cgroup this process owns (a service with `Delegate=yes`; `auto`: the one it
+    /// runs in). Each sandbox is
     /// a child directory of it.
     Delegated(PathBuf),
     /// A transient scope per sandbox from the user's systemd instance (an interactive login).
@@ -483,7 +484,8 @@ fn cgroups() -> Result<&'static Cgroups> {
 
 fn detect_cgroups() -> std::result::Result<Cgroups, String> {
     if let Ok(root) = std::env::var("SELF_SANDBOX_CGROUP") {
-        return prepare_delegated(Path::new(&root)).map(Cgroups::Delegated);
+        let root = if root == "auto" { own_cgroup()? } else { PathBuf::from(root) };
+        return prepare_delegated(&root).map(Cgroups::Delegated);
     }
     let ok = Command::new("systemd-run").args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
@@ -494,6 +496,14 @@ fn detect_cgroups() -> std::result::Result<Cgroups, String> {
 /// Make `root` usable as the parent of sandbox cgroups. cgroup v2 allows controllers to be enabled for
 /// children only when the parent itself holds no processes, so this process moves into a leaf
 /// (`root/supervisor`) first.
+/// The cgroup this process runs in (`SELF_SANDBOX_CGROUP=auto`: a systemd service with `Delegate=yes`, or a
+/// container with its own cgroup namespace, owns it).
+fn own_cgroup() -> std::result::Result<PathBuf, String> {
+    let line = std::fs::read_to_string("/proc/self/cgroup").map_err(|e| format!("read /proc/self/cgroup: {}", e))?;
+    let rel = line.lines().find_map(|l| l.strip_prefix("0::")).ok_or("no cgroup v2 entry in /proc/self/cgroup")?;
+    Ok(Path::new("/sys/fs/cgroup").join(rel.trim().trim_start_matches('/')))
+}
+
 fn prepare_delegated(root: &Path) -> std::result::Result<PathBuf, String> {
     if !root.starts_with("/sys/fs/cgroup") { return Err(format!("{} is not under /sys/fs/cgroup", root.display())); }
     let supervisor = root.join("supervisor");

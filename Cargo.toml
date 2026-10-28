@@ -37,6 +37,11 @@ lru = "0.12"
 fuser = { version = "0.14", optional = true, default-features = false, features = ["abi-7-31"] }
 flate2 = "1.0"
 sha2 = "0.10"
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false }
+bytes = "1"
+# HTTP between the coordinator and the nodes (blocking, on worker threads)
+ureq = { version = "2", default-features = false, features = ["json"] }
 # the RL environment service (src/env): HTTP API and its JSON bodies
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
@@ -55,6 +60,5 @@ opt-level = 3
 panic = "abort"
 
 [dev-dependencies]
-ureq = { version = "2", default-features = false, features = ["json"] }
 # the mount tests name fuser::BackgroundSession (the mount handle)
 fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }

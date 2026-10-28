@@ -118,7 +118,7 @@ impl Session {
 
     /// Write a file in the session (parent directories are created), recorded as a step like a command. A
     /// refused write (a read-only path) is a failed step with the sandbox's message in stderr.
-    pub fn write_file(&mut self, path: &str, data: &[u8], mode: u32) -> Result<StepResult> {
+    pub fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<StepResult> {
         let started = Instant::now();
         let outcome = match self.sup()?.write(path, data, mode)? {
             Ok(()) => Outcome::default(),

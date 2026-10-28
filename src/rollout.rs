@@ -77,13 +77,17 @@ pub struct Rollout {
     scan: BTreeMap<String, Entry>,
     /// The size of the regular files in `scan`.
     bytes: u64,
+    /// The paths of each regular file's inode in `scan`. inotify reports a change under the name it was made
+    /// through; a file's other names (hard links) changed too (measured: a chmod through one name left the
+    /// other's change unreported).
+    by_ino: HashMap<u64, BTreeSet<String>>,
     watch: TreeWatch,
     walk_every: u32,
     since_walk: u32,
 }
 
 /// What the scan keeps per upper entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct Entry {
     kind: Kind,
     mode: u32,
@@ -91,7 +95,18 @@ struct Entry {
     mtime_ns: i64,
     link: Option<PathBuf>,
     opaque: bool,
+    /// A regular file's inode (0 otherwise): its hard links change with it. Not part of what the entry
+    /// shows, so not compared.
+    ino: u64,
 }
+
+impl PartialEq for Entry {
+    fn eq(&self, o: &Entry) -> bool {
+        (self.kind, self.mode, self.size, self.mtime_ns, &self.link, self.opaque) == (o.kind, o.mode, o.size, o.mtime_ns, &o.link, o.opaque)
+    }
+}
+
+impl Eq for Entry {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind { File, Dir, Symlink, Whiteout, Other }
@@ -104,6 +119,7 @@ fn entry_of(path: &Path, md: &std::fs::Metadata) -> Entry {
     Entry {
         kind, mode: md.mode() & 0o7777, size: md.size(), mtime_ns: md.mtime() * 1_000_000_000 + md.mtime_nsec(),
         link: if kind == Kind::Symlink { std::fs::read_link(path).ok() } else { None }, opaque,
+        ino: if kind == Kind::File { md.ino() } else { 0 },
     }
 }
 
@@ -255,7 +271,7 @@ impl Rollout {
         }
         // the sandbox's own mount points (/.selfdb, read-only paths) are not the rollout's changes
         let _ = watch.take();
-        let mut r = Rollout { work, layers: layers.to_vec(), sup: Some(sup), env, scan: BTreeMap::new(), bytes: 0, watch,
+        let mut r = Rollout { work, layers: layers.to_vec(), sup: Some(sup), env, scan: BTreeMap::new(), bytes: 0, by_ino: HashMap::new(), watch,
                               walk_every: opts.walk_every.max(1), since_walk: 0 };
         r.rescan_all()?;
         Ok(r)
@@ -281,8 +297,9 @@ impl Rollout {
         self.finish(outcome, started)
     }
 
-    /// Write a file (parent directories created). A refused write is a failed action with the message in stderr.
-    pub fn write_file(&mut self, path: &str, data: &[u8], mode: u32) -> Result<ActionResult> {
+    /// Write a file (parent directories created; `mode` as in `Supervisor::write`). A refused write is a failed
+    /// action with the message in stderr.
+    pub fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<ActionResult> {
         let started = Instant::now();
         let outcome = match self.sup()?.write(path, data, mode)? {
             Ok(()) => Outcome::default(),
@@ -320,42 +337,57 @@ impl Rollout {
             if !cur.contains_key(p) { changed.push((p.clone(), Some(pe.clone()))); }
         }
         self.bytes = cur.values().filter(|e| e.kind == Kind::File).map(|e| e.size).sum();
+        self.by_ino.clear();
+        for (p, e) in &cur {
+            if e.kind == Kind::File { self.by_ino.entry(e.ino).or_default().insert(p.clone()); }
+        }
         self.scan = cur;
         self.since_walk = 0;
         Ok(changed)
     }
 
-    /// Update the scan at `paths` only (and below those that are no longer directories). Returns the entries
-    /// that differ, each with its previous value.
+    /// Update the scan at `paths` only, the other names of the files among them, and what was below those
+    /// that are no longer directories. Returns the entries that differ, each with its previous value.
     fn rescan(&mut self, paths: &BTreeSet<String>) -> Result<Vec<(String, Option<Entry>)>> {
         let upper = self.upper();
         let mut changed = Vec::new();
-        for p in paths {
-            if p == "/" { continue; }
-            let hp = host(&upper, p);
+        let mut queue: Vec<String> = paths.iter().rev().cloned().collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(p) = queue.pop() {
+            if p == "/" || !seen.insert(p.clone()) { continue; }
+            let hp = host(&upper, &p);
             let now = match std::fs::symlink_metadata(&hp) {
                 Ok(md) => Some(entry_of(&hp, &md)),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                 Err(err) => return Err(anyhow!("scan {}: {}", hp.display(), err)),
             };
+            for e in [self.scan.get(&p), now.as_ref()].into_iter().flatten().filter(|e| e.kind == Kind::File) {
+                if let Some(names) = self.by_ino.get(&e.ino) {
+                    queue.extend(names.iter().filter(|n| !seen.contains(*n)).cloned());
+                }
+            }
             if now.as_ref().map(|e| e.kind != Kind::Dir).unwrap_or(true) {
                 // not a directory (any more): nothing the scan had below it is there
                 let prefix = format!("{}/", p);
                 let below: Vec<String> = self.scan.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)).map(|(k, _)| k.clone()).collect();
                 for k in below { self.set(k, None, &mut changed); }
             }
-            self.set(p.clone(), now, &mut changed);
+            self.set(p, now, &mut changed);
         }
         Ok(changed)
     }
 
     fn set(&mut self, p: String, now: Option<Entry>, changed: &mut Vec<(String, Option<Entry>)>) {
         let prev = self.scan.get(&p).cloned();
-        if prev == now { return; }
+        if let Some(e) = prev.as_ref().filter(|e| e.kind == Kind::File) {
+            if let Some(names) = self.by_ino.get_mut(&e.ino) { names.remove(&p); if names.is_empty() { self.by_ino.remove(&e.ino); } }
+        }
+        if let Some(e) = now.as_ref().filter(|e| e.kind == Kind::File) { self.by_ino.entry(e.ino).or_default().insert(p.clone()); }
         let size = |e: &Option<Entry>| e.as_ref().filter(|e| e.kind == Kind::File).map(|e| e.size).unwrap_or(0);
         self.bytes = self.bytes + size(&now) - size(&prev);
+        // kept even when it shows the same (the inode may differ)
         match &now { Some(e) => { self.scan.insert(p.clone(), e.clone()); } None => { self.scan.remove(&p); } }
-        changed.push((p, prev));
+        if prev != now { changed.push((p, prev)); }
     }
 
     fn scan_upper(&self) -> Result<BTreeMap<String, Entry>> {

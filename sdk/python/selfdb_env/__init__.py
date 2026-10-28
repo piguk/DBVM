@@ -69,6 +69,10 @@ class Client:
     def task(self, task_id):
         return self._request("GET", "/v1/tasks/" + task_id)
 
+    def delete_task(self, task_id):
+        """Delete a task no running session and no checkpoint uses."""
+        self._request("DELETE", "/v1/tasks/" + task_id)
+
     # sessions
 
     def session(self, template_id=None, task_id=None, egress=None, label=None, seed=None):
@@ -89,6 +93,21 @@ class Client:
 
     def usage(self):
         return self._request("GET", "/v1/usage")
+
+    # checkpoints
+
+    def fork_checkpoint(self, checkpoint_id, variants):
+        """New sessions starting from a checkpoint (``Session.checkpoint``), one per variant; also after the
+        checkpointed session has ended. A variant without a seed keeps that session's."""
+        ids = self._request("POST", "/v1/checkpoints/%s/fork" % checkpoint_id, {"variants": variants})["session_ids"]
+        return [Session(self, i) for i in ids]
+
+    def checkpoints(self, session_id):
+        """A session's checkpoints, oldest first (``id``, ``step``, ``label``, ``seed``, ``bytes``)."""
+        return self._request("GET", "/v1/sessions/%s/checkpoints" % session_id)
+
+    def delete_checkpoint(self, checkpoint_id):
+        self._request("DELETE", "/v1/checkpoints/" + checkpoint_id)
 
 
 class Session:
@@ -130,6 +149,11 @@ class Session:
         """New sessions starting from this one's current state; this one keeps running."""
         ids = self.client._request("POST", "/v1/sessions/%s/fork" % self.id, {"variants": variants})["session_ids"]
         return [Session(self.client, i) for i in ids]
+
+    def checkpoint(self):
+        """Keep this session's files as of now, to start sessions from later (``Client.fork_checkpoint``).
+        Returns the checkpoint (``id``, ``step``, ...). It counts against storage until deleted."""
+        return self.client._request("POST", "/v1/sessions/%s/checkpoints" % self.id)
 
     def freeze(self, name):
         """Save the current state as a template; returns the template."""
@@ -199,6 +223,7 @@ class AsyncSession:
     edit_file = _wrap(Session.edit_file)
     list_dir = _wrap(Session.list_dir)
     freeze = _wrap(Session.freeze)
+    checkpoint = _wrap(Session.checkpoint)
     judge = _wrap(Session.judge)
     trajectory = _wrap(Session.trajectory)
     close = _wrap(Session.close)
@@ -221,11 +246,17 @@ class AsyncClient:
     delete_template = _wrap(Client.delete_template)
     create_task = _wrap(Client.create_task)
     task = _wrap(Client.task)
+    delete_task = _wrap(Client.delete_task)
     act_batch = _wrap(Client.act_batch)
     usage = _wrap(Client.usage)
+    checkpoints = _wrap(Client.checkpoints)
+    delete_checkpoint = _wrap(Client.delete_checkpoint)
 
     async def session(self, **kwargs):
         return AsyncSession(await asyncio.to_thread(self._sync.session, **kwargs))
 
     async def rollouts(self, task_id, variants):
         return [AsyncSession(s) for s in await asyncio.to_thread(self._sync.rollouts, task_id, variants)]
+
+    async def fork_checkpoint(self, checkpoint_id, variants):
+        return [AsyncSession(s) for s in await asyncio.to_thread(self._sync.fork_checkpoint, checkpoint_id, variants)]

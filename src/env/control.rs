@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS layers(
     tenant_id TEXT,
     path TEXT NOT NULL,
     bytes INTEGER NOT NULL,
+    -- the sha256 of the layer's stream (transfer.rs), taken the first time another node asks for it
+    digest TEXT,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE TABLE IF NOT EXISTS templates(
@@ -40,12 +42,15 @@ CREATE TABLE IF NOT EXISTS templates(
     bytes INTEGER NOT NULL,
     env TEXT NOT NULL DEFAULT '[]',
     workdir TEXT NOT NULL DEFAULT '/',
+    -- the sha256 of base.db, as for layers
+    db_digest TEXT,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE TABLE IF NOT EXISTS tasks(
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
     spec TEXT NOT NULL,
+    layers TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE TABLE IF NOT EXISTS sessions(
@@ -66,9 +71,60 @@ CREATE TABLE IF NOT EXISTS sessions(
     steps INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_tenant ON sessions(tenant_id);
+CREATE TABLE IF NOT EXISTS checkpoints(
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    task_id TEXT,
+    egress TEXT NOT NULL DEFAULT '[]',
+    layers TEXT NOT NULL,
+    step INTEGER NOT NULL,
+    label TEXT,
+    seed INTEGER,
+    bytes INTEGER NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id);
 ";
 
-#[derive(Debug, Clone)]
+/// A session's files at one step, kept as layers: new sessions start from it after the session has moved
+/// on or ended.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Checkpoint {
+    pub id: String,
+    #[serde(skip)]
+    pub tenant_id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub template_id: String,
+    pub task_id: Option<String>,
+    #[serde(skip)]
+    pub egress: Vec<String>,
+    /// Layers above the template's, bottom first.
+    #[serde(skip)]
+    pub layers: Vec<String>,
+    /// Actions the session had taken.
+    pub step: i64,
+    pub label: Option<String>,
+    pub seed: Option<u64>,
+    /// What the checkpoint's own layer stores.
+    pub bytes: i64,
+    pub created_at: i64,
+}
+
+fn checkpoint_row(r: &rusqlite::Row) -> rusqlite::Result<Checkpoint> {
+    Ok(Checkpoint {
+        id: r.get(0)?, tenant_id: r.get(1)?, session_id: r.get(2)?, kind: r.get(3)?, template_id: r.get(4)?, task_id: r.get(5)?,
+        egress: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+        layers: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
+        step: r.get(8)?, label: r.get(9)?, seed: r.get::<_, Option<i64>>(10)?.map(|s| s as u64), bytes: r.get(11)?, created_at: r.get(12)?,
+    })
+}
+const CHECKPOINT_COLS: &str = "id, tenant_id, session_id, kind, template_id, task_id, egress, layers, step, label, seed, bytes, created_at";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Tenant {
     pub id: String,
     pub name: String,
@@ -87,7 +143,7 @@ impl Default for Quotas {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Template {
     pub id: String,
     /// None: a system template every tenant can use.
@@ -169,6 +225,17 @@ impl ControlDb {
         self.tenant(id)?.ok_or_else(|| anyhow!("tenant {} vanished", id))
     }
 
+    /// A tenant as the coordinator of a cluster has it (its id, name and quotas), on a node.
+    pub fn put_tenant(&self, t: &Tenant) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT INTO tenants(id, name, max_sessions, max_storage_bytes, max_session_secs, max_session_disk_bytes) VALUES (?1,?2,?3,?4,?5,?6)
+                       ON CONFLICT(id) DO UPDATE SET name=excluded.name, max_sessions=excluded.max_sessions, max_storage_bytes=excluded.max_storage_bytes,
+                       max_session_secs=excluded.max_session_secs, max_session_disk_bytes=excluded.max_session_disk_bytes",
+                params![t.id, t.name, t.max_sessions, t.max_storage_bytes, t.max_session_secs, t.max_session_disk_bytes])?;
+            Ok(())
+        })
+    }
+
     pub fn tenant(&self, id: &str) -> Result<Option<Tenant>> {
         self.with(|c| Ok(c.query_row(&format!("SELECT {} FROM tenants WHERE id=?1", TENANT_COLS), params![id], tenant_row).optional()?))
     }
@@ -196,6 +263,22 @@ impl ControlDb {
             |r| Ok(Layer { id: r.get(0)?, tenant_id: r.get(1)?, path: PathBuf::from(r.get::<_, String>(2)?), bytes: r.get(3)? })).optional()?))
     }
 
+    pub fn layer_digest(&self, id: &str) -> Result<Option<String>> {
+        self.with(|c| Ok(c.query_row("SELECT digest FROM layers WHERE id=?1", params![id], |r| r.get(0)).optional()?.flatten()))
+    }
+
+    pub fn set_layer_digest(&self, id: &str, digest: &str) -> Result<()> {
+        self.with(|c| { c.execute("UPDATE layers SET digest=?2 WHERE id=?1", params![id, digest])?; Ok(()) })
+    }
+
+    pub fn template_db_digest(&self, id: &str) -> Result<Option<String>> {
+        self.with(|c| Ok(c.query_row("SELECT db_digest FROM templates WHERE id=?1", params![id], |r| r.get(0)).optional()?.flatten()))
+    }
+
+    pub fn set_template_db_digest(&self, id: &str, digest: &str) -> Result<()> {
+        self.with(|c| { c.execute("UPDATE templates SET db_digest=?2 WHERE id=?1", params![id, digest])?; Ok(()) })
+    }
+
     pub fn delete_layer(&self, id: &str) -> Result<()> {
         self.with(|c| { c.execute("DELETE FROM layers WHERE id=?1", params![id])?; Ok(()) })
     }
@@ -204,7 +287,8 @@ impl ControlDb {
     pub fn layers_in_use(&self) -> Result<std::collections::HashSet<String>> {
         self.with(|c| {
             let mut out = std::collections::HashSet::new();
-            let mut st = c.prepare("SELECT layers FROM templates UNION ALL SELECT extra_layers FROM sessions WHERE ended_at IS NULL")?;
+            let mut st = c.prepare("SELECT layers FROM templates UNION ALL SELECT extra_layers FROM sessions WHERE ended_at IS NULL
+                                    UNION ALL SELECT layers FROM checkpoints UNION ALL SELECT layers FROM tasks")?;
             for r in st.query_map([], |r| r.get::<_, String>(0))? {
                 for id in serde_json::from_str::<Vec<String>>(&r?).unwrap_or_default() { out.insert(id); }
             }
@@ -222,15 +306,31 @@ impl ControlDb {
 
     pub fn insert_template(&self, t: &Template) -> Result<()> {
         self.with(|c| {
-            c.execute("INSERT INTO templates(id, tenant_id, name, parent_id, layers, db_path, bytes, env, workdir) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            c.execute("INSERT INTO templates(id, tenant_id, name, parent_id, layers, db_path, bytes, env, workdir, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![t.id, t.tenant_id, t.name, t.parent_id, serde_json::to_string(&t.layers)?, t.db_path.to_string_lossy(), t.bytes,
-                        serde_json::to_string(&t.env)?, t.workdir])?;
+                        serde_json::to_string(&t.env)?, t.workdir, t.created_at])?;
             Ok(())
         })
     }
 
     pub fn template(&self, id: &str) -> Result<Option<Template>> {
         self.with(|c| Ok(c.query_row(&format!("SELECT {} FROM templates WHERE id=?1", TEMPLATE_COLS), params![id], template_row).optional()?))
+    }
+
+    pub fn all_templates(&self) -> Result<Vec<Template>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!("SELECT {} FROM templates ORDER BY created_at, id", TEMPLATE_COLS))?;
+            let rows = st.query_map([], template_row)?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    pub fn tenant_ids(&self) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id FROM tenants ORDER BY id")?;
+            let rows = st.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
     }
 
     /// The system templates and `tenant`'s own.
@@ -253,13 +353,33 @@ impl ControlDb {
             params![tenant], |r| r.get(0))?))
     }
 
-    pub fn insert_task(&self, id: &str, tenant: &str, spec: &str) -> Result<()> {
-        self.with(|c| { c.execute("INSERT INTO tasks(id, tenant_id, spec) VALUES (?1,?2,?3)", params![id, tenant, spec])?; Ok(()) })
+    /// A task: its spec (JSON) and the layers of its files, above its template's.
+    pub fn insert_task(&self, id: &str, tenant: &str, spec: &str, layers: &[String]) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT INTO tasks(id, tenant_id, spec, layers) VALUES (?1,?2,?3,?4)", params![id, tenant, spec, serde_json::to_string(layers)?])?;
+            Ok(())
+        })
     }
 
-    /// (tenant, spec JSON)
-    pub fn task(&self, id: &str) -> Result<Option<(String, String)>> {
-        self.with(|c| Ok(c.query_row("SELECT tenant_id, spec FROM tasks WHERE id=?1", params![id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?))
+    /// (tenant, spec JSON, layers)
+    pub fn task(&self, id: &str) -> Result<Option<(String, String, Vec<String>)>> {
+        self.with(|c| Ok(c.query_row("SELECT tenant_id, spec, layers FROM tasks WHERE id=?1", params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default()))).optional()?))
+    }
+
+    pub fn delete_task(&self, id: &str) -> Result<()> {
+        self.with(|c| { c.execute("DELETE FROM tasks WHERE id=?1", params![id])?; Ok(()) })
+    }
+
+    /// Whether a running session or a checkpoint uses `task`.
+    pub fn task_in_use(&self, task: &str) -> Result<bool> {
+        self.with(|c| Ok(c.query_row("SELECT 1 FROM sessions WHERE task_id=?1 AND ended_at IS NULL UNION ALL SELECT 1 FROM checkpoints WHERE task_id=?1 LIMIT 1",
+            params![task], |_| Ok(())).optional()?.is_some()))
+    }
+
+    /// Whether a task is built on `template`.
+    pub fn template_has_tasks(&self, template: &str) -> Result<bool> {
+        self.with(|c| Ok(c.query_row("SELECT 1 FROM tasks WHERE json_extract(spec, '$.template_id')=?1 LIMIT 1", params![template], |_| Ok(())).optional()?.is_some()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -277,6 +397,66 @@ impl ControlDb {
             c.execute("UPDATE sessions SET ended_at=strftime('%s','now'), end_reason=?2, wall_ms=?3, cpu_usec=?4, steps=?5 WHERE id=?1 AND ended_at IS NULL",
                 params![id, reason, wall_ms as i64, cpu_usec.map(|v| v as i64), steps as i64])?;
             Ok(())
+        })
+    }
+
+    pub fn insert_checkpoint(&self, k: &Checkpoint) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT INTO checkpoints(id, tenant_id, session_id, kind, template_id, task_id, egress, layers, step, label, seed, bytes)
+                       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![k.id, k.tenant_id, k.session_id, k.kind, k.template_id, k.task_id, serde_json::to_string(&k.egress)?,
+                        serde_json::to_string(&k.layers)?, k.step, k.label, k.seed.map(|s| s as i64), k.bytes])?;
+            Ok(())
+        })
+    }
+
+    pub fn checkpoint(&self, id: &str) -> Result<Option<Checkpoint>> {
+        self.with(|c| Ok(c.query_row(&format!("SELECT {} FROM checkpoints WHERE id=?1", CHECKPOINT_COLS), params![id], checkpoint_row).optional()?))
+    }
+
+    /// `tenant`'s checkpoints of `session`, oldest first.
+    pub fn checkpoints_of(&self, tenant: &str, session: &str) -> Result<Vec<Checkpoint>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!("SELECT {} FROM checkpoints WHERE tenant_id=?1 AND session_id=?2 ORDER BY step, created_at, id", CHECKPOINT_COLS))?;
+            let rows = st.query_map(params![tenant, session], checkpoint_row)?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    pub fn delete_checkpoint(&self, id: &str) -> Result<()> {
+        self.with(|c| { c.execute("DELETE FROM checkpoints WHERE id=?1", params![id])?; Ok(()) })
+    }
+
+    /// Whether a checkpoint starts from `template` (it needs the template's layers and database).
+    pub fn template_has_checkpoints(&self, template: &str) -> Result<bool> {
+        self.with(|c| Ok(c.query_row("SELECT 1 FROM checkpoints WHERE template_id=?1 LIMIT 1", params![template], |_| Ok(())).optional()?.is_some()))
+    }
+
+    /// For a support bundle: counts, and the recent sessions' ids, kinds, times, end reasons and steps. No
+    /// key digests, names, labels, task specs or file contents.
+    pub fn support_summary(&self) -> Result<serde_json::Value> {
+        self.with(|c| {
+            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [], |r| r.get(0)) };
+            let mut st = c.prepare("SELECT id, tenant_id, kind, started_at, ended_at, end_reason, steps, wall_ms FROM sessions ORDER BY started_at DESC LIMIT 500")?;
+            let sessions: Vec<serde_json::Value> = st.query_map([], |r| Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?, "tenant": r.get::<_, String>(1)?, "kind": r.get::<_, String>(2)?, "started_at": r.get::<_, i64>(3)?,
+                "ended_at": r.get::<_, Option<i64>>(4)?, "end_reason": r.get::<_, Option<String>>(5)?, "steps": r.get::<_, i64>(6)?, "wall_ms": r.get::<_, Option<i64>>(7)?,
+            })))?.collect::<rusqlite::Result<_>>()?;
+            let mut st = c.prepare("SELECT end_reason, count(*) FROM sessions WHERE ended_at IS NOT NULL GROUP BY end_reason")?;
+            let reasons: serde_json::Map<String, serde_json::Value> = st.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(|(k, v)| (k, v.into())).collect();
+            let mut st = c.prepare("SELECT id, tenant_id IS NULL, bytes, layers, created_at FROM templates ORDER BY created_at")?;
+            let templates: Vec<serde_json::Value> = st.query_map([], |r| Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?, "system": r.get::<_, bool>(1)?, "bytes": r.get::<_, i64>(2)?,
+                "layers": serde_json::from_str::<Vec<String>>(&r.get::<_, String>(3)?).map(|l| l.len()).unwrap_or(0), "created_at": r.get::<_, i64>(4)?,
+            })))?.collect::<rusqlite::Result<_>>()?;
+            Ok(serde_json::json!({
+                "tenants": count("SELECT count(*) FROM tenants")?, "api_keys": count("SELECT count(*) FROM api_keys WHERE revoked=0")?,
+                "tasks": count("SELECT count(*) FROM tasks")?, "checkpoints": count("SELECT count(*) FROM checkpoints")?,
+                "layers": count("SELECT count(*) FROM layers")?, "layer_bytes": count("SELECT COALESCE(sum(bytes),0) FROM layers")?,
+                "sessions_running": count("SELECT count(*) FROM sessions WHERE ended_at IS NULL")?, "end_reasons": reasons,
+                "templates": templates, "recent_sessions": sessions,
+            }))
         })
     }
 

@@ -14,7 +14,8 @@
  *   CTL/<id>/cwd      working directory
  *   CTL/<id>/timeout_ms
  * read:   CTL/<id>/path, CTL/<id>/offset, CTL/<id>/len   -> the bytes in out
- * write:  CTL/<id>/path, CTL/<id>/mode (octal), CTL/<id>/in -> the file, parent directories created
+ * write:  CTL/<id>/path, CTL/<id>/mode, CTL/<id>/in -> the file, parent directories created; mode is
+ *          octal, the mode of a new file, or "=" and octal, the mode of the file whether it existed or not
  * list:   CTL/<id>/path                                   -> "<kind>\t<size>\t<name>\n" per entry in out
  * and the supervisor writes
  *   CTL/<id>/out, CTL/<id>/err   output (exec: the command's stdout and stderr; file ops: result, error)
@@ -250,9 +251,13 @@ static void op_write(const char *id) {
     int in = open(pi, O_RDONLY | O_CLOEXEC);
     if (in < 0) { fail(id, "cannot read request data for", path); goto done; }
     make_parents(path);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, (mode_t)strtol(mode, NULL, 8));
+    /* "=MODE" sets the mode exactly, also of a file that exists; "MODE" is the mode of a new file only */
+    int exact = mode[0] == '=';
+    mode_t m = (mode_t)strtol(mode + exact, NULL, 8);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, m);
     if (fd < 0) { fail(id, "cannot open", path); close(in); goto done; }
     if (copy_fd(in, fd, -1) != 0) fail(id, "cannot write", path);
+    else if (exact && fchmod(fd, m) != 0) fail(id, "cannot set the mode of", path);
     else write_status(id, "exit 0");
     close(fd);
     close(in);

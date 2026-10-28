@@ -84,6 +84,8 @@ fn templates_tasks_rollouts_judge_fork_and_tenants() {
     // a template in use cannot be deleted; once its rollouts end it can
     assert_eq!(a.req("DELETE", &format!("/v1/templates/{}", tpl_id), None).0, 400);
     for id in ids.iter().chain(kids.iter()) { a.ok("DELETE", &format!("/v1/sessions/{}", id), None); }
+    assert_eq!(a.req("DELETE", &format!("/v1/templates/{}", tpl_id), None).0, 400, "a task still uses it");
+    a.ok("DELETE", &format!("/v1/tasks/{}", task), None);
     a.ok("DELETE", &format!("/v1/templates/{}", tpl_id), None);
     let usage = a.ok("GET", "/v1/usage", None);
     let fix_row = usage.as_array().unwrap().iter().find(|u| u["id"] == fix.as_str()).unwrap();
@@ -176,4 +178,147 @@ fn a_session_outlives_the_thread_that_started_it() {
     let sid = a.ok("POST", "/v1/sessions", Some(json!({"template_id": image.id})))["session_id"].as_str().unwrap().to_string();
     std::thread::sleep(std::time::Duration::from_secs(13));
     assert_eq!(a.bash(&sid, "echo alive")["output"], "alive\n");
+}
+
+#[test]
+fn checkpoints_keep_a_step_to_fork_from_later() {
+    if !bwrap_ok() { return; }
+    let s = start("ckpt");
+    let a = tenant(&s, "a", Quotas::default());
+    let b = tenant(&s, "b", Quotas::default());
+    let task = calc_task(&s, &a);
+    let sid = a.ok("POST", "/v1/rollouts", Some(json!({"task_id": task, "variants": [{"label": "main", "seed": 5}]})))["session_ids"][0].as_str().unwrap().to_string();
+    // step 1: a wrong edit, kept; step 2: the fix, kept
+    a.act(&sid, json!({"tool": "edit_file", "path": "/app/calc.sh", "old": "2 - 3", "new": "2 * 3"}));
+    let c1 = a.ok("POST", &format!("/v1/sessions/{}/checkpoints", sid), None);
+    assert_eq!(c1["step"], 1, "{}", c1);
+    a.act(&sid, json!({"tool": "edit_file", "path": "/app/calc.sh", "old": "2 * 3", "new": "2 + 3"}));
+    let c2 = a.ok("POST", &format!("/v1/sessions/{}/checkpoints", sid), None);
+    let (c1, c2) = (c1["id"].as_str().unwrap().to_string(), c2["id"].as_str().unwrap().to_string());
+    let listed: Vec<i64> = a.ok("GET", &format!("/v1/sessions/{}/checkpoints", sid), None).as_array().unwrap().iter().map(|k| k["step"].as_i64().unwrap()).collect();
+    assert_eq!(listed, vec![1, 2]);
+    let traj = String::from_utf8(s.svc.trajectory(&s.svc.authenticate(&a.key).unwrap(), &sid).unwrap()).unwrap();
+    assert!(traj.lines().any(|l| l.contains(&format!("\"checkpoint\":\"{}\"", c1))), "{}", traj);
+    // the session ends; its checkpoints stay
+    a.ok("DELETE", &format!("/v1/sessions/{}", sid), None);
+    let kids: Vec<String> = a.ok("POST", &format!("/v1/checkpoints/{}/fork", c1), Some(json!({"variants": [{"label": "retry"}, {"label": "retry2", "seed": 9}]})))
+        ["session_ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(a.bash(&kids[0], "cat /app/calc.sh; echo $SEED")["output"], "echo $((2 * 3))\n5\n", "step 1's files, the session's seed");
+    assert_eq!(a.bash(&kids[1], "echo $SEED")["output"], "9\n");
+    assert_eq!(a.ok("POST", &format!("/v1/sessions/{}/judge", kids[0]), None)["reward"], 0.0);
+    a.act(&kids[0], json!({"tool": "edit_file", "path": "/app/calc.sh", "old": "2 * 3", "new": "2 + 3"}));
+    assert_eq!(a.ok("POST", &format!("/v1/sessions/{}/judge", kids[0]), None)["reward"], 1.0);
+    let from2 = a.ok("POST", &format!("/v1/checkpoints/{}/fork", c2), Some(json!({"variants": [{}]})))["session_ids"][0].as_str().unwrap().to_string();
+    assert_eq!(a.ok("POST", &format!("/v1/sessions/{}/judge", from2), None)["reward"], 1.0, "step 2 had the fix");
+    // another tenant sees none of it
+    assert_eq!(b.req("POST", &format!("/v1/checkpoints/{}/fork", c1), Some(json!({"variants": [{}]}))).0, 404);
+    assert_eq!(b.req("DELETE", &format!("/v1/checkpoints/{}", c1), None).0, 404);
+    assert!(b.ok("GET", &format!("/v1/sessions/{}/checkpoints", sid), None).as_array().unwrap().is_empty());
+    // a template under checkpoints stays
+    let tpl = s.svc.control().checkpoint(&c1).unwrap().unwrap().template_id;
+    for k in kids.iter().chain(std::iter::once(&from2)) { a.ok("DELETE", &format!("/v1/sessions/{}", k), None); }
+    assert_eq!(a.req("DELETE", &format!("/v1/templates/{}", tpl), None).0, 400);
+    // deleted: no more forks from it; the other checkpoint still works
+    a.ok("DELETE", &format!("/v1/checkpoints/{}", c1), None);
+    assert_eq!(a.req("POST", &format!("/v1/checkpoints/{}/fork", c1), Some(json!({"variants": [{}]}))).0, 404);
+    let again = a.ok("POST", &format!("/v1/checkpoints/{}/fork", c2), Some(json!({"variants": [{}]})))["session_ids"][0].as_str().unwrap().to_string();
+    assert_eq!(a.bash(&again, "cat /app/calc.sh")["output"], "echo $((2 + 3))\n");
+    a.ok("DELETE", &format!("/v1/sessions/{}", again), None);
+    assert_eq!(a.req("DELETE", &format!("/v1/tasks/{}", task), None).0, 400, "a checkpoint still uses the task");
+    a.ok("DELETE", &format!("/v1/checkpoints/{}", c2), None);
+    a.ok("DELETE", &format!("/v1/tasks/{}", task), None);
+    a.ok("DELETE", &format!("/v1/templates/{}", tpl), None);
+}
+
+#[test]
+fn checkpoints_count_against_storage() {
+    if !bwrap_ok() { return; }
+    let s = start("ckpt-quota");
+    let image = s.svc.store().import_image(s.svc.control(), "mini", &rootfs(&s.dir)).unwrap();
+    let a = tenant(&s, "a", Quotas { max_storage_bytes: 1 << 20, ..Quotas::default() });
+    let sid = a.ok("POST", "/v1/sessions", Some(json!({"template_id": image.id})))["session_id"].as_str().unwrap().to_string();
+    a.bash(&sid, "head -c 600000 /dev/zero > /big");
+    a.ok("POST", &format!("/v1/sessions/{}/checkpoints", sid), None);
+    let (code, body) = a.req("POST", &format!("/v1/sessions/{}/checkpoints", sid), None);
+    assert_eq!(code, 429, "two copies exceed 1 MiB: {}", body);
+}
+
+#[test]
+fn file_tools_carry_any_bytes_and_modes() {
+    if !bwrap_ok() { return; }
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let s = start("bytes");
+    let image = s.svc.store().import_image(s.svc.control(), "mini", &rootfs(&s.dir)).unwrap();
+    let a = tenant(&s, "a", Quotas::default());
+    let sid = a.ok("POST", "/v1/sessions", Some(json!({"template_id": image.id})))["session_id"].as_str().unwrap().to_string();
+    let data: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
+    let w = a.act(&sid, json!({"tool": "write_file", "path": "/bin.dat", "content": b64.encode(&data), "encoding": "base64", "mode": 0o755}));
+    assert_eq!(w["exit_code"], 0, "{}", w);
+    let r = a.act(&sid, json!({"tool": "read_file", "path": "/bin.dat", "encoding": "base64"}));
+    assert_eq!(b64.decode(r["output"].as_str().unwrap()).unwrap(), data);
+    let r = a.act(&sid, json!({"tool": "read_file", "path": "/bin.dat", "offset": 4096, "limit": 100, "encoding": "base64"}));
+    assert_eq!(b64.decode(r["output"].as_str().unwrap()).unwrap(), data[4096..4196].to_vec(), "a range");
+    let mode = |a: &Client| a.bash(&sid, "ls -l /bin.dat")["output"].as_str().unwrap()[..10].to_string();
+    assert_eq!(mode(&a), "-rwxr-xr-x");
+    // an existing file: a given mode is applied, none keeps the file's
+    a.act(&sid, json!({"tool": "write_file", "path": "/bin.dat", "content": "x", "mode": 0o600}));
+    assert_eq!(mode(&a), "-rw-------");
+    a.act(&sid, json!({"tool": "write_file", "path": "/bin.dat", "content": "y"}));
+    assert_eq!(mode(&a), "-rw-------");
+    let bad = a.req("POST", &format!("/v1/sessions/{}/actions", sid), Some(json!({"tool": "write_file", "path": "/x", "content": "not base64!", "encoding": "base64"})));
+    assert_eq!(bad.0, 400);
+    // what the node reports to Prometheus
+    let m = s.svc.metrics_text();
+    for want in ["selfdb_actions_total{tool=\"write_file\",outcome=\"ok\"} 3", "selfdb_actions_total{tool=\"write_file\",outcome=\"error\"} 1",
+                 "selfdb_action_seconds_bucket{tool=\"read_file\",le=\"+Inf\"} 2", "selfdb_sessions_started_total{kind=\"build\"} 1",
+                 "# TYPE selfdb_sessions_running gauge"] {
+        assert!(m.contains(want), "{} in:\n{}", want, m);
+    }
+}
+
+#[test]
+fn task_files_are_where_every_rollout_starts() {
+    if !bwrap_ok() { return; }
+    use base64::Engine;
+    let s = start("taskfiles");
+    let image = s.svc.store().import_image(s.svc.control(), "mini", &rootfs(&s.dir)).unwrap();
+    let a = tenant(&s, "a", Quotas::default());
+    let judge = "#!/bin/sh\nif [ \"$(cat /work/answer)\" = 42 ]; then echo '{\"reward\": 1}'; else echo '{\"reward\": 0}'; fi\n";
+    let task = a.ok("POST", "/v1/tasks", Some(json!({
+        "template_id": image.id, "readonly": ["/tests"],
+        "judge": {"cmd": ["/tests/judge.sh"], "sees": ["/work"]},
+        "files": [
+            {"path": "/work/answer", "content": "41\n"},
+            {"path": "/work/data.bin", "content": base64::engine::general_purpose::STANDARD.encode([0u8, 255, 1]), "encoding": "base64"},
+            {"path": "/tests/judge.sh", "content": judge, "mode": 0o755},
+        ],
+    })))["task_id"].as_str().unwrap().to_string();
+    let ids: Vec<String> = a.ok("POST", "/v1/rollouts", Some(json!({"task_id": task, "variants": [{}, {}]})))["session_ids"]
+        .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    let r = a.bash(&ids[0], "cat /work/answer; ls -l /tests/judge.sh | cut -c1-10; od -An -tu1 /work/data.bin 2>/dev/null || true");
+    assert!(r["output"].as_str().unwrap().starts_with("41\n-rwxr-xr-x\n"), "{}", r);
+    assert_eq!(r["changes"], json!({"created": [], "modified": [], "deleted": []}), "the task's files are not the agent's changes");
+    assert_ne!(a.act(&ids[0], json!({"tool": "write_file", "path": "/tests/judge.sh", "content": "echo '{\"reward\": 1}'"}))["exit_code"], 0, "read-only");
+    assert_eq!(a.ok("POST", &format!("/v1/sessions/{}/judge", ids[0]), None)["reward"], 0.0);
+    a.act(&ids[1], json!({"tool": "write_file", "path": "/work/answer", "content": "42"}));
+    assert_eq!(a.ok("POST", &format!("/v1/sessions/{}/judge", ids[1]), None)["reward"], 1.0, "the judge has the task's tests");
+    // freezing a rollout keeps the task's files in the template
+    let tpl = a.ok("POST", &format!("/v1/sessions/{}/freeze", ids[1]), Some(json!({"name": "solved"})))["id"].as_str().unwrap().to_string();
+    let b = a.ok("POST", "/v1/sessions", Some(json!({"template_id": tpl})))["session_id"].as_str().unwrap().to_string();
+    assert_eq!(a.bash(&b, "cat /work/answer; test -x /tests/judge.sh && echo X")["output"], "42X\n");
+    // a task in use stays; then it goes, and its layer with it
+    assert_eq!(a.req("DELETE", &format!("/v1/tasks/{}", task), None).0, 400);
+    for id in ids.iter().chain(std::iter::once(&b)) { a.ok("DELETE", &format!("/v1/sessions/{}", id), None); }
+    // the frozen template lists the task's layer too: the layer stays until neither uses it
+    a.ok("DELETE", &format!("/v1/templates/{}", tpl), None);
+    let layers_before = s.svc.control().all_layers().unwrap().len();
+    a.ok("DELETE", &format!("/v1/tasks/{}", task), None);
+    assert_eq!(s.svc.control().all_layers().unwrap().len(), layers_before - 1, "the task's layer is collected");
+    assert_eq!(a.req("GET", &format!("/v1/tasks/{}", task), None).0, 404);
+    // bad files are refused
+    for bad in [json!([{"path": "rel", "content": ""}]), json!([{"path": "/a", "content": ""}, {"path": "/a/b", "content": ""}]),
+                json!([{"path": "/x", "content": "!!", "encoding": "base64"}])] {
+        assert_eq!(a.req("POST", "/v1/tasks", Some(json!({"template_id": image.id, "files": bad}))).0, 400, "{}", bad);
+    }
 }

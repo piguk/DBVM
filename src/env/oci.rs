@@ -264,9 +264,7 @@ fn apply_layer(conn: &Connection, layer: &LayerBlob, diff_id: &str) -> Result<()
             } else if kind.is_hard_link() {
                 // the target is named by its archive path, and is in this layer or one below
                 let Some(t) = e.link_name()? else { continue };
-                let target = vm::normalize_vm_path(&t.to_string_lossy());
-                let data = vm::vm_cat(conn, &target).map_err(|err| anyhow!("hard link {} -> {}: {}", p, target, err))?;
-                vm::vm_add_bytes(conn, &p, &data, mode, mtime)?;
+                vm::hard_link(conn, &p, &vm::normalize_vm_path(&t.to_string_lossy()), mode, mtime)?;
             } else if kind.is_file() {
                 vm::ensure_parent_dirs(conn, &p)?;
                 vm::fs_put_file_stream(conn, &p, mode, mtime, &mut e)?;

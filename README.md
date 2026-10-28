@@ -61,7 +61,7 @@ target/release/self vm-exec /tmp/alpine.vm.db /bin/busybox -- --help
 
 ## RL 环境服务
 
-以 HTTP 接口提供 RL 训练用的环境：模板、任务、批量 rollout、fork、判分、轨迹，多租户与配额。见 **[docs/env.md](docs/env.md)**。
+以 HTTP 接口提供 RL 训练用的环境：模板、任务、批量 rollout、fork、checkpoint、判分、轨迹，多租户与配额，可多节点部署。见 **[docs/env.md](docs/env.md)**；部署见 [packaging/README.md](packaging/README.md)；EDA 任务包见 [packs/eda/README.md](packs/eda/README.md)。
 
 ```sh
 self env-admin --data /srv/env image import base rootfs.tar

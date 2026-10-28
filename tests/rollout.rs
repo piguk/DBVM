@@ -89,7 +89,7 @@ fn a_read_only_path_refuses_changes_and_creation() {
     assert_eq!(String::from_utf8_lossy(&b.outcome.stdout), "exit 0\n", "the file is untouched");
     let c = sh(&mut r, "mkdir -p /absent/x");
     assert_ne!(c.outcome.exit_code, 0, "a read-only path absent from the template cannot be created");
-    let w = r.write_file("/tests/new.sh", b"x", 0o644).unwrap();
+    let w = r.write_file("/tests/new.sh", b"x", Some(0o644)).unwrap();
     assert_ne!(w.outcome.exit_code, 0, "the file tool honours the read-only mount too");
     assert!(a.changes.modified.is_empty() && b.changes.deleted.is_empty() && w.changes.created.is_empty());
 }
@@ -99,7 +99,7 @@ fn file_tools_read_write_and_list_inside_the_rollout() {
     if !bwrap_ok() { return; }
     let t = template("files");
     let mut r = Rollout::start(std::slice::from_ref(&t.layer), &RolloutOptions::default()).unwrap();
-    let w = r.write_file("/work/deep/dir/f.txt", b"hello", 0o600).unwrap();
+    let w = r.write_file("/work/deep/dir/f.txt", b"hello", Some(0o600)).unwrap();
     assert_eq!(w.outcome.exit_code, 0, "{}", String::from_utf8_lossy(&w.outcome.stderr));
     assert_eq!(sorted(&w.changes.created), vec!["/work/deep", "/work/deep/dir", "/work/deep/dir/f.txt"]);
     assert_eq!(r.read_file("/work/deep/dir/f.txt", 1, 3).unwrap().unwrap(), b"ell");
@@ -264,7 +264,10 @@ fn watched_change_lists_match_full_walks() {
         "rm /etc/conf && mkdir /etc/conf && echo c > /etc/conf/c",
         "rm -rf /etc/conf && echo back > /etc/conf",
         "i=0; while [ $i -lt 300 ]; do rm /work/n$i; i=$((i+2)); done",
-        "rm /work/hard /work/l",
+        // hard links: a change through one name is a change of the others
+        "echo more >> /work/renamed",
+        "ln /work/renamed /work/h2 && chmod 640 /work/h2",
+        "rm /work/hard /work/l /work/h2",
     ];
     for (i, cmd) in steps.iter().enumerate() {
         let (ra, rb) = (sh(&mut a, cmd), sh(&mut b, cmd));

@@ -10,6 +10,9 @@ use crate::sandbox::Limits;
 #[serde(deny_unknown_fields)]
 pub struct TaskSpec {
     pub template_id: String,
+    /// What the agent is asked to do (the prompt), handed to the agent by adapters (OpenEnv's reset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
     /// Directories or files the agent cannot change or create (mounted read-only from the template).
     #[serde(default)]
     pub readonly: Vec<String>,
@@ -26,6 +29,22 @@ pub struct TaskSpec {
     /// The environment variable that carries a rollout's seed (PYTHONHASHSEED gets it too).
     #[serde(default = "default_seed_env")]
     pub seed_env: String,
+    /// Files every rollout of the task starts with, over its template (the task's code, data, tests). They
+    /// become one read-only layer the rollouts share; they are not the agent's changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<TaskFile>,
+}
+
+/// A file of a task: its content as text or (`encoding: base64`) base64, its mode (default 0644).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskFile {
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub encoding: Encoding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 fn default_step_timeout() -> u64 { 120 }
@@ -84,11 +103,28 @@ impl LimitsSpec {
 pub enum Action {
     /// A shell command line, run with /bin/sh -c.
     Bash { command: String, #[serde(default)] timeout_secs: Option<u64>, #[serde(default)] cwd: Option<String> },
-    ReadFile { path: String, #[serde(default)] offset: u64, #[serde(default)] limit: Option<u64> },
-    WriteFile { path: String, content: String, #[serde(default)] mode: Option<u32> },
+    /// `output` is the content, as text or (`encoding: base64`) base64.
+    ReadFile { path: String, #[serde(default)] offset: u64, #[serde(default)] limit: Option<u64>, #[serde(default)] encoding: Encoding },
+    /// With `mode` the file gets exactly that mode; without, a new file is 0644 and an existing one keeps
+    /// its mode. `content` is text or (`encoding: base64`) base64.
+    WriteFile { path: String, content: String, #[serde(default)] mode: Option<u32>, #[serde(default)] encoding: Encoding },
     /// Replace exactly one occurrence of `old` with `new`.
     EditFile { path: String, old: String, new: String },
     ListDir { path: String },
+}
+
+/// How file contents travel in JSON: text, or base64 for any bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Encoding { #[default] Utf8, Base64 }
+
+impl Action {
+    pub fn tool_name(&self) -> &'static str {
+        match self {
+            Action::Bash { .. } => "bash", Action::ReadFile { .. } => "read_file", Action::WriteFile { .. } => "write_file",
+            Action::EditFile { .. } => "edit_file", Action::ListDir { .. } => "list_dir",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

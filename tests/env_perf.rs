@@ -35,12 +35,15 @@ fn service_timings() {
     if !bwrap_ok() { return; }
     if std::env::var("SELF_SANDBOX_CGROUP").is_err() {
         let exe = std::env::current_exe().unwrap();
-        let script = format!("export SELF_SANDBOX_CGROUP=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); exec {} --exact service_timings --ignored --nocapture", exe.display());
+        // `auto`: the scope this runs in, as for a service with Delegate=yes
+        let script = format!("export SELF_SANDBOX_CGROUP=auto; exec {} --exact service_timings --ignored --nocapture", exe.display());
         let st = std::process::Command::new("systemd-run")
             .args(["--user", "--scope", "--quiet", "--collect", "-p", "Delegate=yes", "--", "sh", "-c", &script]).status().unwrap();
         assert!(st.success());
         return;
     }
+    // the delegated cgroup, before the first sandbox moves this process into its `supervisor` child
+    let root = std::path::PathBuf::from(format!("/sys/fs/cgroup{}", std::fs::read_to_string("/proc/self/cgroup").unwrap().trim().strip_prefix("0::").unwrap()));
     let s = start("perf");
     let c = tenant(&s, "perf", Quotas { max_sessions: 2000, ..Quotas::default() });
     let task = calc_task(&s, &c);
@@ -81,7 +84,6 @@ fn service_timings() {
 
     // the same rollouts per their cgroups: memory.current is what the kernel charges each sandbox (its
     // processes' memory, the kernel memory and page cache it caused)
-    let root = std::path::PathBuf::from(std::env::var("SELF_SANDBOX_CGROUP").unwrap());
     let stat_of = |dir: &std::path::Path, key: &str| -> u64 {
         std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default().lines()
             .find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix(' ')).and_then(|v| v.trim().parse().ok())).unwrap_or(0)

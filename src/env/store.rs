@@ -6,7 +6,6 @@
 //! <data>/tenants/<tenant>/{layers,templates}/<id>
 //! <data>/tenants/<tenant>/trajectories/<session>.jsonl
 //! <data>/run/                                 rollouts' upper directories (removed with each rollout)
-//! <data>/cache/                               the materialize content cache
 //! ```
 //! A template is immutable once created: a database (`base.db`) and an ordered list of layers. A layer is
 //! a read-only directory, shared by every rollout and template that lists it.
@@ -16,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use super::control::{random_hex, ControlDb, Layer, Template};
 use super::oci::{self, ImageConfig};
+use super::transfer;
 use crate::vm;
 
 /// Past this many layers a freeze squashes them into one materialized tree: every layer is an overlay lower
@@ -23,6 +23,17 @@ use crate::vm;
 pub const MAX_LAYERS: usize = 16;
 
 pub struct Store { pub root: PathBuf, pub node: String }
+
+/// A layer as another node fetches it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LayerMeta { pub id: String, pub tenant_id: Option<String>, pub bytes: i64, pub digest: String }
+
+/// A template downloaded from another node, not recorded yet (`Store::register`).
+pub struct Downloaded { template: Template, db_digest: String, layers: Vec<(Layer, String)> }
+
+/// A template as another node fetches it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TemplateMeta { pub template: Template, pub db_digest: String, pub layers: Vec<LayerMeta> }
 
 /// Total size of the regular files below `path` (a layer: nothing changes it).
 pub fn dir_bytes(path: &Path) -> Result<i64> {
@@ -37,7 +48,7 @@ pub fn dir_bytes(path: &Path) -> Result<i64> {
 impl Store {
     pub fn open(root: &Path, node: &str) -> Result<Store> {
         if node.is_empty() || !node.chars().all(|c| c.is_ascii_alphanumeric()) { return Err(anyhow!("node id must be alphanumeric")); }
-        for d in ["system/layers", "system/templates", "tenants", "run", "cache"] { std::fs::create_dir_all(root.join(d))?; }
+        for d in ["system/layers", "system/templates", "tenants", "run"] { std::fs::create_dir_all(root.join(d))?; }
         std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
         Ok(Store { root: root.to_path_buf(), node: node.to_string() })
     }
@@ -78,7 +89,7 @@ impl Store {
     fn materialized_layer(&self, control: &ControlDb, tenant: Option<&str>, db: &rusqlite::Connection) -> Result<Layer> {
         let id = self.new_id("lyr")?;
         let path = self.owner_dir(tenant).join("layers").join(&id);
-        vm::vm_materialize_tree_with_cache(db, &path, &self.root.join("cache"))?;
+        vm::vm_materialize_tree_uncached(db, &path)?;
         let layer = Layer { id, tenant_id: tenant.map(String::from), bytes: dir_bytes(&path)?, path };
         control.insert_layer(&layer)?;
         Ok(layer)
@@ -163,6 +174,89 @@ impl Store {
             for lid in created_layers { if let Ok(Some(l)) = control.layer(&lid) { let _ = crate::vm::remove_tree(&l.path); let _ = control.delete_layer(&lid); } }
         }
         r
+    }
+
+    /// What another node needs to fetch template `t`: the template, its database's digest, and its layers
+    /// with their digests (each taken now if it never was; layers do not change, so it stays right).
+    pub fn template_meta(&self, control: &ControlDb, t: &Template) -> Result<TemplateMeta> {
+        let db_digest = match control.template_db_digest(&t.id)? {
+            Some(d) => d,
+            None => { let d = transfer::file_digest(&t.db_path)?; control.set_template_db_digest(&t.id, &d)?; d }
+        };
+        let mut layers = Vec::new();
+        for id in &t.layers {
+            let l = control.layer(id)?.ok_or_else(|| anyhow!("missing layer {}", id))?;
+            let digest = match control.layer_digest(id)? {
+                Some(d) => d,
+                None => { let d = transfer::layer_digest(&l.path)?; control.set_layer_digest(id, &d)?; d }
+            };
+            layers.push(LayerMeta { id: l.id, tenant_id: l.tenant_id, bytes: l.bytes, digest });
+        }
+        Ok(TemplateMeta { template: t.clone(), db_digest, layers })
+    }
+
+    /// Download another node's template here (same ids): its database and the layers this node lacks, each
+    /// checked against its digest. `db` and `layer` open the streams. Nothing is recorded yet (`register`):
+    /// the download takes long, and needs no lock; unrecorded directories are swept at the next start.
+    pub fn download_template(&self, control: &ControlDb, meta: &TemplateMeta, db: &dyn Fn() -> Result<Box<dyn std::io::Read>>,
+                             layer: &dyn Fn(&str) -> Result<Box<dyn std::io::Read>>) -> Result<Downloaded> {
+        let mut layers = Vec::new();
+        let mut made: Vec<PathBuf> = Vec::new();
+        let r = (|| -> Result<Template> {
+            for l in &meta.layers {
+                if control.layer(&l.id)?.is_some() { continue; }
+                let dir = self.owner_dir(l.tenant_id.as_deref()).join("layers");
+                std::fs::create_dir_all(&dir)?;
+                let path = dir.join(&l.id);
+                transfer::read_layer(layer(&l.id)?, &path, &l.digest)?;
+                made.push(path.clone());
+                layers.push((Layer { id: l.id.clone(), tenant_id: l.tenant_id.clone(), path, bytes: l.bytes }, l.digest.clone()));
+            }
+            let t = &meta.template;
+            let dir = self.owner_dir(t.tenant_id.as_deref()).join("templates").join(&t.id);
+            std::fs::create_dir_all(&dir)?;
+            made.push(dir.clone());
+            let db_path = dir.join("base.db");
+            transfer::read_file(db()?, &db_path, &meta.db_digest)?;
+            Ok(Template { db_path, ..t.clone() })
+        })();
+        match r {
+            Ok(template) => Ok(Downloaded { template, db_digest: meta.db_digest.clone(), layers }),
+            Err(e) => { for p in made { let _ = crate::vm::remove_tree(&p); } Err(e) }
+        }
+    }
+
+    /// Record a downloaded template (with the layers lock held: its layers must not be collected before the
+    /// template lists them).
+    pub fn register(&self, control: &ControlDb, d: Downloaded) -> Result<Template> {
+        for (l, digest) in &d.layers {
+            if control.layer(&l.id)?.is_some() { let _ = crate::vm::remove_tree(&l.path); continue; }
+            control.insert_layer(l)?;
+            control.set_layer_digest(&l.id, digest)?;
+        }
+        if let Some(t) = control.template(&d.template.id)? { return Ok(t); }
+        control.insert_template(&d.template)?;
+        control.set_template_db_digest(&d.template.id, &d.db_digest)?;
+        Ok(d.template)
+    }
+
+    /// Remove layer and template directories the control database does not list: what an interrupted
+    /// download or import left behind.
+    pub fn sweep_unrecorded(&self, control: &ControlDb) -> Result<()> {
+        let layers: std::collections::HashSet<PathBuf> = control.all_layers()?.into_iter().map(|l| l.path).collect();
+        let templates: std::collections::HashSet<PathBuf> = control.all_templates()?.into_iter()
+            .filter_map(|t| t.db_path.parent().map(Path::to_path_buf)).collect();
+        let mut owners = vec![self.root.join("system")];
+        if let Ok(rd) = std::fs::read_dir(self.root.join("tenants")) { owners.extend(rd.flatten().map(|e| e.path())); }
+        for o in owners {
+            for (sub, known) in [("layers", &layers), ("templates", &templates)] {
+                let Ok(rd) = std::fs::read_dir(o.join(sub)) else { continue };
+                for e in rd.flatten() {
+                    if !known.contains(&e.path()) { crate::vm::remove_tree(&e.path())?; }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Remove a template's database; its layers go when nothing uses them (`gc_layers`).

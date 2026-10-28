@@ -58,6 +58,9 @@ enum EnvAdmin {
     /// Import a system template every tenant can use; prints its id. PATH is a root filesystem tarball
     /// (`docker export`), or with --oci an OCI image layout or `docker save` archive (directory or tar).
     Image { name: String, path: String, #[arg(long)] oci: bool },
+    /// Write a support bundle (.tar.gz): host checks, versions, sizes and a summary of the control database,
+    /// without keys, tokens, names, labels or task contents.
+    SupportBundle { out: String },
 }
 
 #[derive(Subcommand)]
@@ -159,10 +162,38 @@ enum Cmd {
     VmDiskExport{ db: String, raw: String },
     VmDiskInfo{ db: String },
     /// The RL environment service (see docs/env.md).
-    EnvServe{ #[arg(long)] data: String, #[arg(long, default_value="127.0.0.1:8650")] listen: String, #[arg(long, default_value="n1")] node: String },
+    EnvServe{ #[arg(long)] data: String, #[arg(long, default_value="127.0.0.1:8650")] listen: String, #[arg(long, default_value="n1")] node: String,
+              /// At most this many sessions on this node.
+              #[arg(long)] max_sessions: Option<i64>,
+              /// As a node of a cluster: the coordinator's URL (needs --advertise and --token-file).
+              #[arg(long)] coordinator: Option<String>,
+              /// The URL the coordinator and the other nodes reach this node at.
+              #[arg(long)] advertise: Option<String>,
+              /// A file holding the cluster token (readable by its owner only).
+              #[arg(long)] token_file: Option<String>,
+              /// Serve Prometheus metrics at http://ADDR/metrics (no authentication: an internal address).
+              #[arg(long)] metrics_listen: Option<String> },
+    /// Check whether this host can run the environment service (exits 1 if a check fails).
+    EnvDoctor{ #[arg(long)] data: Option<String> },
+    /// The coordinator of a cluster of environment nodes (see docs/env.md).
+    EnvCoordinator{ #[arg(long)] data: String, #[arg(long, default_value="127.0.0.1:8650")] listen: String,
+                    #[arg(long, default_value="c1")] id: String, #[arg(long)] token_file: String,
+                    /// Serve Prometheus metrics at http://ADDR/metrics (no authentication: an internal address).
+                    #[arg(long)] metrics_listen: Option<String> },
     /// Operator commands for the environment service's data directory.
     EnvAdmin{ #[arg(long)] data: String, #[arg(long, default_value="n1")] node: String, #[command(subcommand)] action: EnvAdmin },
     VmRun{ db: String, #[arg(long, default_value="512M")] mem: String, #[arg(long, default_value="")] raw: String, #[arg(long)] kvm: bool, #[arg(long, default_value="")] kernel: String, #[arg(long, default_value="")] initrd: String, #[arg(long, default_value="")] append: String },
+}
+
+/// The cluster token from `path`: a file only its owner may read (a token in a world-readable file, or on a
+/// command line, is anyone's).
+fn read_token(path: &str) -> anyhow::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path).map_err(|e| anyhow::anyhow!("token file {}: {}", path, e))?;
+    if md.mode() & 0o077 != 0 { anyhow::bail!("token file {} is readable by others (mode {:o}); chmod 600 it", path, md.mode() & 0o777); }
+    let t = std::fs::read_to_string(path)?.trim().to_string();
+    if t.len() < 32 { anyhow::bail!("token file {}: the token must have at least 32 characters", path); }
+    Ok(t)
 }
 
 fn open_db(path: &str) -> Connection {
@@ -351,13 +382,44 @@ fn main() -> anyhow::Result<()> {
             }
             std::process::exit(code?);
         },
-        Cmd::EnvServe{data, listen, node} => {
+        Cmd::EnvServe{data, listen, node, max_sessions, coordinator, advertise, token_file, metrics_listen} => {
             // before any thread starts: access to everything the sandboxes write, whatever its modes
             selfdb::access::enter_owner_namespace()?;
-            let svc = selfdb::env::service::Service::open(Path::new(&data), &node)?;
+            let cluster_token = token_file.as_deref().map(read_token).transpose()?;
+            if coordinator.is_some() && (advertise.is_none() || cluster_token.is_none()) {
+                anyhow::bail!("--coordinator needs --advertise and --token-file");
+            }
+            let cfg = selfdb::env::service::NodeConfig { max_sessions, cluster_token: cluster_token.clone() };
+            let svc = selfdb::env::service::Service::open_node(Path::new(&data), &node, cfg)?;
             eprintln!("environment service on {} (data {}, node {})", listen, data, node);
+            if let (Some(c), Some(url), Some(token)) = (coordinator, advertise, cluster_token) {
+                selfdb::env::cluster::register_forever(c, token, node.clone(), url, max_sessions);
+            }
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-            rt.block_on(selfdb::env::api::serve(svc, &listen))?;
+            rt.block_on(async move {
+                if let Some(m) = metrics_listen {
+                    let s = svc.clone();
+                    tokio::spawn(async move { if let Err(e) = selfdb::env::metrics::serve(m, std::sync::Arc::new(move || s.metrics_text())).await { eprintln!("metrics: {:#}", e); } });
+                }
+                selfdb::env::api::serve(svc, &listen).await
+            })?;
+        },
+        Cmd::EnvCoordinator{data, listen, id, token_file, metrics_listen} => {
+            let c = selfdb::env::cluster::Coordinator::open(Path::new(&data), &id, read_token(&token_file)?)?;
+            eprintln!("environment coordinator on {} (data {}, id {})", listen, data, id);
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(async move {
+                if let Some(m) = metrics_listen {
+                    let cc = c.clone();
+                    tokio::spawn(async move { if let Err(e) = selfdb::env::metrics::serve(m, std::sync::Arc::new(move || cc.metrics_text())).await { eprintln!("metrics: {:#}", e); } });
+                }
+                selfdb::env::cluster::serve(c, &listen).await
+            })?;
+        },
+        Cmd::EnvDoctor{data} => {
+            let (text, ok) = selfdb::env::doctor::report(&selfdb::env::doctor::checks(data.as_deref().map(Path::new)));
+            print!("{}", text);
+            if !ok { std::process::exit(1); }
         },
         Cmd::EnvAdmin{data, node, action} => {
             // the control database and the store only: opening the service would end the running service's
@@ -373,6 +435,10 @@ fn main() -> anyhow::Result<()> {
                 EnvAdmin::Image{name, path, oci} => {
                     let t = if oci { store.import_oci(&control, &name, Path::new(&path))? } else { store.import_image(&control, &name, Path::new(&path))? };
                     println!("{}", t.id);
+                },
+                EnvAdmin::SupportBundle{out} => {
+                    selfdb::env::doctor::support_bundle(Path::new(&data), Path::new(&out))?;
+                    eprintln!("wrote {}", out);
                 },
             }
         },
