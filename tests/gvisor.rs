@@ -201,3 +201,60 @@ fn workload_timings_bwrap_vs_gvisor() {
         eprintln!("{:24} {:>8}ms {:>8}ms {:>6.1}x", name, tb.as_millis(), tg.as_millis(), tg.as_secs_f64() / tb.as_secs_f64().max(1e-6));
     }
 }
+
+/// The four combinations a session can use: bwrap or gVisor, over a materialized tree or the FUSE mount.
+/// A long-lived session needs the mount (no per-step materialize), so its cost under gVisor decides the
+/// session design.
+#[cfg(feature = "fuse")]
+#[test]
+#[ignore]
+fn workload_timings_mount_vs_materialized() {
+    if !runsc_ok() || !bwrap_ok() { return; }
+    let (Some(node), Some(pi)) = (node_binary(), pi_dir()) else { eprintln!("skip: node or pi missing"); return; };
+    let dir = std::env::temp_dir().join(format!("gv-mnt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    let _cleanup = Cleanup(dir.clone());
+    let db = dir.join("v.db");
+    drop(vm::init_vm_db_with_opts(db.to_str().unwrap(), true, true).unwrap());
+    agent::provision_agent_with(&db, &node, &pi, agent::ToolSet::Dev).unwrap();
+    {
+        let c = vm::vm_open(db.to_str().unwrap()).unwrap();
+        for d in ["/tmp", "/dev", "/proc", "/sys"] { let _ = vm::vm_add_dir(&c, d, 0o1777, 1); }
+        vm::vm_materialize_tree(&c, &dir.join("tree")).unwrap();
+    }
+    let mnt = dir.join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let session = selfdb::fuse::fuse_impl::mount_vm_background(db.to_str().unwrap(), mnt.to_str().unwrap()).unwrap();
+    for _ in 0..50 { if mnt.join("usr").exists() { break; } std::thread::sleep(Duration::from_millis(100)); }
+
+    const PREP: &str = "rm -rf /tmp/w /tmp/x /tmp/t.tar; cp -r /usr/include/linux /tmp/w";
+    let loop20 = |cmd: &str| format!("i=0; while [ $i -lt 20 ]; do {}; i=$((i+1)); done", cmd);
+    let workloads: Vec<(&str, String)> = vec![
+        ("sandbox start + true", "true".into()),
+        ("python3 startup x20", loop20("python3 -c pass")),
+        ("gcc compile x20", format!("cd /tmp && printf 'int main(){{return 0;}}' > m.c && {}", loop20("gcc -O2 m.c -o m"))),
+        ("copy 2k-file tree", format!("{}; find /tmp/w -type f | wc -l", PREP)),
+        ("git add+commit tree", format!("{}; cd /tmp/w && git init -q . && git -c user.email=a@b -c user.name=t add -A && git -c user.email=a@b -c user.name=t commit -qm m", PREP)),
+        ("tar create+extract", format!("{}; cd /tmp && tar -cf t.tar w && mkdir x && tar -xf t.tar -C x", PREP)),
+        ("stat 2k files x20", format!("{}; {}", PREP, loop20("find /tmp/w -type f > /dev/null"))),
+    ];
+    let combos = [("bwrap/tree", Isolation::Bwrap, dir.join("tree")), ("gvisor/tree", Isolation::Gvisor, dir.join("tree")),
+                  ("bwrap/mount", Isolation::Bwrap, mnt.clone()), ("gvisor/mount", Isolation::Gvisor, mnt.clone())];
+    eprintln!("{:22} {:>11} {:>11} {:>11} {:>11}", "workload", combos[0].0, combos[1].0, combos[2].0, combos[3].0);
+    for (name, script) in &workloads {
+        let mut row = Vec::new();
+        for (label, iso, root) in &combos {
+            let took = (0..3).map(|_| {
+                let (o, took) = in_vm(root, *iso, script);
+                assert_eq!(o.exit_code, 0, "{} {}: {}", label, name, text(&o));
+                took
+            }).min().unwrap();
+            row.push(format!("{:>9}ms", took.as_millis()));
+        }
+        eprintln!("{:22} {}", name, row.join("  "));
+    }
+    drop(session);
+}

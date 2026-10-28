@@ -276,7 +276,19 @@ gVisor 后端：
   | tar 打包并解包 | 88 ms | 319 ms | 3.6 |
   | 遍历 2k 文件 ×20 | 88 ms | 310 ms | 3.5 |
 
-  计算密集负载约慢 1.6–1.9 倍，文件密集负载约慢 3–4 倍。以 FUSE 挂载为根时的 gVisor 性能未测。
+  计算密集负载约慢 1.6–1.9 倍，文件密集负载约慢 3–4 倍。
+
+- 以 FUSE 挂载为根（`tests/gvisor.rs` 的 `workload_timings_mount_vs_materialized`）：文件密集负载比物化树慢 5–12 倍，gVisor 在挂载上又比 bwrap 慢 1.5–2 倍；git add+commit 2k 文件：bwrap/物化树 189 ms，gVisor/挂载 1828 ms。因此长期 session 应以物化树为根，每步回写变更，而不是以挂载为根。
+- 端到端 agent 任务（`tests/e2e_isolation.rs`，每项 2 次，均由外部重跑测试确认完成）：
+
+  | 任务 | 隔离 | 总耗时 | 等待模型 | 其余（sandbox、工具、物化与回写、agent） |
+  |---|---|---|---|---|
+  | node 修 bug | bwrap | 24.0–24.9 s | 20.2–21.3 s | 3.7–3.8 s |
+  | node 修 bug | gVisor | 25.7–27.4 s | 21.6–23.4 s | 4.0–4.1 s |
+  | C 项目修编译错误 | bwrap | 20.6–25.3 s | 16.9–21.6 s | 3.7 s |
+  | C 项目修编译错误 | gVisor | 19.8–21.5 s | 15.1–17.0 s | 4.5–4.7 s |
+
+  gVisor 比 bwrap 每个任务多 0.3–1.0 s，约占总耗时的 1–4%；同一配置两次运行之间，模型等待时间的差异（最大 4.7 s）大于隔离方式带来的差异。
 - 文件系统层面的 uid 隔离：sandbox 内仍以调用者身份访问其根目录。
 
 ### 2. 挂载（FUSE，`vm-mount`、`vm-chroot` 的 FUSE 路径）

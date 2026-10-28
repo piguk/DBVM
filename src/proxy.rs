@@ -77,11 +77,28 @@ impl AllowList {
 /// host is allowed; anything else is refused with 403 and a message the guest can read.
 pub const PACKAGE_PREFIX: &str = "/pkg";
 
+/// Time spent waiting for the model: the sum over model requests of the time from sending the request
+/// upstream to having the whole response. Package downloads are not counted.
+#[derive(Default)]
+pub struct ModelStats { nanos: std::sync::atomic::AtomicU64, requests: std::sync::atomic::AtomicU64 }
+
+impl ModelStats {
+    fn record(&self, took: std::time::Duration) {
+        self.nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+    /// (summed wait, number of requests)
+    pub fn total(&self) -> (std::time::Duration, u64) {
+        (std::time::Duration::from_nanos(self.nanos.load(Ordering::Relaxed)), self.requests.load(Ordering::Relaxed))
+    }
+}
+
 /// A running proxy bound to a socket path; dropping it stops the loop and removes the socket.
 pub struct Proxy {
     socket: PathBuf,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+    stats: Arc<ModelStats>,
 }
 
 impl Proxy {
@@ -97,11 +114,16 @@ impl Proxy {
         let stop2 = stop.clone();
         let pre = path_prefix.to_string();
         let listener_thread = listener;
+        let stats = Arc::new(ModelStats::default());
+        let stats2 = stats.clone();
         let handle = std::thread::spawn(move || {
-            serve_loop(listener_thread, upstream, pre, allow, stop2);
+            serve_loop(listener_thread, upstream, pre, allow, stop2, stats2);
         });
-        Ok(Proxy { socket: socket.to_path_buf(), stop, handle: Some(handle) })
+        Ok(Proxy { socket: socket.to_path_buf(), stop, handle: Some(handle), stats })
     }
+
+    /// Time this proxy has spent waiting for the model so far.
+    pub fn model_time(&self) -> (std::time::Duration, u64) { self.stats.total() }
 
     pub fn socket_path(&self) -> &Path { &self.socket }
 
@@ -128,13 +150,13 @@ fn bind_listener(socket: &Path) -> Result<UnixListener> {
 
 /// Accept and serve until `stop` is set. Polls with a short sleep so a stop request is noticed even
 /// when no connection arrives.
-fn serve_loop(listener: UnixListener, upstream: Upstream, prefix: String, allow: AllowList, stop: Arc<AtomicBool>) {
+fn serve_loop(listener: UnixListener, upstream: Upstream, prefix: String, allow: AllowList, stop: Arc<AtomicBool>, stats: Arc<ModelStats>) {
     let _ = listener.set_nonblocking(true);
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((c, _)) => {
-                let (up, pre, al) = (upstream.clone(), prefix.clone(), allow.clone());
-                std::thread::spawn(move || { let _ = serve(c, &up, &pre, &al); });
+                let (up, pre, al, st) = (upstream.clone(), prefix.clone(), allow.clone(), stats.clone());
+                std::thread::spawn(move || { let _ = serve(c, &up, &pre, &al, &st); });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -154,13 +176,13 @@ pub fn serve_until_stopped(socket: &Path, upstream: Upstream, path_prefix: &str,
 /// As `serve_until_stopped`, with an allowlist for package hosts.
 pub fn serve_until_stopped_with(socket: &Path, upstream: Upstream, path_prefix: &str, allow: AllowList, stop: Arc<AtomicBool>) -> Result<()> {
     let l = bind_listener(socket)?;
-    serve_loop(l, upstream, path_prefix.to_string(), allow, stop);
+    serve_loop(l, upstream, path_prefix.to_string(), allow, stop, Arc::new(ModelStats::default()));
     let _ = std::fs::remove_file(socket);
     Ok(())
 }
 
 /// Serve one guest connection: read its HTTP request, forward it upstream, relay the response.
-fn serve(mut guest: UnixStream, up: &Upstream, prefix: &str, allow: &AllowList) -> Result<()> {
+fn serve(mut guest: UnixStream, up: &Upstream, prefix: &str, allow: &AllowList, stats: &ModelStats) -> Result<()> {
     let mut buf = vec![0u8; 65536];
     let mut head = Vec::new();
     loop {
@@ -240,7 +262,9 @@ fn serve(mut guest: UnixStream, up: &Upstream, prefix: &str, allow: &AllowList) 
         return Ok(());
     }
     let full_path = format!("{}{}", prefix.trim_end_matches('/'), path);
+    let started = std::time::Instant::now();
     let response = forward(up, &method, &full_path, &version, &forwarded, &body)?;
+    stats.record(started.elapsed());
     guest.write_all(&response)?;
     let _ = guest.flush();
     Ok(())

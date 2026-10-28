@@ -433,9 +433,9 @@ fn main() -> anyhow::Result<()> {
             std::io::stdout().write_all(&r.stdout)?;
             std::io::stderr().write_all(&r.stderr)?;
             if r.stdout_truncated || r.stderr_truncated { eprintln!("output truncated at {} bytes", max_output); }
-            eprintln!("agent step {}: exit={} timed_out={} rolled_back={} created={} modified={} deleted={} ({} ms)",
+            eprintln!("agent step {}: exit={} timed_out={} rolled_back={} created={} modified={} deleted={} ({} ms, model {} ms over {} requests)",
                 r.step_id, r.exit_code, r.timed_out, r.rolled_back,
-                r.changes.created.len(), r.changes.modified.len(), r.changes.deleted.len(), r.duration_ms);
+                r.changes.created.len(), r.changes.modified.len(), r.changes.deleted.len(), r.duration_ms, r.model_ms, r.model_requests);
             std::process::exit(r.exit_code);
         }
         Cmd::VmProxy{base, key_env, socket, port, forwarder, allow_hosts} => {

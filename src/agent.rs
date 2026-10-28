@@ -51,6 +51,10 @@ pub struct StepResult {
     pub stderr_truncated: bool,
     pub changes: vm::SnapDiff,
     pub duration_ms: u128,
+    /// For an agent run: summed time waiting for the model, and the number of model requests. The rest
+    /// of `duration_ms` is the sandbox, the tools and the agent's own work. Zero for a plain step.
+    pub model_ms: u128,
+    pub model_requests: u64,
 }
 
 pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepResult> {
@@ -102,7 +106,7 @@ pub fn run_step(db: &Path, argv: &[String], opts: &StepOptions) -> Result<StepRe
         params![argv.join(" "), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
                 &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
     let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms, model_ms: 0, model_requests: 0 })
 }
 
 /// Compact JSON for the change list, written with stable key order.
@@ -424,6 +428,8 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
     let proxy = crate::proxy::Proxy::bind_with(&sock, upstream, &prefix,
         crate::proxy::AllowList { hosts: opts.allow_hosts.clone() })?;
     let outcome = run_agent_in(&mnt, &sock, opts, &agent_dir);
+    let (model_wait, model_requests) = proxy.model_time();
+    let model_ms = model_wait.as_millis();
     drop(proxy);
     drop(mount);
     // remove the scaffolding the run itself created, so it does not show up as a task change
@@ -448,7 +454,7 @@ pub fn run_agent_fused(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         params![format!("vm-agent --fuse: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
                 &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
     let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms, model_ms, model_requests })
 }
 
 /// Milliseconds since the epoch, used to give each run its own agent directory.
@@ -504,6 +510,8 @@ pub fn run_agent_on_overlay(db: &Path, opts: &AgentOptions) -> Result<StepResult
     let proxy = crate::proxy::Proxy::bind_with(&sock, upstream, &prefix,
         crate::proxy::AllowList { hosts: opts.allow_hosts.clone() })?;
     let outcome = run_agent_in(scratch.path(), &sock, opts, "/opt/piagent");
+    let (model_wait, model_requests) = proxy.model_time();
+    let model_ms = model_wait.as_millis();
     drop(proxy);
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome?;
     for rel in ["opt/piagent/models.json", "opt/piagent/settings.json", "opt/fwd.cjs", "opt/run-agent.sh", "tmp/proxy.sock", "tmp/fwd.log"] {
@@ -523,7 +531,7 @@ pub fn run_agent_on_overlay(db: &Path, opts: &AgentOptions) -> Result<StepResult
         params![format!("vm-agent: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
                 &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
     let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms, model_ms, model_requests })
 }
 
 /// Record a run whose synced content could not be applied, then report the failure.
@@ -677,6 +685,8 @@ pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         crate::proxy::AllowList { hosts: opts.allow_hosts.clone() })?;
 
     let outcome = run_agent_in(scratch.path(), &sock, opts, "/opt/piagent");
+    let (model_wait, model_requests) = proxy.model_time();
+    let model_ms = model_wait.as_millis();
     drop(proxy);
     let outcome = outcome?;
     let Outcome { exit_code, timed_out, stdout, stderr, stdout_truncated, stderr_truncated } = outcome;
@@ -712,7 +722,7 @@ pub fn run_agent(db: &Path, opts: &AgentOptions) -> Result<StepResult> {
         params![format!("vm-agent: {}", opts.task), exit_code, timed_out as i64, rolled_back as i64, duration_ms as i64,
                 &stdout, &stderr, stdout_truncated as i64, stderr_truncated as i64, before, after_name, diff_json])?;
     let step_id = conn.last_insert_rowid();
-    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms })
+    Ok(StepResult { step_id, exit_code, timed_out, rolled_back, stdout, stderr, stdout_truncated, stderr_truncated, changes, duration_ms, model_ms, model_requests })
 }
 
 /// pi's provider config: a local endpoint that the forwarder serves, with a placeholder key. The real
