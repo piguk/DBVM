@@ -52,6 +52,8 @@ struct State {
 
 struct Tree {
     root: PathBuf,
+    /// Paths of no interest (neither recorded nor watched below).
+    skip: fn(&str) -> bool,
     wds: HashSet<i32>,
     paths: BTreeSet<String>,
     full: bool,
@@ -81,13 +83,13 @@ fn hub() -> Option<&'static Hub> {
 }
 
 impl TreeWatch {
-    /// Watch `root` and every directory below it.
-    pub fn new(root: &Path) -> TreeWatch {
+    /// Watch `root` and every directory below it, except paths `skip` names (and what is below them).
+    pub fn new(root: &Path, skip: fn(&str) -> bool) -> TreeWatch {
         let Some(h) = hub() else { return TreeWatch { id: 0 } };
         let mut st = h.state.lock().unwrap();
         st.next_id += 1;
         let id = st.next_id;
-        st.trees.insert(id, Tree { root: root.to_path_buf(), wds: HashSet::new(), paths: BTreeSet::new(), full: false, unwatched: false });
+        st.trees.insert(id, Tree { root: root.to_path_buf(), skip, wds: HashSet::new(), paths: BTreeSet::new(), full: false, unwatched: false });
         st.watch_tree(h.fd.as_raw_fd(), id, "/", false);
         TreeWatch { id }
     }
@@ -151,7 +153,7 @@ impl State {
             };
             let rel = e.path().strip_prefix(&root).unwrap_or(e.path()).to_string_lossy().to_string();
             let vm_p = vm::normalize_vm_path(&format!("/{}", rel));
-            if vm_p != "/" && vm::is_reserved_vm_path(&vm_p) { continue; }
+            if vm_p != "/" && (t.skip)(&vm_p) { continue; }
             if mark { t.paths.insert(vm_p.clone()); }
             if !e.file_type().is_dir() { continue; }
             let Ok(c) = std::ffi::CString::new(e.path().as_os_str().as_encoded_bytes()) else { t.full = true; continue };
@@ -207,7 +209,7 @@ impl State {
             return;
         }
         let path = if name.is_empty() { dir } else { vm::normalize_vm_path(&format!("{}/{}", dir, name)) };
-        if vm::is_reserved_vm_path(&path) { return; }
+        if path != "/" && (t.skip)(&path) { return; }
         t.paths.insert(path.clone());
         if mask & libc::IN_ISDIR != 0 {
             // a directory moved away within the tree takes its subtree with it, under watches that still

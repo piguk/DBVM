@@ -90,7 +90,7 @@ impl Session {
         let tree = dir.join("tree");
         vm::vm_materialize_tree(&conn, &tree).map_err(|e| anyhow!("materialize failed: {}", e))?;
         // watching starts before the sandbox does, so no write of the session is missed
-        let watch = crate::watch::TreeWatch::new(&tree);
+        let watch = crate::watch::TreeWatch::new(&tree, vm::is_reserved_vm_path);
         let mut session = Session { conn, _work: work, dir: dir.clone(), sup: None, env: opts.env.clone(), watch, _lock: lock };
         let mut spec = sandbox::Spec::new(&tree, Vec::new());
         spec.limits = opts.limits;

@@ -241,7 +241,8 @@ impl Rollout {
             }
         }
         // watching starts before the sandbox does, so no write of the rollout is missed
-        let mut watch = TreeWatch::new(&upper_dir(&work));
+        // everything in the upper counts (the disk quota); reserved paths are left out of change lists only
+        let mut watch = TreeWatch::new(&upper_dir(&work), |_| false);
         let sup = Supervisor::start(spec, Isolation::Bwrap, work.path(), opts.egress.as_deref())?;
         let mut env = opts.env.clone();
         if opts.egress.is_some() {
@@ -364,7 +365,6 @@ impl Rollout {
             let Some(e) = vanished_ok(e)? else { continue };
             let rel = e.path().strip_prefix(&upper).unwrap_or(e.path()).to_string_lossy().to_string();
             let p = vm::normalize_vm_path(&format!("/{}", rel));
-            if vm::is_reserved_vm_path(&p) { continue; }
             match std::fs::symlink_metadata(e.path()) {
                 Ok(md) => { out.insert(p, entry_of(e.path(), &md)); }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -406,6 +406,8 @@ impl Rollout {
             }
         }
         for p in &deleted { created.remove(p); modified.remove(p); }
+        // runtime artefacts (/tmp, __pycache__, the sandbox's mount points) are not the rollout's changes
+        for set in [&mut created, &mut modified, &mut deleted] { set.retain(|p| !vm::is_reserved_vm_path(p)); }
         Ok(SnapDiff { created: created.into_iter().collect(), modified: modified.into_iter().collect(), deleted: deleted.into_iter().collect() })
     }
 
@@ -436,9 +438,14 @@ impl Rollout {
     /// processes that keep writing cannot leave a mix of older and newer files in it; the rollout then keeps
     /// running. Only files are captured: processes and their memory are not.
     pub fn snapshot_upper(&self, dest: &Path) -> Result<()> {
-        let sup = self.sup.as_ref().ok_or_else(|| anyhow!("the rollout is closed"))?;
-        let _frozen = sup.freeze()?;
+        let _frozen = self.freeze()?;
         copy_layer(&self.upper(), dest)
+    }
+
+    /// Stop every process of the rollout until the guard drops, so that its upper directory can be read as
+    /// one moment of it.
+    pub fn freeze(&self) -> Result<sandbox::Frozen> {
+        self.sup.as_ref().ok_or_else(|| anyhow!("the rollout is closed"))?.freeze()
     }
 
     pub fn close(self) {}

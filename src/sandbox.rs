@@ -327,7 +327,8 @@ impl Sandbox {
         } else {
             cmd.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
         }
-        let child = cmd.spawn().map_err(|e| anyhow!("start sandbox ({:?}): {}", cmd.get_program(), e))?;
+        let program = cmd.get_program().to_owned();
+        let child = spawn_from_keeper(cmd).map_err(|e| anyhow!("start sandbox ({:?}): {}", program, e))?;
         if let Some(f) = join_fd { keep.push(f); }
         Ok(Sandbox { child, cgroup, _runsc_state: runsc_state, _keep: keep })
     }
@@ -390,6 +391,27 @@ pub struct Frozen { dir: PathBuf }
 
 impl Drop for Frozen {
     fn drop(&mut self) { let _ = std::fs::write(self.dir.join("cgroup.freeze"), "0"); }
+}
+
+/// Start `cmd` from a thread that lives as long as the process. bwrap's --die-with-parent (PR_SET_PDEATHSIG)
+/// fires when the thread that forked it exits, not the process: sandboxes started from a server's worker
+/// threads died when those threads were retired after 10 s without work (measured). From the keeper thread
+/// a sandbox still ends with the process, which is what --die-with-parent is for.
+fn spawn_from_keeper(cmd: Command) -> std::io::Result<Child> {
+    type Job = (Command, std::sync::mpsc::Sender<std::io::Result<Child>>);
+    static KEEPER: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+    let keeper = KEEPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new().name("sandbox-spawner".into()).spawn(move || {
+            for (mut cmd, reply) in rx { let _ = reply.send(cmd.spawn()); }
+        }).expect("start the sandbox spawner thread");
+        std::sync::Mutex::new(tx)
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    if keeper.lock().unwrap().send((cmd, tx)).is_err() {
+        return Err(std::io::Error::other("the sandbox spawner thread is gone"));
+    }
+    rx.recv().unwrap_or_else(|_| Err(std::io::Error::other("the sandbox spawner thread is gone")))
 }
 
 impl Drop for Sandbox {
