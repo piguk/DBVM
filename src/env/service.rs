@@ -264,7 +264,7 @@ impl Service {
         } else { None };
         let opts = RolloutOptions {
             limits, env: env.clone(), readonly: spec.map(|s| s.readonly.clone()).unwrap_or_default(),
-            egress: proxy.as_ref().map(|(_, d)| d.path().to_path_buf()), work_root: Some(self.store.run_dir()),
+            egress: proxy.as_ref().map(|(_, d)| d.path().to_path_buf()), work_root: Some(self.store.run_dir()), ..RolloutOptions::default()
         };
         let rollout = Rollout::start(&layers, &opts)?;
         let id = self.store.new_id("ses")?;
@@ -338,7 +338,7 @@ impl Service {
         resp.entries = entries;
         let line = serde_json::json!({"step": l.steps, "ts": crate::vm::now_secs(), "label": l.label, "seed": l.seed, "action": action, "response": resp});
         writeln!(l.trajectory, "{}", line)?;
-        let over = l.rollout.upper_bytes()? as i64 > l.tenant.max_session_disk_bytes;
+        let over = l.rollout.upper_bytes() as i64 > l.tenant.max_session_disk_bytes;
         drop(l);
         if over {
             self.close(t, id, "disk quota")?;
@@ -386,7 +386,7 @@ impl Service {
     pub fn freeze(&self, t: &Tenant, id: &str, name: &str) -> EnvResult<Template> {
         let live = self.live(t, id)?;
         let l = live.lock().unwrap();
-        let need = l.rollout.upper_bytes()? as i64 + l.template.bytes;
+        let need = l.rollout.upper_bytes() as i64 + l.template.bytes;
         if self.control.storage_bytes(&t.id)? + need > t.max_storage_bytes {
             return Err(EnvError::Quota(format!("storing this template would exceed {} bytes", t.max_storage_bytes)));
         }
@@ -409,7 +409,7 @@ impl Service {
             copy_seen(src, &judge.sees, &dest)?;
             layers.push(dest);
         }
-        let opts = RolloutOptions { limits: l.limits, env: l.env.clone(), readonly: Vec::new(), egress: None, work_root: Some(self.store.run_dir()) };
+        let opts = RolloutOptions { limits: l.limits, env: l.env.clone(), readonly: Vec::new(), egress: None, work_root: Some(self.store.run_dir()), ..RolloutOptions::default() };
         let mut sandbox = Rollout::start(&layers, &opts)?;
         let outcome = sandbox.exec(&judge.cmd, "/", Duration::from_secs(judge.timeout_secs.clamp(1, MAX_ACTION_SECS)), MAX_OUTPUT)?.outcome;
         drop(sandbox);

@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use crate::sandbox::{self, Isolation, Limits, Outcome, RoOverlay};
 use crate::session::supervisor::{DirEntry, Supervisor};
 use crate::vm::{self, SnapDiff, WorkDir};
+use crate::watch::TreeWatch;
 
 #[derive(Debug, Clone)]
 pub struct RolloutOptions {
@@ -39,6 +40,10 @@ pub struct RolloutOptions {
     /// Where the rollout's upper directory and control files go; $TMPDIR when None. A service puts them on
     /// its data disk: a rollout's upper holds everything it writes.
     pub work_root: Option<PathBuf>,
+    /// After an action only the paths the watcher reports are looked at (see `watch`); every this many
+    /// actions the whole upper directory is walked instead, to catch what raises no event (writes through
+    /// a shared memory mapping). 1: walk after every action.
+    pub walk_every: u32,
 }
 
 impl Default for RolloutOptions {
@@ -49,6 +54,7 @@ impl Default for RolloutOptions {
             readonly: Vec::new(),
             egress: None,
             work_root: None,
+            walk_every: 64,
         }
     }
 }
@@ -69,6 +75,11 @@ pub struct Rollout {
     env: Vec<(String, String)>,
     /// The upper directory as of the end of the previous action.
     scan: BTreeMap<String, Entry>,
+    /// The size of the regular files in `scan`.
+    bytes: u64,
+    watch: TreeWatch,
+    walk_every: u32,
+    since_walk: u32,
 }
 
 /// What the scan keeps per upper entry.
@@ -112,6 +123,8 @@ fn vanished_ok(e: walkdir::Result<walkdir::DirEntry>) -> Result<Option<walkdir::
         Err(err) => Err(anyhow!("scan the upper directory: {}", err)),
     }
 }
+
+fn upper_dir(work: &WorkDir) -> PathBuf { work.path().join("upper") }
 
 fn host(dir: &Path, vm_path: &str) -> PathBuf { dir.join(vm_path.trim_start_matches('/')) }
 
@@ -227,6 +240,8 @@ impl Rollout {
                 spec.ro_overlays.push(RoOverlay { layers: vec![empty], dest: p });
             }
         }
+        // watching starts before the sandbox does, so no write of the rollout is missed
+        let mut watch = TreeWatch::new(&upper_dir(&work));
         let sup = Supervisor::start(spec, Isolation::Bwrap, work.path(), opts.egress.as_deref())?;
         let mut env = opts.env.clone();
         if opts.egress.is_some() {
@@ -237,33 +252,25 @@ impl Rollout {
                 env.push((k.into(), proxy.clone()));
             }
         }
-        let mut r = Rollout { work, layers: layers.to_vec(), sup: Some(sup), env, scan: BTreeMap::new() };
         // the sandbox's own mount points (/.selfdb, read-only paths) are not the rollout's changes
-        r.scan = r.scan_upper()?;
+        let _ = watch.take();
+        let mut r = Rollout { work, layers: layers.to_vec(), sup: Some(sup), env, scan: BTreeMap::new(), bytes: 0, watch,
+                              walk_every: opts.walk_every.max(1), since_walk: 0 };
+        r.rescan_all()?;
         Ok(r)
     }
 
     pub fn layers(&self) -> &[PathBuf] { &self.layers }
-    pub fn upper(&self) -> PathBuf { self.work.path().join("upper") }
+    pub fn upper(&self) -> PathBuf { upper_dir(&self.work) }
 
     fn sup(&mut self) -> Result<&mut Supervisor> { self.sup.as_mut().ok_or_else(|| anyhow!("the rollout is closed")) }
 
     /// CPU time used by the rollout's sandbox so far, in microseconds.
     pub fn cpu_usec(&mut self) -> Option<u64> { self.sup.as_mut().and_then(|s| s.cpu_usec()) }
 
-    /// Bytes the rollout has written so far (the size of its upper directory).
-    pub fn upper_bytes(&self) -> Result<u64> {
-        let mut n = 0;
-        for e in walkdir::WalkDir::new(self.upper()).follow_links(false) {
-            let Some(e) = vanished_ok(e)? else { continue };
-            match e.metadata() {
-                Ok(md) => if md.is_file() { n += md.len(); },
-                Err(err) if err.io_error().map(|i| i.kind()) == Some(std::io::ErrorKind::NotFound) => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-        Ok(n)
-    }
+    /// Bytes the rollout has written, as of the end of its last action (the regular files of its upper
+    /// directory).
+    pub fn upper_bytes(&self) -> u64 { self.bytes }
 
     /// Run a command.
     pub fn exec(&mut self, argv: &[String], cwd: &str, timeout: Duration, max_output: usize) -> Result<ActionResult> {
@@ -292,10 +299,62 @@ impl Rollout {
     }
 
     fn finish(&mut self, outcome: Outcome, started: Instant) -> Result<ActionResult> {
-        let cur = self.scan_upper()?;
-        let changes = self.diff(&cur)?;
-        self.scan = cur;
+        let seen = self.watch.take();
+        self.since_walk += 1;
+        let changed = if seen.full || self.since_walk >= self.walk_every { self.rescan_all()? } else { self.rescan(&seen.paths)? };
+        let changes = self.diff(&changed)?;
         Ok(ActionResult { outcome, changes, duration_ms: started.elapsed().as_millis() })
+    }
+
+    /// Replace the scan with a walk of the whole upper directory. Returns the entries that differ, each
+    /// with its previous value.
+    fn rescan_all(&mut self) -> Result<Vec<(String, Option<Entry>)>> {
+        let cur = self.scan_upper()?;
+        let mut changed: Vec<(String, Option<Entry>)> = Vec::new();
+        for (p, e) in &cur {
+            let prev = self.scan.get(p);
+            if prev != Some(e) { changed.push((p.clone(), prev.cloned())); }
+        }
+        for (p, pe) in &self.scan {
+            if !cur.contains_key(p) { changed.push((p.clone(), Some(pe.clone()))); }
+        }
+        self.bytes = cur.values().filter(|e| e.kind == Kind::File).map(|e| e.size).sum();
+        self.scan = cur;
+        self.since_walk = 0;
+        Ok(changed)
+    }
+
+    /// Update the scan at `paths` only (and below those that are no longer directories). Returns the entries
+    /// that differ, each with its previous value.
+    fn rescan(&mut self, paths: &BTreeSet<String>) -> Result<Vec<(String, Option<Entry>)>> {
+        let upper = self.upper();
+        let mut changed = Vec::new();
+        for p in paths {
+            if p == "/" { continue; }
+            let hp = host(&upper, p);
+            let now = match std::fs::symlink_metadata(&hp) {
+                Ok(md) => Some(entry_of(&hp, &md)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(anyhow!("scan {}: {}", hp.display(), err)),
+            };
+            if now.as_ref().map(|e| e.kind != Kind::Dir).unwrap_or(true) {
+                // not a directory (any more): nothing the scan had below it is there
+                let prefix = format!("{}/", p);
+                let below: Vec<String> = self.scan.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)).map(|(k, _)| k.clone()).collect();
+                for k in below { self.set(k, None, &mut changed); }
+            }
+            self.set(p.clone(), now, &mut changed);
+        }
+        Ok(changed)
+    }
+
+    fn set(&mut self, p: String, now: Option<Entry>, changed: &mut Vec<(String, Option<Entry>)>) {
+        let prev = self.scan.get(&p).cloned();
+        if prev == now { return; }
+        let size = |e: &Option<Entry>| e.as_ref().filter(|e| e.kind == Kind::File).map(|e| e.size).unwrap_or(0);
+        self.bytes = self.bytes + size(&now) - size(&prev);
+        match &now { Some(e) => { self.scan.insert(p.clone(), e.clone()); } None => { self.scan.remove(&p); } }
+        changed.push((p, prev));
     }
 
     fn scan_upper(&self) -> Result<BTreeMap<String, Entry>> {
@@ -315,15 +374,20 @@ impl Rollout {
         Ok(out)
     }
 
-    /// The changes between the previous scan and `cur`, as the rollout's merged view sees them.
-    fn diff(&self, cur: &BTreeMap<String, Entry>) -> Result<SnapDiff> {
+    /// What `changed` (upper entries with their previous values; the scan holds the current ones) changed
+    /// in the rollout's merged view.
+    fn diff(&self, changed: &[(String, Option<Entry>)]) -> Result<SnapDiff> {
         let mut created = BTreeSet::new();
         let mut modified = BTreeSet::new();
         let mut deleted = BTreeSet::new();
         let upper = self.upper();
-        for (p, e) in cur {
-            let prev = self.scan.get(p);
-            if prev == Some(e) { continue; }
+        for (p, prev) in changed {
+            let prev = prev.as_ref();
+            let Some(e) = self.scan.get(p) else {
+                // an entry that only ever existed in the upper, removed again
+                if prev.map(|pe| pe.kind != Kind::Whiteout).unwrap_or(false) { deleted.insert(p.clone()); }
+                continue;
+            };
             let lower = lower_lookup(&self.layers, p);
             let was_visible = match prev { Some(pe) => pe.kind != Kind::Whiteout, None => lower.is_some() };
             if e.kind == Kind::Whiteout {
@@ -337,14 +401,9 @@ impl Rollout {
             // a directory made opaque hides what the layers had below it
             if e.kind == Kind::Dir && e.opaque && !prev.map(|pe| pe.opaque).unwrap_or(false) {
                 for below in lower_tree(&self.layers, p)? {
-                    if !cur.contains_key(&below) { deleted.insert(below); }
+                    if !self.scan.contains_key(&below) { deleted.insert(below); }
                 }
             }
-        }
-        for (p, pe) in &self.scan {
-            if cur.contains_key(p) || pe.kind == Kind::Whiteout { continue; }
-            // an entry that only ever existed in the upper, removed again
-            deleted.insert(p.clone());
         }
         for p in &deleted { created.remove(p); modified.remove(p); }
         Ok(SnapDiff { created: created.into_iter().collect(), modified: modified.into_iter().collect(), deleted: deleted.into_iter().collect() })

@@ -12,6 +12,7 @@ pub mod proxy;
 pub mod access;
 pub mod sandbox;
 pub mod session;
+pub mod watch;
 pub mod rollout;
 pub mod egress;
 pub mod env;

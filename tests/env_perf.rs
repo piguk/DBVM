@@ -79,6 +79,20 @@ fn service_timings() {
     eprintln!("{:34} {:?} total, {:.2} ms each, memory +{} MB ({:.2} MB each)", "500 idle rollouts", took,
               took.as_secs_f64() * 1e3 / 500.0, after.saturating_sub(before), after.saturating_sub(before) as f64 / 500.0);
 
+    // the same rollouts per their cgroups: memory.current is what the kernel charges each sandbox (its
+    // processes' memory, the kernel memory and page cache it caused)
+    let root = std::path::PathBuf::from(std::env::var("SELF_SANDBOX_CGROUP").unwrap());
+    let stat_of = |dir: &std::path::Path, key: &str| -> u64 {
+        std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default().lines()
+            .find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix(' ')).and_then(|v| v.trim().parse().ok())).unwrap_or(0)
+    };
+    let sbs: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("sb-")).collect();
+    let n = sbs.len() as f64;
+    let mean_kib = |f: &dyn Fn(&std::path::Path) -> u64| sbs.iter().map(|p| f(p)).sum::<u64>() as f64 / n / 1024.0;
+    let current = mean_kib(&|p| std::fs::read_to_string(p.join("memory.current")).unwrap().trim().parse().unwrap());
+    eprintln!("{:34} {} cgroups: memory.current {:.0} KiB each (anon {:.0}, file {:.0}, kernel {:.0}, sock {:.0})", "idle rollouts by cgroup", sbs.len(), current,
+              mean_kib(&|p| stat_of(p, "anon")), mean_kib(&|p| stat_of(p, "file")), mean_kib(&|p| stat_of(p, "kernel")), mean_kib(&|p| stat_of(p, "sock")));
+
     // throughput: 64 sessions, 20 actions each, concurrently
     let svc = s.svc.clone();
     let t0 = Instant::now();
@@ -90,4 +104,16 @@ fn service_timings() {
     let el = t0.elapsed();
     eprintln!("{:34} {} actions in {:?}: {:.0} actions/s", "64 concurrent sessions", 64 * 20, el, (64 * 20) as f64 / el.as_secs_f64());
     for id in many { s.svc.close(&t, &id, "perf").unwrap(); }
+
+    // a long trajectory: every step adds a file, so the upper directory grows by one entry per step; each
+    // step's change list (and the disk quota) scan the whole upper
+    let long = create();
+    let mut all = Vec::new();
+    for i in 1..=5000 {
+        let t0 = Instant::now();
+        s.svc.act(&t, &long, bash(&format!("echo {} > /app/f{}", i, i))).unwrap();
+        all.push(t0.elapsed());
+    }
+    for end in [100, 1000, 2500, 5000] { report(&format!("steps {}-{}, one more file each", end - 99, end), all[end - 100..end].to_vec()); }
+    s.svc.close(&t, &long, "perf").unwrap();
 }

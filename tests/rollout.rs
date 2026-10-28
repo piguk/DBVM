@@ -240,3 +240,37 @@ fn merged_fork_layers_show_the_same_tree() {
     assert!(stacked.contains("work/x/z") && stacked.contains("etc/other") && !stacked.contains("data/a"), "{}", stacked);
     assert_eq!(flat, stacked);
 }
+
+#[test]
+fn watched_change_lists_match_full_walks() {
+    if !bwrap_ok() { return; }
+    let t = template("watch");
+    let walk = RolloutOptions { walk_every: 1, ..RolloutOptions::default() };
+    let watched = RolloutOptions { walk_every: u32::MAX, ..RolloutOptions::default() };
+    let mut a = Rollout::start(std::slice::from_ref(&t.layer), &walk).unwrap();
+    let mut b = Rollout::start(std::slice::from_ref(&t.layer), &watched).unwrap();
+    let steps = [
+        "echo new > /work/new",
+        "echo changed > /etc/conf",
+        ": >> /etc/other",
+        "mkdir -p /work/a/b/c && echo f > /work/a/b/c/f && ln -s /work/a /work/l && ln /work/new /work/hard",
+        "echo more >> /data/sub/b",
+        "rm -rf /data",
+        "mkdir /data && echo z > /data/z",
+        "mv /work/a /work/moved",
+        "mv /work/new /work/renamed && chmod 600 /work/renamed",
+        "rm -rf /work/moved",
+        "i=0; while [ $i -lt 300 ]; do echo $i > /work/n$i; i=$((i+1)); done",
+        "rm /etc/conf && mkdir /etc/conf && echo c > /etc/conf/c",
+        "rm -rf /etc/conf && echo back > /etc/conf",
+        "i=0; while [ $i -lt 300 ]; do rm /work/n$i; i=$((i+2)); done",
+        "rm /work/hard /work/l",
+    ];
+    for (i, cmd) in steps.iter().enumerate() {
+        let (ra, rb) = (sh(&mut a, cmd), sh(&mut b, cmd));
+        assert_eq!(ra.outcome.exit_code, 0, "step {}: {}", i, String::from_utf8_lossy(&ra.outcome.stderr));
+        let norm = |d: &vm::SnapDiff| (sorted(&d.created), sorted(&d.modified), sorted(&d.deleted));
+        assert_eq!(norm(&rb.changes), norm(&ra.changes), "step {} ({})", i, cmd);
+        assert_eq!(b.upper_bytes(), a.upper_bytes(), "step {}: written bytes", i);
+    }
+}

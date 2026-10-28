@@ -12,7 +12,7 @@
 | rollout | 基于任务的 session；无网络，只读路径由 mount 强制 |
 | 任务（task） | 模板 + 只读路径 + 判分命令 + 资源限制 + 种子变量 |
 
-rollout 的根是 bwrap overlay：lower 为模板的各层，upper 为 rollout 私有目录。启动不需要物化；每个动作的变更清单由扫描 upper 得到，与模板大小无关；每步不写数据库，只有 freeze 时把 upper 应用进新模板的数据库（`vm_apply_upper`）。
+rollout 的根是 bwrap overlay：lower 为模板的各层，upper 为 rollout 私有目录。启动不需要物化；每个动作的变更清单只检查 inotify 报告的 upper 路径，代价与这一步的改动量成正比，与模板大小和累计改动量无关（inotify 不确定时，以及每 64 步一次，改为遍历整个 upper）；每步不写数据库，只有 freeze 时把 upper 应用进新模板的数据库（`vm_apply_upper`）。
 
 ## 部署
 
@@ -28,6 +28,7 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 - 数据目录布局见 `src/env/store.rs`；`run/` 为运行中 rollout 的 upper，服务重启时清空。
 - `env-admin` 只打开控制库与存储，不影响运行中的服务。
 - `env-serve` 启动时进入一个只映射自身 uid/gid 的 user namespace，保留 `CAP_DAC_OVERRIDE`、`CAP_DAC_READ_SEARCH`、`CAP_FOWNER`（只对本用户的文件有效）。原因：agent 在 sandbox 内是 root，可以把目录设为 000；没有这些权限，宿主侧的复制、diff 和磁盘配额统计会读不到这些目录。在该 namespace 中 setuid 程序不生效，因此 bwrap 不能依赖 setuid 安装。
+- 所有 rollout 共用进程内的一个 inotify 实例；每个 rollout 的 upper 中每个目录占用一个 watch。`fs.inotify.max_user_watches` 用尽后，无法再添加 watch 的 rollout 改为每步遍历 upper（结果不变，变慢），需要时调大该值。
 - 节点 id（`--node`）是所有对象 id 的前缀，为多节点路由预留。
 
 ## 接口（`/v1`）
@@ -111,11 +112,12 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 
 | 指标 | 结果 |
 |---|---|
-| 启动一个 rollout | p50 20.8 ms，p95 26.1 ms |
-| fork 一个子 rollout（含冻结父 rollout） | p50 18.2 ms，p95 24.9 ms |
-| 空动作（服务内 / 经 HTTP） | p50 1.36 ms / 1.53 ms |
-| 500 个空闲 rollout | 依次启动共 11.4 s；每个 0.84–1.25 MB 内存（两次运行。整机 `MemTotal − MemAvailable` 的增量除以 500：含内核内存，不含可回收的 page cache，受宿主上其他进程影响） |
-| 64 个 session 并发、每个 20 次写读动作 | 6917 动作/秒 |
+| 启动一个 rollout | p50 21.0 ms，p95 27.7 ms |
+| fork 一个子 rollout（含冻结父 rollout） | p50 18.2–22.9 ms（两次运行） |
+| 空动作（服务内 / 经 HTTP） | p50 1.34 ms / 1.49 ms |
+| 500 个空闲 rollout | 依次启动共 10.5 s；每个 sandbox cgroup 的 `memory.current` 约 800 KiB（anon 343 KiB，内核 444 KiB，page cache 0） |
+| 64 个 session 并发、每个 20 次写读动作 | 7103 动作/秒 |
+| 长轨迹：5000 步，每步新增一个文件 | 第 1–100 步 p50 1.35 ms，第 4901–5000 步 p50 1.35 ms、mean 1.65 ms（每 64 步一次全量遍历）；改为增量之前，第 4901–5000 步 p50 为 21.3 ms |
 
 ## 不在当前范围内
 

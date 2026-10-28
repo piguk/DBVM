@@ -19,7 +19,7 @@
 //! slower (measured, docs/vm.md).
 
 pub mod supervisor;
-mod watch;
+
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
@@ -74,7 +74,7 @@ pub struct Session {
     sup: Option<Supervisor>,
     env: Vec<(String, String)>,
     /// Paths of the tree changed since the last command was recorded.
-    watch: watch::TreeWatch,
+    watch: crate::watch::TreeWatch,
     _lock: StepLock,
 }
 
@@ -90,7 +90,7 @@ impl Session {
         let tree = dir.join("tree");
         vm::vm_materialize_tree(&conn, &tree).map_err(|e| anyhow!("materialize failed: {}", e))?;
         // watching starts before the sandbox does, so no write of the session is missed
-        let watch = watch::TreeWatch::new(&tree)?;
+        let watch = crate::watch::TreeWatch::new(&tree);
         let mut session = Session { conn, _work: work, dir: dir.clone(), sup: None, env: opts.env.clone(), watch, _lock: lock };
         let mut spec = sandbox::Spec::new(&tree, Vec::new());
         spec.limits = opts.limits;
