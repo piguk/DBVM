@@ -92,6 +92,10 @@ class SelfdbEnvironment(BaseEnvironment):
 
     async def start(self, force_build=False):
         self._session = await self._client.session(template_id=await self._template_id(), egress=self._hosts())
+        # as Harbor's own unmounted environments do: the trial's log directories (/logs/agent, ...), then
+        # the task's environment/ files for a prebuilt image
+        await self.ensure_dirs(self._mount_targets(writable_only=True))
+        await self._upload_environment_dir_after_start()
 
     async def stop(self, delete=True):
         if self._session is not None:

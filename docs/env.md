@@ -160,7 +160,10 @@ self env-admin --data /srv/env image eda eda.tar --oci       # 镜像导入到�
 - **Harbor**（`selfdb_env.harbor:SelfdbEnvironment`）：在 Harbor 的 job 配置中以 `import_path` 指定，`kwargs` 给出 `base_url`、可选的 `template`（模板 id 或名称；默认用任务的 `docker_image` 作为模板名称）与 `egress`。每个 trial 是一个 build session。网络策略：`no-network` 无网络；`allowlist` 为任务列出的主机（`*.x` 转为 `.x`）加上 `egress`；`public` 只有 `egress`，因为服务只放行列出的主机。不构建 Dockerfile：镜像需先用 `env-admin image ... --oci` 导入。命令以 root 执行，要求其他用户的命令会报错。
 - **OpenEnv**（`selfdb_env.openenv`）：`create_app(task_id, base_url, max_steps)` 返回 OpenEnv 的 HTTP/WebSocket app。每个 OpenEnv 会话是任务的一个 rollout：`reset(seed)` 启动 rollout，observation 中带任务的 `instruction`；`step` 执行一个工具调用；`submit` 或达到 `max_steps` 时判分并结束，`reward` 为判分结果。
 
-两者的测试（`tests/env_adapters.rs`）使用 `tests/adapter_stubs/` 中按框架源码签名编写的替身，不依赖安装框架本身；框架接口变化后需要对照新版本重新检查。
+验证：
+
+- 已用 harbor 0.25.0 与 openenv-core 0.3.0 验证：`harbor run -e selfdb_env.harbor:SelfdbEnvironment` 以 oracle 与 nop agent 运行任务，判分在同一环境（`shared`）与独立环境（`separate`，agent 的产出以 artifact 传入）两种模式下 reward 均符合预期（`tests/env_harbor.rs`）；OpenEnv 经其 `create_app`（uvicorn）与 `GenericEnvClient` 完成 reset、step、submit（`tests/env_adapters.rs`）。运行这些测试需设置 `SELFDB_ADAPTER_PYTHON` 为装有两个框架的 Python。
+- 未设置时，`tests/env_adapters.rs` 使用 `tests/adapter_stubs/` 中按框架源码签名编写的替身。框架发布新版本后，需要用真实框架重新运行。
 
 ## Python SDK
 

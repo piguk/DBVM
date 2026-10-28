@@ -135,4 +135,4 @@ def create_app(task_id, base_url=None, max_steps=None, **kwargs):
     """The OpenEnv HTTP/WebSocket app serving rollouts of ``task_id`` (see the module docs)."""
     from openenv.core.env_server.http_server import create_app as openenv_app
     return openenv_app(lambda: SelfdbEnvironment(task_id, base_url=base_url, max_steps=max_steps),
-                       SelfdbAction, SelfdbObservation, env_name="selfdb", state_cls=SelfdbState, **kwargs)
+                       SelfdbAction, SelfdbObservation, env_name="selfdb", **kwargs)

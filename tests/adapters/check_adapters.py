@@ -23,11 +23,11 @@ def harbor_env(base, scratch, policy, **kw):
 
 
 async def check_harbor(base, scratch):
-    hosts = harbor_env(base, scratch, NetworkPolicy(NetworkMode.ALLOWLIST, ["*.example.com", "pypi.org"]), template="calc", egress=["x.org"])
+    hosts = harbor_env(base, scratch, NetworkPolicy(network_mode=NetworkMode.ALLOWLIST, allowed_hosts=["*.example.com", "pypi.org"]), template="calc", egress=["x.org"])
     assert hosts._hosts() == ["x.org", ".example.com", "pypi.org"], hosts._hosts()
-    assert harbor_env(base, scratch, NetworkPolicy(NetworkMode.NO_NETWORK), template="calc", egress=["x.org"])._hosts() == []
+    assert harbor_env(base, scratch, NetworkPolicy(network_mode=NetworkMode.NO_NETWORK), template="calc", egress=["x.org"])._hosts() == []
 
-    env = harbor_env(base, scratch, NetworkPolicy(NetworkMode.NO_NETWORK), template="calc")
+    env = harbor_env(base, scratch, NetworkPolicy(network_mode=NetworkMode.NO_NETWORK), template="calc")
     await env.start(force_build=False)
     r = await env.exec('echo "$P" $X; pwd', env={"X": "x"})
     assert (r.return_code, r.stdout) == (0, "p q x\n/app\n"), vars(r)

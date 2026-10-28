@@ -24,7 +24,7 @@ impl Drop for Server { fn drop(&mut self) { let _ = vm::remove_tree(&self.dir); 
 /// A small root filesystem (a shell and a few tools) as a tarball.
 pub fn rootfs(dir: &Path) -> PathBuf {
     let c = vm::init_vm_db_with_opts(dir.join("img.db").to_str().unwrap(), true, true).unwrap();
-    for prog in ["/bin/sh", "/bin/cat", "/bin/mkdir", "/bin/rm", "/bin/ls", "/bin/chmod", "/usr/bin/head", "/bin/ln", "/usr/bin/readlink", "/usr/bin/cut", "/bin/sleep"] {
+    for prog in ["/bin/sh", "/bin/cat", "/bin/mkdir", "/bin/rm", "/bin/ls", "/bin/chmod", "/usr/bin/head", "/bin/ln", "/usr/bin/readlink", "/usr/bin/cut", "/bin/sleep", "/bin/bash", "/usr/bin/tee", "/usr/bin/tail"] {
         if Path::new(prog).exists() { vm::vm_import_closure(&c, prog, "/").unwrap(); }
     }
     let tree = dir.join("img-tree");
