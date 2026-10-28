@@ -1,13 +1,16 @@
 #!/bin/sh
-# A root filesystem tarball for the EDA template, assembled from the packages installed on this host (Debian or
+# A root filesystem tarball for a pack's template, assembled from the packages installed on this host (Debian or
 # Ubuntu): the given packages and everything they depend on, as dpkg lists their files. For hosts without network
-# access; with network access, build packs/eda/Dockerfile instead and import the image with --oci.
+# access; with network access, build the pack's Dockerfile instead and import the image with --oci.
 #
-#   packs/eda/scripts/host-rootfs.sh OUT.tar
+#   packs/packkit/host-rootfs.sh OUT.tar PACKAGE...
+#   (packs/eda: verilator ngspice g++ make perl python3)
 set -eu
-out=${1:?usage: host-rootfs.sh OUT.tar}
-# dash provides /bin/sh; Essential packages appear in no Depends
-want="verilator ngspice g++ make perl python3 libc-bin dash bash coreutils grep sed findutils diffutils"
+out=${1:?usage: host-rootfs.sh OUT.tar PACKAGE...}
+shift
+[ $# -gt 0 ] || { echo "host-rootfs: name the packages" >&2; exit 2; }
+# a shell and the basic commands every task uses; dash provides /bin/sh (Essential packages appear in no Depends)
+want="$* libc-bin dash bash coreutils grep sed findutils diffutils"
 arch=$(dpkg --print-architecture)
 
 tmp=$(mktemp -d)

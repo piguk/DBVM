@@ -2,7 +2,7 @@
 
 A mutation changes one site of the reference: an operator (+ to -, & to |, == to !=, << to >>, ...), a constant
 (one more or one less), a clock edge, a condition (negated), or a bit (~ or ! removed). Whether a mutant is a
-task (it compiles, and the testbench catches it) is decided by running the judge (build_tasks.py), not here.
+task (it compiles, and the testbench catches it) is decided by running the judge (packkit build), not here.
 """
 
 import os
@@ -100,12 +100,13 @@ def mutations(src):
     return out
 
 
-def task(name, mutant, description, judge_src):
+def task(name, mutant, description, judge_src, rules_src):
     """(task spec without template_id, reference file, metadata)."""
     files = [
         {"path": "/work/rtl/%s.v" % name, "content": mutant},
         {"path": "/tests/tb.sv", "content": testbench(name)},
         {"path": "/tests/judge.py", "content": judge_src, "mode": 0o755},
+        {"path": "/tests/rtl_rules.py", "content": rules_src},
     ]
     instruction = ("The Verilog module `%s` in /work/rtl/%s.v does not do what its header comment describes: the "
                    "self-checking testbench /tests/tb.sv fails. Fix the module (synthesizable RTL; no system tasks, "
