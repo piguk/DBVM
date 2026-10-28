@@ -1,0 +1,26 @@
+# The coordinator of a cluster. Settings: /etc/selfdb/coordinator.env (SELFDB_COORDINATOR_ARGS); the cluster
+# token: /etc/selfdb/cluster-token (root:root, 0600), handed to the service as a systemd credential.
+[Unit]
+Description=SQL-VM RL environment coordinator
+Documentation=https://github.com/piguk/DBVM/blob/main/docs/env.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=selfdb
+Group=selfdb
+EnvironmentFile=/etc/selfdb/coordinator.env
+LoadCredential=cluster-token:/etc/selfdb/cluster-token
+ExecStart=/usr/local/bin/self env-coordinator --data /var/lib/selfdb/coordinator --token-file %d/cluster-token $SELFDB_COORDINATOR_ARGS
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/selfdb
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,88 @@
+# A coordinator and environment nodes on Kubernetes. Not verified on a cluster (see packaging/README.md).
+#
+# Before applying: build the image (packaging/Dockerfile) into a registry the cluster pulls from and set it
+# below, and create the cluster token from a random file:
+#   kubectl create namespace selfdb
+#   kubectl -n selfdb create secret generic selfdb-cluster-token --from-file=token=cluster-token
+apiVersion: v1
+kind: Service
+metadata: { name: selfdb, namespace: selfdb }
+spec:
+  selector: { app: selfdb-coordinator }
+  ports: [{ name: api, port: 8650 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: selfdb-coordinator, namespace: selfdb }
+spec:
+  serviceName: selfdb
+  replicas: 1
+  selector: { matchLabels: { app: selfdb-coordinator } }
+  template:
+    metadata: { labels: { app: selfdb-coordinator } }
+    spec:
+      containers:
+        - name: coordinator
+          image: REGISTRY/selfdb:VERSION
+          args: [env-coordinator, --data, /data, --listen, "0.0.0.0:8650", --id, c1,
+                 --token-file, /etc/selfdb/token/token, --metrics-listen, "0.0.0.0:9651"]
+          ports: [{ containerPort: 8650 }, { containerPort: 9651, name: metrics }]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: token, mountPath: /etc/selfdb/token, readOnly: true }
+      volumes:
+        - name: token
+          secret: { secretName: selfdb-cluster-token, defaultMode: 0400 }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 10Gi } } }
+---
+# the nodes reach each other (template fetches) and are reached by the coordinator at stable names
+apiVersion: v1
+kind: Service
+metadata: { name: selfdb-nodes, namespace: selfdb }
+spec:
+  clusterIP: None
+  selector: { app: selfdb-node }
+  ports: [{ name: api, port: 8650 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: selfdb-node, namespace: selfdb }
+spec:
+  serviceName: selfdb-nodes
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector: { matchLabels: { app: selfdb-node } }
+  template:
+    metadata: { labels: { app: selfdb-node } }
+    spec:
+      containers:
+        - name: node
+          image: REGISTRY/selfdb:VERSION
+          # the node id is n<ordinal>: selfdb-node-0 is n0
+          command: [/bin/sh, -c]
+          args:
+            - exec /usr/local/bin/self env-serve --data /data --listen 0.0.0.0:8650 --node "n${HOSTNAME##*-}"
+              --advertise "http://${HOSTNAME}.selfdb-nodes.selfdb.svc:8650" --coordinator http://selfdb.selfdb.svc:8650
+              --token-file /etc/selfdb/token/token --max-sessions 200 --metrics-listen 0.0.0.0:9650
+          env:
+            # sandboxes get cgroups below the container's own (its cgroup namespace)
+            - { name: SELF_SANDBOX_CGROUP, value: auto }
+          # Sandboxes need user namespaces (unconfined seccomp and AppArmor), their own /proc mounts and a
+          # writable cgroup tree: privileged is the one setting that grants all three. The container's root is
+          # root on the node; give the nodes their own machines (taints) accordingly.
+          securityContext: { privileged: true }
+          resources:
+            requests: { cpu: "8", memory: 16Gi }
+          ports: [{ containerPort: 8650 }, { containerPort: 9650, name: metrics }]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: token, mountPath: /etc/selfdb/token, readOnly: true }
+      volumes:
+        - name: token
+          secret: { secretName: selfdb-cluster-token, defaultMode: 0400 }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      # ext4 or xfs: the layers need user xattrs and whiteouts (`self env-doctor --data`)
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 200Gi } } }

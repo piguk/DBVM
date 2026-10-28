@@ -1,0 +1,32 @@
+# An environment node. Settings: /etc/selfdb/node.env (SELFDB_NODE_ARGS); the cluster token:
+# /etc/selfdb/cluster-token (root:root, 0600), handed to the service as a systemd credential.
+[Unit]
+Description=SQL-VM RL environment node
+Documentation=https://github.com/piguk/DBVM/blob/main/docs/env.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=selfdb
+Group=selfdb
+EnvironmentFile=/etc/selfdb/node.env
+# every sandbox gets a cgroup below the service's own
+Delegate=yes
+Environment=SELF_SANDBOX_CGROUP=auto
+# a sandbox running out of memory ends that sandbox, not the service
+OOMPolicy=continue
+LoadCredential=cluster-token:/etc/selfdb/cluster-token
+ExecStart=/usr/local/bin/self env-serve --data /var/lib/selfdb/node --token-file %d/cluster-token $SELFDB_NODE_ARGS
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+TasksMax=infinity
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/selfdb
+
+[Install]
+WantedBy=multi-user.target
