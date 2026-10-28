@@ -55,8 +55,9 @@ enum EnvAdmin {
              #[arg(long, default_value_t=4 << 30)] max_session_disk_bytes: i64 },
     /// Create an API key for a tenant. The key is printed once; only its digest is stored.
     Key { tenant: String },
-    /// Import a root filesystem tarball as a system template every tenant can use; prints its id.
-    Image { name: String, rootfs: String },
+    /// Import a system template every tenant can use; prints its id. PATH is a root filesystem tarball
+    /// (`docker export`), or with --oci an OCI image layout or `docker save` archive (directory or tar).
+    Image { name: String, path: String, #[arg(long)] oci: bool },
 }
 
 #[derive(Subcommand)]
@@ -369,7 +370,10 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", control.create_tenant(&store.new_id("ten")?, &name, &q)?.id);
                 }
                 EnvAdmin::Key{tenant} => println!("{}", control.create_key(&tenant)?),
-                EnvAdmin::Image{name, rootfs} => println!("{}", store.import_image(&control, &name, Path::new(&rootfs))?.id),
+                EnvAdmin::Image{name, path, oci} => {
+                    let t = if oci { store.import_oci(&control, &name, Path::new(&path))? } else { store.import_image(&control, &name, Path::new(&path))? };
+                    println!("{}", t.id);
+                },
             }
         },
         Cmd::VmResolve{db, vm_path} => {

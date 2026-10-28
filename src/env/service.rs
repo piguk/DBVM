@@ -78,6 +78,40 @@ struct Live {
     trajectory: std::fs::File,
 }
 
+/// What the sessions a request starts share: everything but their label and seed.
+struct Plan<'a> {
+    kind: Kind,
+    template: &'a Template,
+    task: &'a Option<(String, TaskSpec)>,
+    /// Layers above the template's (from forks).
+    extra: &'a [String],
+    egress: &'a [String],
+    parent: Option<&'a str>,
+}
+
+/// Places in a tenant's session limit, held for sessions being started (`Service::reserve`). Each session
+/// started takes one; the rest are given back on drop.
+struct Reservation<'a> {
+    svc: &'a Service,
+    tenant: String,
+    left: std::sync::atomic::AtomicI64,
+}
+
+impl Reservation<'_> {
+    /// A session took its place: called with the session table locked, after the session was inserted.
+    fn admit(&self) {
+        self.left.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        *self.svc.reserved.lock().unwrap().entry(self.tenant.clone()).or_insert(0) -= 1;
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let left = self.left.load(std::sync::atomic::Ordering::SeqCst);
+        *self.svc.reserved.lock().unwrap().entry(self.tenant.clone()).or_insert(0) -= left;
+    }
+}
+
 /// A session table entry. What lookups need is kept beside the session, so finding a session never waits
 /// for one that is busy running a long command.
 struct Entry {
@@ -92,12 +126,17 @@ pub struct Service {
     store: Store,
     control: ControlDb,
     sessions: Mutex<HashMap<String, Entry>>,
+    /// Per tenant, sessions being started: counted against the tenant's limit with the running ones, so
+    /// concurrent requests cannot start more than it allows. Locked after `sessions`, never before.
+    reserved: Mutex<HashMap<String, i64>>,
     /// Held while a layer exists that no session row lists yet (a fork), and while unused layers are
     /// removed, so a fresh fork layer is never collected.
     layers_lock: Mutex<()>,
 }
 
-fn base_env(task: Option<&TaskSpec>, seed: Option<u64>) -> Vec<(String, String)> {
+/// The environment of a session's commands: defaults, then the template's (an image's `Env`), then the
+/// task's, then the seed.
+fn base_env(template: &Template, task: Option<&TaskSpec>, seed: Option<u64>) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
         ("PATH".into(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()),
         ("HOME".into(), "/root".into()),
@@ -105,7 +144,10 @@ fn base_env(task: Option<&TaskSpec>, seed: Option<u64>) -> Vec<(String, String)>
         ("LANG".into(), "C.UTF-8".into()),
         ("LC_ALL".into(), "C.UTF-8".into()),
     ];
-    if let Some(t) = task { for (k, v) in &t.env { env.retain(|(n, _)| n != k); env.push((k.clone(), v.clone())); } }
+    for (k, v) in template.env.iter().map(|(k, v)| (k, v)).chain(task.map(|t| t.env.iter()).into_iter().flatten()) {
+        env.retain(|(n, _)| n != k);
+        env.push((k.clone(), v.clone()));
+    }
     if let Some(s) = seed {
         let var = task.map(|t| t.seed_env.clone()).unwrap_or_else(|| "SEED".into());
         for k in [var, "PYTHONHASHSEED".into()] { env.retain(|(n, _)| *n != k); env.push((k, s.to_string())); }
@@ -157,7 +199,7 @@ impl Service {
         let store = Store::open(data, node)?;
         let control = ControlDb::open(&data.join("control.db"))?;
         control.end_orphaned_sessions()?;
-        let svc = Arc::new(Service { store, control, sessions: Mutex::new(HashMap::new()), layers_lock: Mutex::new(()) });
+        let svc = Arc::new(Service { store, control, sessions: Mutex::new(HashMap::new()), reserved: Mutex::new(HashMap::new()), layers_lock: Mutex::new(()) });
         // the rollouts of a previous run are gone; so are the layers only they used
         crate::vm::remove_tree(&svc.store.run_dir())?;
         std::fs::create_dir_all(svc.store.run_dir())?;
@@ -226,8 +268,18 @@ impl Service {
         }
     }
 
-    fn live_count(&self, tenant: &str) -> usize {
-        self.sessions.lock().unwrap().values().filter(|e| e.tenant == tenant).count()
+    /// Hold `n` places in `t`'s session limit, or refuse if the running sessions and those being started
+    /// leave fewer.
+    fn reserve(&self, t: &Tenant, n: usize) -> EnvResult<Reservation<'_>> {
+        let map = self.sessions.lock().unwrap();
+        let mut reserved = self.reserved.lock().unwrap();
+        let running = map.values().filter(|e| e.tenant == t.id).count() as i64;
+        let r = reserved.entry(t.id.clone()).or_insert(0);
+        if running + *r + n as i64 > t.max_sessions {
+            return Err(EnvError::Quota(format!("at most {} running sessions", t.max_sessions)));
+        }
+        *r += n as i64;
+        Ok(Reservation { svc: self, tenant: t.id.clone(), left: std::sync::atomic::AtomicI64::new(n as i64) })
     }
 
     pub fn create_session(&self, t: &Tenant, req: CreateSession) -> EnvResult<String> {
@@ -235,32 +287,35 @@ impl Service {
             (Some(tid), None) => {
                 let tp = self.visible_template(t, tid)?;
                 if req.egress.len() > MAX_EGRESS_HOSTS { return Err(EnvError::BadRequest(format!("at most {} egress hosts", MAX_EGRESS_HOSTS))); }
-                self.start(t, Kind::Build, tp, None, Vec::new(), req.label, req.seed, req.egress, None)
+                let slots = self.reserve(t, 1)?;
+                let plan = Plan { kind: Kind::Build, template: &tp, task: &None, extra: &[], egress: &req.egress, parent: None };
+                self.start(t, &slots, &plan, Variant { label: req.label, seed: req.seed })
             }
             (None, Some(task_id)) => {
                 if !req.egress.is_empty() { return Err(EnvError::BadRequest("rollouts have no network; egress is for build sessions".into())); }
                 let spec = self.task(t, task_id)?;
                 let tp = self.visible_template(t, &spec.template_id)?;
-                self.start(t, Kind::Rollout, tp, Some((task_id.clone(), spec)), Vec::new(), req.label, req.seed, Vec::new(), None)
+                let slots = self.reserve(t, 1)?;
+                let task = Some((task_id.clone(), spec));
+                let plan = Plan { kind: Kind::Rollout, template: &tp, task: &task, extra: &[], egress: &[], parent: None };
+                self.start(t, &slots, &plan, Variant { label: req.label, seed: req.seed })
             }
             _ => Err(EnvError::BadRequest("give exactly one of template_id and task_id".into())),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn start(&self, t: &Tenant, kind: Kind, template: Template, task: Option<(String, TaskSpec)>, extra_layers: Vec<String>,
-             label: Option<String>, seed: Option<u64>, egress: Vec<String>, parent: Option<&str>) -> EnvResult<String> {
-        if self.live_count(&t.id) as i64 >= t.max_sessions {
-            return Err(EnvError::Quota(format!("at most {} running sessions", t.max_sessions)));
-        }
+    /// Start one session of `plan`, in a place `slots` holds.
+    fn start(&self, t: &Tenant, slots: &Reservation, plan: &Plan, v: Variant) -> EnvResult<String> {
+        let Plan { kind, template, task, extra: extra_layers, egress, parent } = *plan;
+        let (label, seed) = (v.label, v.seed);
         let ids: Vec<String> = template.layers.iter().chain(extra_layers.iter()).cloned().collect();
         let layers = self.store.layer_paths(&self.control, &ids)?;
         let spec = task.as_ref().map(|(_, s)| s);
-        let env = base_env(spec, seed);
+        let env = base_env(template, spec, seed);
         let limits = spec.map(|s| s.limits.resolve()).unwrap_or_default();
         let proxy = if !egress.is_empty() {
             let dir = WorkDir::create_in(&self.store.run_dir(), "egress-")?;
-            Some((EgressProxy::start(dir.path(), EgressPolicy { allow: egress.clone() })?, dir))
+            Some((EgressProxy::start(dir.path(), EgressPolicy { allow: egress.to_vec() })?, dir))
         } else { None };
         let opts = RolloutOptions {
             limits, env: env.clone(), readonly: spec.map(|s| s.readonly.clone()).unwrap_or_default(),
@@ -272,12 +327,49 @@ impl Service {
         if let Some(p) = traj_path.parent() { std::fs::create_dir_all(p)?; }
         let trajectory = std::fs::File::create(&traj_path)?;
         self.control.insert_session(&id, &t.id, kind.name(), &template.id, task.as_ref().map(|(i, _)| i.as_str()), parent,
-                                    label.as_deref(), seed, &extra_layers)?;
+                                    label.as_deref(), seed, extra_layers)?;
         let entry = Entry { tenant: t.id.clone(), template: template.id.clone(), started: Instant::now(), max_secs: t.max_session_secs, live: Arc::new(Mutex::new(Live {
-            tenant: t.clone(), kind, template, task, extra_layers, label, seed, env, limits, egress, rollout,
-            _proxy: proxy, steps: 0, started: Instant::now(), trajectory })) };
-        self.sessions.lock().unwrap().insert(id.clone(), entry);
+            tenant: t.clone(), kind, template: template.clone(), task: task.clone(), extra_layers: extra_layers.to_vec(), label, seed, env, limits,
+            egress: egress.to_vec(), rollout, _proxy: proxy, steps: 0, started: Instant::now(), trajectory })) };
+        let mut map = self.sessions.lock().unwrap();
+        map.insert(id.clone(), entry);
+        slots.admit();
         Ok(id)
+    }
+
+    /// Start one session of `plan` per variant, several at once (each start waits mostly on its sandbox
+    /// coming up). The results are in the variants' order.
+    fn start_many(&self, t: &Tenant, slots: &Reservation, plan: &Plan, variants: Vec<Variant>) -> Vec<EnvResult<String>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = variants.len();
+        let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(n).max(1);
+        let next = AtomicUsize::new(0);
+        let variants: Vec<Mutex<Option<Variant>>> = variants.into_iter().map(|v| Mutex::new(Some(v))).collect();
+        let results: Vec<Mutex<Option<EnvResult<String>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= n { break; }
+                    let v = variants[i].lock().unwrap().take().expect("each variant is started once");
+                    *results[i].lock().unwrap() = Some(self.start(t, slots, plan, v));
+                });
+            }
+        });
+        results.into_iter().map(|r| r.into_inner().unwrap().expect("every variant was started")).collect()
+    }
+
+    /// All the sessions `results` started, or (closing them) the first error.
+    fn all_started(&self, t: &Tenant, results: Vec<EnvResult<String>>, why: &str) -> EnvResult<Vec<String>> {
+        if !results.iter().any(|r| r.is_err()) { return Ok(results.into_iter().map(|r| r.unwrap_or_default()).collect()); }
+        let mut first = None;
+        for r in results {
+            match r {
+                Ok(id) => { let _ = self.close(t, &id, why); }
+                Err(e) => { if first.is_none() { first = Some(e); } }
+            }
+        }
+        Err(first.expect("an error was seen"))
     }
 
     pub fn act(&self, t: &Tenant, id: &str, action: Action) -> EnvResult<ActionResponse> {
@@ -287,7 +379,7 @@ impl Service {
         let mut entries = None;
         let result = match &action {
             Action::Bash { command, timeout_secs, cwd } => {
-                let cwd = cwd.clone().unwrap_or_else(|| "/".into());
+                let cwd = cwd.clone().unwrap_or_else(|| l.template.workdir.clone());
                 check_path(&cwd)?;
                 let secs = timeout_secs.unwrap_or(step_timeout).clamp(1, MAX_ACTION_SECS);
                 l.rollout.exec(&["/bin/sh".into(), "-c".into(), command.clone()], &cwd, Duration::from_secs(secs), MAX_OUTPUT)?
@@ -350,10 +442,8 @@ impl Service {
     /// New sessions starting from `id`'s current state, one per variant. The parent keeps running.
     pub fn fork(&self, t: &Tenant, id: &str, variants: Vec<Variant>) -> EnvResult<Vec<String>> {
         if variants.is_empty() { return Err(EnvError::BadRequest("no variants".into())); }
-        if self.live_count(&t.id) as i64 + variants.len() as i64 > t.max_sessions {
-            return Err(EnvError::Quota(format!("at most {} running sessions", t.max_sessions)));
-        }
-        let _g = self.layers_lock.lock().unwrap();
+        let slots = self.reserve(t, variants.len())?;
+        let g = self.layers_lock.lock().unwrap();
         let live = self.live(t, id)?;
         let (kind, template, task, mut extra, egress, parent_seed) = {
             let l = live.lock().unwrap();
@@ -368,18 +458,12 @@ impl Service {
             let merged = self.store.new_layer(&self.control, Some(&t.id), &|dest| crate::rollout::merge_layers(&paths, dest))?;
             extra = vec![merged.id];
         }
-        let mut ids = Vec::new();
-        for v in variants {
-            match self.start(t, kind, template.clone(), task.clone(), extra.clone(), v.label, v.seed.or(parent_seed), egress.clone(), Some(id)) {
-                Ok(child) => ids.push(child),
-                Err(e) => {
-                    drop(_g);
-                    for c in &ids { let _ = self.close(t, c, "fork failed"); }
-                    return Err(e);
-                }
-            }
-        }
-        Ok(ids)
+        let variants = variants.into_iter().map(|v| Variant { label: v.label, seed: v.seed.or(parent_seed) }).collect();
+        let plan = Plan { kind, template: &template, task: &task, extra: &extra, egress: &egress, parent: Some(id) };
+        let results = self.start_many(t, &slots, &plan, variants);
+        // closing a failed batch collects layers, which takes the layers lock
+        drop(g);
+        self.all_started(t, results, "fork failed")
     }
 
     /// A template of `id`'s current state, owned by the tenant.
@@ -404,14 +488,18 @@ impl Service {
         let work = WorkDir::create_in(&self.store.run_dir(), "judge-")?;
         let mut layers = self.store.layer_paths(&self.control, &l.template.layers)?;
         let own = self.store.layer_paths(&self.control, &l.extra_layers)?;
-        for (i, src) in own.iter().chain(std::iter::once(&l.rollout.upper())).enumerate() {
-            let dest = work.path().join(format!("seen{}", i));
-            copy_seen(src, &judge.sees, &dest)?;
-            layers.push(dest);
+        {
+            // the rollout's processes keep running between actions; its upper is copied as one moment
+            let _frozen = l.rollout.freeze()?;
+            for (i, src) in own.iter().chain(std::iter::once(&l.rollout.upper())).enumerate() {
+                let dest = work.path().join(format!("seen{}", i));
+                copy_seen(src, &judge.sees, &dest)?;
+                layers.push(dest);
+            }
         }
         let opts = RolloutOptions { limits: l.limits, env: l.env.clone(), readonly: Vec::new(), egress: None, work_root: Some(self.store.run_dir()), ..RolloutOptions::default() };
         let mut sandbox = Rollout::start(&layers, &opts)?;
-        let outcome = sandbox.exec(&judge.cmd, "/", Duration::from_secs(judge.timeout_secs.clamp(1, MAX_ACTION_SECS)), MAX_OUTPUT)?.outcome;
+        let outcome = sandbox.exec(&judge.cmd, &l.template.workdir, Duration::from_secs(judge.timeout_secs.clamp(1, MAX_ACTION_SECS)), MAX_OUTPUT)?.outcome;
         drop(sandbox);
         let verdict = JudgeResult::parse(&outcome);
         let line = serde_json::json!({"step": l.steps, "ts": crate::vm::now_secs(), "label": l.label, "seed": l.seed, "judge": verdict});
@@ -445,17 +533,13 @@ impl Service {
     /// One rollout of `task_id` per variant.
     pub fn rollouts(&self, t: &Tenant, task_id: &str, variants: Vec<Variant>) -> EnvResult<Vec<String>> {
         if variants.is_empty() { return Err(EnvError::BadRequest("no variants".into())); }
-        if self.live_count(&t.id) as i64 + variants.len() as i64 > t.max_sessions {
-            return Err(EnvError::Quota(format!("at most {} running sessions", t.max_sessions)));
-        }
-        let mut ids = Vec::new();
-        for v in variants {
-            match self.create_session(t, CreateSession { template_id: None, task_id: Some(task_id.into()), egress: Vec::new(), label: v.label, seed: v.seed }) {
-                Ok(id) => ids.push(id),
-                Err(e) => { for c in &ids { let _ = self.close(t, c, "rollouts failed"); } return Err(e); }
-            }
-        }
-        Ok(ids)
+        let spec = self.task(t, task_id)?;
+        let tp = self.visible_template(t, &spec.template_id)?;
+        let slots = self.reserve(t, variants.len())?;
+        let task = Some((task_id.to_string(), spec));
+        let plan = Plan { kind: Kind::Rollout, template: &tp, task: &task, extra: &[], egress: &[], parent: None };
+        let results = self.start_many(t, &slots, &plan, variants);
+        self.all_started(t, results, "rollouts failed")
     }
 
     pub fn usage(&self, t: &Tenant) -> EnvResult<Vec<SessionUsage>> { Ok(self.control.usage(&t.id)?) }

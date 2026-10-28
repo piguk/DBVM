@@ -15,6 +15,7 @@ use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 
 use super::control::{random_hex, ControlDb, Layer, Template};
+use super::oci::{self, ImageConfig};
 use crate::vm;
 
 /// Past this many layers a freeze squashes them into one materialized tree: every layer is an overlay lower
@@ -85,19 +86,38 @@ impl Store {
 
     /// A system template from a root filesystem tarball (a distribution's minimal rootfs, `docker export`).
     pub fn import_image(&self, control: &ControlDb, name: &str, rootfs: &Path) -> Result<Template> {
+        self.import_system(control, name, &|conn| {
+            vm::vm_import_tar_filtered(conn, rootfs.to_str().ok_or_else(|| anyhow!("non-utf8 path"))?, "", None, None)?;
+            Ok(ImageConfig { env: Vec::new(), workdir: "/".into() })
+        })
+    }
+
+    /// A system template from an OCI image (see `oci`): an image layout or a `docker save` archive, as a
+    /// directory or a tar file.
+    pub fn import_oci(&self, control: &ControlDb, name: &str, image: &Path) -> Result<Template> {
+        // an archive is unpacked on the data disk, next to the rollouts, and removed afterwards
+        let scratch = vm::WorkDir::create_in(&self.run_dir(), "oci-")?;
+        self.import_system(control, name, &|conn| oci::import(conn, image, scratch.path()))
+    }
+
+    fn import_system(&self, control: &ControlDb, name: &str, fill: &dyn Fn(&rusqlite::Connection) -> Result<ImageConfig>) -> Result<Template> {
         let id = self.new_id("tpl")?;
         let dir = self.owner_dir(None).join("templates").join(&id);
         std::fs::create_dir_all(&dir)?;
         let db_path = dir.join("base.db");
         let r = (|| -> Result<Template> {
             let conn = vm::init_vm_db_with_opts(db_path.to_str().ok_or_else(|| anyhow!("non-utf8 path"))?, true, true)?;
-            vm::vm_import_tar_filtered(&conn, rootfs.to_str().ok_or_else(|| anyhow!("non-utf8 path"))?, "", None, None)?;
-            for d in ["/tmp", "/root", "/dev", "/proc", "/sys"] { let _ = vm::vm_add_dir(&conn, d, if d == "/tmp" { 0o1777 } else { 0o755 }, vm::now_secs()); }
+            let image = fill(&conn)?;
+            // mount points and scratch space every sandbox expects, if the image has none
+            for d in ["/tmp", "/root", "/dev", "/proc", "/sys"] {
+                if vm::vm_stat(&conn, d).is_err() { vm::vm_add_dir(&conn, d, if d == "/tmp" { 0o1777 } else { 0o755 }, 0)?; }
+            }
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
             let layer = self.materialized_layer(control, None, &conn)?;
             drop(conn);
             let t = Template { id: id.clone(), tenant_id: None, name: name.into(), parent_id: None, layers: vec![layer.id],
-                               bytes: std::fs::metadata(&db_path)?.len() as i64, db_path: db_path.clone(), created_at: vm::now_secs() };
+                               bytes: std::fs::metadata(&db_path)?.len() as i64, db_path: db_path.clone(), env: image.env, workdir: image.workdir,
+                               created_at: vm::now_secs() };
             control.insert_template(&t)?;
             Ok(t)
         })();
@@ -133,7 +153,8 @@ impl Store {
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
             drop(conn);
             let t = Template { id: id.clone(), tenant_id: Some(tenant.into()), name: name.into(), parent_id: Some(base.id.clone()),
-                               layers, bytes: std::fs::metadata(&db_path)?.len() as i64, db_path: db_path.clone(), created_at: vm::now_secs() };
+                               layers, bytes: std::fs::metadata(&db_path)?.len() as i64, db_path: db_path.clone(),
+                               env: base.env.clone(), workdir: base.workdir.clone(), created_at: vm::now_secs() };
             control.insert_template(&t)?;
             Ok(t)
         })();

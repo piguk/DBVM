@@ -105,6 +105,13 @@ fn service_timings() {
     eprintln!("{:34} {} actions in {:?}: {:.0} actions/s", "64 concurrent sessions", 64 * 20, el, (64 * 20) as f64 / el.as_secs_f64());
     for id in many { s.svc.close(&t, &id, "perf").unwrap(); }
 
+    // one batch of 500 rollouts, started in parallel
+    let t0 = Instant::now();
+    let batch = s.svc.rollouts(&t, &task, (0..500).map(|i| Variant { label: None, seed: Some(i) }).collect()).unwrap();
+    let took = t0.elapsed();
+    eprintln!("{:34} {:?} total, {:.2} ms each", "500 rollouts in one batch", took, took.as_secs_f64() * 1e3 / 500.0);
+    for id in batch { s.svc.close(&t, &id, "perf").unwrap(); }
+
     // a long trajectory: every step adds a file, so the upper directory grows by one entry per step; each
     // step's change list (and the disk quota) scan the whole upper
     let long = create();

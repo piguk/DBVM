@@ -18,7 +18,8 @@ rollout 的根是 bwrap overlay：lower 为模板的各层，upper 为 rollout �
 
 ```sh
 cargo build --release
-self env-admin --data /srv/env image import debian /path/to/debian-rootfs.tar   # 系统模板
+self env-admin --data /srv/env image python /path/to/image.tar --oci             # 系统模板：OCI 镜像
+self env-admin --data /srv/env image debian /path/to/debian-rootfs.tar           # 或 rootfs tarball
 self env-admin --data /srv/env tenant lab-a --max-sessions 1000                  # 打印租户 id
 self env-admin --data /srv/env key <tenant-id>                                   # 打印 API key，只显示一次
 self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
@@ -27,6 +28,7 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 - 以 systemd 服务运行，`Delegate=yes`，并设置 `SELF_SANDBOX_CGROUP` 为服务自身的 cgroup：每个 sandbox 一个子 cgroup（见 `docs/vm.md`「安全边界」）。
 - 数据目录布局见 `src/env/store.rs`；`run/` 为运行中 rollout 的 upper，服务重启时清空。
 - `env-admin` 只打开控制库与存储，不影响运行中的服务。
+- `image --oci` 接受 OCI image layout（`skopeo copy docker://python:3.12-alpine oci:DIR`、`docker buildx build --output type=oci`）或 `docker save` 的输出，目录或 tar 文件均可。多架构镜像取 linux/本机架构。各层按顺序应用（含 whiteout 与 opaque 目录）；每层解压后的内容按 config 的 `rootfs.diff_ids` 校验，image layout 中的每个 blob 按其 digest 校验，不符则拒绝导入。config 的 `Env` 与 `WorkingDir` 成为模板的环境变量与默认工作目录（任务的 `env` 覆盖镜像的）；`Entrypoint`、`Cmd`、`User` 不使用（命令以 sandbox 内的 root 执行）。不从 registry 拉取：先用 skopeo 或 docker 取到本地。
 - `env-serve` 启动时进入一个只映射自身 uid/gid 的 user namespace，保留 `CAP_DAC_OVERRIDE`、`CAP_DAC_READ_SEARCH`、`CAP_FOWNER`（只对本用户的文件有效）。原因：agent 在 sandbox 内是 root，可以把目录设为 000；没有这些权限，宿主侧的复制、diff 和磁盘配额统计会读不到这些目录。在该 namespace 中 setuid 程序不生效，因此 bwrap 不能依赖 setuid 安装。
 - 所有 rollout 共用进程内的一个 inotify 实例；每个 rollout 的 upper 中每个目录占用一个 watch。`fs.inotify.max_user_watches` 用尽后，无法再添加 watch 的 rollout 改为每步遍历 upper（结果不变，变慢），需要时调大该值。
 - 节点 id（`--node`）是所有对象 id 的前缀，为多节点路由预留。
@@ -42,7 +44,7 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 | POST | `/v1/tasks` | 创建任务，返回 `task_id` |
 | GET | `/v1/tasks/{id}` | 任务定义 |
 | POST | `/v1/sessions` | `{"template_id", "egress": [...]}` 创建 build session；`{"task_id", "label", "seed"}` 创建 rollout |
-| POST | `/v1/rollouts` | `{"task_id", "variants": [{"label", "seed"}, ...]}`：同一起点的多个 rollout |
+| POST | `/v1/rollouts` | `{"task_id", "variants": [{"label", "seed"}, ...]}`：同一起点的多个 rollout，并行启动；全部成功或全部不启动，返回顺序与 `variants` 一致 |
 | POST | `/v1/sessions/{id}/actions` | 执行一个动作 |
 | POST | `/v1/actions` | `[{"session_id", "action"}, ...]`：多个 session 各执行一个动作，并发进行 |
 | POST | `/v1/sessions/{id}/fork` | `{"variants": [...]}`：从当前文件系统状态分叉；父 session 继续运行（见下文「fork」） |
@@ -99,7 +101,7 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 
 | 配额 | 默认 |
 |---|---|
-| 同时运行的 session 数 | 256 |
+| 同时运行的 session 数（含正在启动的；并发请求同样受限） | 256 |
 | 存储（模板数据库与层） | 50 GiB |
 | 单个 session 的最长运行时间 | 4 小时（超时由服务关闭） |
 | 单个 session 写入的总字节数 | 4 GiB（超出时该步失败并关闭 session） |
@@ -116,9 +118,10 @@ self env-serve --data /srv/env --listen 0.0.0.0:8650 --node n1
 | fork 一个子 rollout（含冻结父 rollout） | p50 18.2–22.9 ms（两次运行） |
 | 空动作（服务内 / 经 HTTP） | p50 1.34 ms / 1.49 ms |
 | 500 个空闲 rollout | 依次启动共 10.5 s；每个 sandbox cgroup 的 `memory.current` 约 800 KiB（anon 343 KiB，内核 444 KiB，page cache 0） |
-| 64 个 session 并发、每个 20 次写读动作 | 7103 动作/秒 |
+| 一次请求批量启动 500 个 rollout（并行） | 共 2.0–2.3 s（每个 4.0–4.6 ms）；逐个启动共 11.5 s |
+| 64 个 session 并发、每个 20 次写读动作 | 7103 动作/秒（机器空闲时）；宿主另有约 3 核负载时 6000–6400 |
 | 长轨迹：5000 步，每步新增一个文件 | 第 1–100 步 p50 1.35 ms，第 4901–5000 步 p50 1.35 ms、mean 1.65 ms（每 64 步一次全量遍历）；改为增量之前，第 4901–5000 步 p50 为 21.3 ms |
 
 ## 不在当前范围内
 
-多节点调度与模板分发、gVisor 下的 overlay rollout（gVisor 的 overlay 以自有格式保存写入，宿主无法逐路径读取）、rollout 的逐步 undo 与从历史步骤分叉（以 fork 代替）、运行态（进程与内存）的 fork、从 Docker 镜像导入、计费与支付、虚拟时钟、PTY 与端口暴露。批量创建 rollout 目前依次启动。
+多节点调度与模板分发、gVisor 下的 overlay rollout（gVisor 的 overlay 以自有格式保存写入，宿主无法逐路径读取）、rollout 的逐步 undo 与从历史步骤分叉（以 fork 代替）、运行态（进程与内存）的 fork、从 Docker 镜像导入、计费与支付、虚拟时钟、PTY 与端口暴露。

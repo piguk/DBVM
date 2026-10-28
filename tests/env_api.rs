@@ -122,4 +122,58 @@ fn deep_fork_chains_and_directories_the_agent_locked() {
     // written, then locked: still counted against the disk quota
     let (code, body) = a.req("POST", &format!("/v1/sessions/{}/actions", sid), Some(json!({"tool": "bash", "command": "mkdir /w/h && head -c 2097152 /dev/zero > /w/h/big && chmod 000 /w/h"})));
     assert_eq!(code, 429, "{}", body);
+    // /tmp is left out of change lists, not out of the disk the rollout uses
+    let sid = a.ok("POST", "/v1/sessions", Some(json!({"template_id": image.id})))["session_id"].as_str().unwrap().to_string();
+    let (code, body) = a.req("POST", &format!("/v1/sessions/{}/actions", sid), Some(json!({"tool": "bash", "command": "head -c 2097152 /dev/zero > /tmp/big"})));
+    assert_eq!(code, 429, "{}", body);
+}
+
+#[test]
+fn the_session_limit_holds_under_concurrent_requests() {
+    if !bwrap_ok() { return; }
+    let s = start("limit");
+    let image = s.svc.store().import_image(s.svc.control(), "mini", &rootfs(&s.dir)).unwrap();
+    let a = tenant(&s, "a", Quotas { max_sessions: 3, ..Quotas::default() });
+    // every request passes a check of the running sessions before any of them is running
+    let codes: Vec<u16> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..8).map(|_| sc.spawn(|| a.req("POST", "/v1/sessions", Some(json!({"template_id": image.id}))).0)).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(codes.iter().filter(|c| **c == 200).count(), 3, "{:?}", codes);
+    assert_eq!(codes.iter().filter(|c| **c == 429).count(), 5, "{:?}", codes);
+    let t = s.svc.authenticate(&a.key).unwrap();
+    let running = s.svc.usage(&t).unwrap().into_iter().filter(|u| u.ended_at.is_none()).count();
+    assert_eq!(running, 3);
+}
+
+#[test]
+fn a_batch_starts_in_parallel_all_or_nothing() {
+    if !bwrap_ok() { return; }
+    let s = start("batch");
+    let a = tenant(&s, "a", Quotas { max_sessions: 40, ..Quotas::default() });
+    let task = calc_task(&s, &a);
+    let variants: Vec<serde_json::Value> = (0..32).map(|i| json!({"label": format!("v{}", i), "seed": i})).collect();
+    let ids: Vec<String> = a.ok("POST", "/v1/rollouts", Some(json!({"task_id": task, "variants": variants})))["session_ids"]
+        .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(ids.len(), 32);
+    // in the variants' order, each with its own seed
+    for (i, id) in ids.iter().enumerate() { assert_eq!(a.bash(id, "echo $SEED")["output"], format!("{}\n", i)); }
+    // more than the limit leaves: refused, and nothing of the batch keeps running
+    let (code, _) = a.req("POST", "/v1/rollouts", Some(json!({"task_id": task, "variants": (0..9).map(|_| json!({})).collect::<Vec<_>>()})));
+    assert_eq!(code, 429);
+    let t = s.svc.authenticate(&a.key).unwrap();
+    assert_eq!(s.svc.usage(&t).unwrap().into_iter().filter(|u| u.ended_at.is_none()).count(), 32);
+}
+
+#[test]
+fn a_session_outlives_the_thread_that_started_it() {
+    // bwrap --die-with-parent follows the thread that forked it; the server's blocking threads exit after
+    // 10 s without work, and every session they had started died with them
+    if !bwrap_ok() { return; }
+    let s = start("idle");
+    let image = s.svc.store().import_image(s.svc.control(), "mini", &rootfs(&s.dir)).unwrap();
+    let a = tenant(&s, "a", Quotas::default());
+    let sid = a.ok("POST", "/v1/sessions", Some(json!({"template_id": image.id})))["session_id"].as_str().unwrap().to_string();
+    std::thread::sleep(std::time::Duration::from_secs(13));
+    assert_eq!(a.bash(&sid, "echo alive")["output"], "alive\n");
 }

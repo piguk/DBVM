@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS templates(
     layers TEXT NOT NULL,
     db_path TEXT NOT NULL,
     bytes INTEGER NOT NULL,
+    env TEXT NOT NULL DEFAULT '[]',
+    workdir TEXT NOT NULL DEFAULT '/',
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE TABLE IF NOT EXISTS tasks(
@@ -97,6 +99,10 @@ pub struct Template {
     #[serde(skip)]
     pub db_path: PathBuf,
     pub bytes: i64,
+    /// The environment commands start with (an image's `Env`), under the task's own.
+    pub env: Vec<(String, String)>,
+    /// Where commands start (an image's `WorkingDir`).
+    pub workdir: String,
     pub created_at: i64,
 }
 
@@ -133,9 +139,10 @@ fn template_row(r: &rusqlite::Row) -> rusqlite::Result<Template> {
         id: r.get(0)?, tenant_id: r.get(1)?, name: r.get(2)?, parent_id: r.get(3)?,
         layers: serde_json::from_str(&layers).unwrap_or_default(),
         db_path: PathBuf::from(r.get::<_, String>(5)?), bytes: r.get(6)?, created_at: r.get(7)?,
+        env: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(), workdir: r.get(9)?,
     })
 }
-const TEMPLATE_COLS: &str = "id, tenant_id, name, parent_id, layers, db_path, bytes, created_at";
+const TEMPLATE_COLS: &str = "id, tenant_id, name, parent_id, layers, db_path, bytes, created_at, env, workdir";
 
 fn tenant_row(r: &rusqlite::Row) -> rusqlite::Result<Tenant> {
     Ok(Tenant { id: r.get(0)?, name: r.get(1)?, max_sessions: r.get(2)?, max_storage_bytes: r.get(3)?, max_session_secs: r.get(4)?, max_session_disk_bytes: r.get(5)? })
@@ -215,8 +222,9 @@ impl ControlDb {
 
     pub fn insert_template(&self, t: &Template) -> Result<()> {
         self.with(|c| {
-            c.execute("INSERT INTO templates(id, tenant_id, name, parent_id, layers, db_path, bytes) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![t.id, t.tenant_id, t.name, t.parent_id, serde_json::to_string(&t.layers)?, t.db_path.to_string_lossy(), t.bytes])?;
+            c.execute("INSERT INTO templates(id, tenant_id, name, parent_id, layers, db_path, bytes, env, workdir) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![t.id, t.tenant_id, t.name, t.parent_id, serde_json::to_string(&t.layers)?, t.db_path.to_string_lossy(), t.bytes,
+                        serde_json::to_string(&t.env)?, t.workdir])?;
             Ok(())
         })
     }
