@@ -3,41 +3,12 @@
 //! stand-in that answers with tool calls), writing rollouts with rewards and advantages.
 mod env_common;
 use env_common::*;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 struct Killed(Child);
 impl Drop for Killed { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
-
-/// A chat-completions endpoint that writes the answer with its first tool call and submits with its second.
-fn fake_model() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = l.local_addr().unwrap().port();
-    std::thread::spawn(move || for c in l.incoming().flatten() {
-        let mut r = BufReader::new(c.try_clone().unwrap());
-        let mut len = 0usize;
-        loop {
-            let mut line = String::new();
-            if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" { break; }
-            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") { len = v.trim().parse().unwrap_or(0); }
-        }
-        let mut body = vec![0u8; len];
-        let _ = r.read_exact(&mut body);
-        let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-        let tools_done = req["messages"].as_array().map(|m| m.iter().filter(|x| x["role"] == "tool").count()).unwrap_or(0);
-        let call = if tools_done == 0 {
-            serde_json::json!({"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": "{\"path\": \"/work/answer\", \"content\": \"42\\n\"}"}})
-        } else {
-            serde_json::json!({"id": "c2", "type": "function", "function": {"name": "submit", "arguments": "{}"}})
-        };
-        let resp = serde_json::json!({"choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]}}]}).to_string();
-        let mut c = c;
-        let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", resp.len(), resp).as_bytes());
-    });
-    port
-}
 
 #[test]
 fn one_machine_one_command() {
@@ -68,7 +39,10 @@ fn one_machine_one_command() {
         ["task_id"].as_str().unwrap().to_string();
     std::fs::write(dir.join("tasks.json"), serde_json::json!([{"task_id": task, "instruction": "Write 42 to /work/answer."}]).to_string()).unwrap();
 
-    let model = fake_model();
+    let model = fake_model(vec![
+        serde_json::json!({"name": "write_file", "arguments": "{\"path\": \"/work/answer\", \"content\": \"42\\n\"}"}),
+        serde_json::json!({"name": "submit", "arguments": "{}"}),
+    ]);
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new("python3").arg("-B").arg(root.join("sdk/python/examples/local_agent.py")).arg(dir.join("tasks.json"))
         .args(["--model", &format!("http://127.0.0.1:{}/v1", model), "--group", "3", "--out"]).arg(dir.join("rollouts.jsonl"))

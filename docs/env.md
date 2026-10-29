@@ -160,13 +160,14 @@ self env-admin --data /srv/env image eda eda.tar --oci       # 镜像导入到�
 
 ## 任务包
 
-任务包用 `packs/packkit` 生成与检查（候选任务 → 起始状态与解答校验 → 作弊用例检查），见其 README。
+任务包用 `packs/packkit` 生成与检查（候选任务 → 起始状态与解答校验 → 作弊用例检查），见其 README。判分能否被绕过，用 `packkit audit`（不需要模型：平凡答案、测试框架 hook 文件、判分脚本与答案是否可见）和 `packkit redteam`（让模型尝试绕过判分，记录得分异常的轨迹）检查。
 
 | 包 | 内容 |
 |---|---|
 | `packs/eda/` | Verilator（RTL 修复）与 ngspice（电路参数） |
 | `packs/data/` | 公司数据上的 SQL / CSV 分析与报表，期望结果为判分专用文件 |
 | `packs/ops/` | 日志排障、服务配置修复、经 API 操作有状态服务（任务服务） |
+| `packs/repo/` | 由客户自己的仓库生成：变异（单点注入缺陷）与 git 历史（撤销过去的修复），以仓库已有的测试判分 |
 
 ## 个人使用
 

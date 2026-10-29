@@ -108,3 +108,30 @@ pub fn calc_task(s: &Server, c: &Client) -> String {
         "judge": {"cmd": ["/bin/sh", "/tests/judge.sh"], "sees": ["/app"]}
     })))["task_id"].as_str().unwrap().to_string()
 }
+
+/// A chat-completions endpoint (OpenAI's format) that answers the n-th request of a conversation with the n-th of
+/// `calls` (each {"name", "arguments"}) as a tool call: n is the number of tool results in the request.
+pub fn fake_model(calls: Vec<Value>) -> u16 {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || for c in l.incoming().flatten() {
+        let mut r = BufReader::new(c.try_clone().unwrap());
+        let mut len = 0usize;
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" { break; }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") { len = v.trim().parse().unwrap_or(0); }
+        }
+        let mut body = vec![0u8; len];
+        let _ = r.read_exact(&mut body);
+        let req: Value = serde_json::from_slice(&body).unwrap_or_default();
+        let n = req["messages"].as_array().map(|m| m.iter().filter(|x| x["role"] == "tool").count()).unwrap_or(0);
+        let call = calls.get(n).or(calls.last()).cloned().unwrap_or(json!({"name": "submit", "arguments": "{}"}));
+        let resp = json!({"choices": [{"message": {"role": "assistant", "content": null,
+            "tool_calls": [{"id": format!("c{}", n), "type": "function", "function": call}]}}]}).to_string();
+        let mut c = c;
+        let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", resp.len(), resp).as_bytes());
+    });
+    port
+}

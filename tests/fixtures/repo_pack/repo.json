@@ -1,0 +1,14 @@
+{
+  "name": "calc",
+  "checkout": "calc",
+  "root": "/work/repo",
+  "include": ["calc/**/*.py"],
+  "exclude": ["**/__init__.py"],
+  "hidden": ["tests/test_hidden.py"],
+  "checks": [
+    {"name": "unit", "cmd": "python3 /judge/unittest_junit.py -s tests -t . -o /tmp/unit.xml", "junit": "/tmp/unit.xml",
+     "agent_cmd": "python3 -m unittest discover -s tests -t .", "timeout": 60}
+  ],
+  "modes": ["mutation", "history"],
+  "history": {"commits": 50}
+}

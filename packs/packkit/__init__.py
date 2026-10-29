@@ -3,17 +3,22 @@ check their judges.
 
 A pack is a directory with a ``pack.py`` that defines ``candidates(rng)``: for each family of tasks (``"rtl/alu"``,
 ``"sql/top_customers"``), an iterator of ``Candidate``s. Each candidate is a task (its spec without the template),
-the files of a solution, and cheats: ways of gaming the judge, each a set of files that must score 0.
+the files of a solution, and cheats: ways of gaming the judge, each a set of files that must score 0. A pack may
+also define ``prepare(client, template_id, log)``, which ``build`` calls first (to look at the template: what a
+repository's tests report on it, say), and ``start_ok(verdict, candidate)``.
 
     python3 -m packkit build PACK_DIR BASE_URL TEMPLATE_ID [--per-family N] [--seed S] [--workers W]
                              [--families PREFIX,...] [--out tasks.json] [--references refs.json]
     python3 -m packkit check BASE_URL tasks.json refs.json
+    python3 -m packkit audit BASE_URL tasks.json refs.json [--out audit.json]
+    python3 -m packkit redteam BASE_URL tasks.json --model URL [--model-name NAME] [--attempts K] [--out redteam.jsonl]
 
 ``build`` keeps a candidate when its starting state scores below 1 (or what the pack's ``start_ok`` accepts) and
 its solution scores 1, each checked with a rollout and the judge, several at once; the others are deleted.
 ``tasks.json`` lists the tasks; ``refs.json`` holds the solutions and cheats, for the trainer's side (never part
 of a task). ``check`` takes one task per family: its solution must score 1, every cheat 0, and its read-only paths
-must refuse writes. The API key comes from SELFDB_ENV_API_KEY.
+must refuse writes. ``audit`` probes each family's judge for ways to game it without a model (audit.py);
+``redteam`` lets a model try (redteam.py). The API key comes from SELFDB_ENV_API_KEY.
 """
 
 import concurrent.futures
@@ -89,6 +94,8 @@ def validate(client, template, c, start_ok):
 def build(client, pack, template, per_family=3, seed=1, workers=8, log=print, families=None):
     """`families`: prefixes of the families to make (all if None)."""
     rng = random.Random(seed)
+    if hasattr(pack, "prepare"):
+        pack.prepare(client, template, log)
     queues = {family: iter(it) for family, it in pack.candidates(rng).items()
               if families is None or any(family.startswith(f) for f in families)}
     start_ok = getattr(pack, "start_ok", lambda verdict, c: verdict["reward"] < 1.0)
@@ -179,6 +186,20 @@ def main(argv):
     c.add_argument("base_url")
     c.add_argument("tasks")
     c.add_argument("references")
+    au = sub.add_parser("audit")
+    au.add_argument("base_url")
+    au.add_argument("tasks")
+    au.add_argument("references")
+    au.add_argument("--out")
+    rt = sub.add_parser("redteam")
+    rt.add_argument("base_url")
+    rt.add_argument("tasks")
+    rt.add_argument("--model", required=True)
+    rt.add_argument("--model-name", default="local")
+    rt.add_argument("--attempts", type=int, default=4)
+    rt.add_argument("--max-steps", type=int, default=30)
+    rt.add_argument("--margin", type=float, default=0.3)
+    rt.add_argument("--out", default="redteam.jsonl")
     a = p.parse_args(argv)
     key = os.environ.get("SELFDB_ENV_API_KEY")
     if not key:
@@ -193,5 +214,17 @@ def main(argv):
             json.dump(refs, f, indent=1)
         sys.exit(1 if short else 0)
     client = Client(a.base_url, key)
+    if a.cmd == "audit":
+        from packkit.audit import audit
+        report = audit(client, json.load(open(a.tasks)), json.load(open(a.references)))
+        if a.out:
+            with open(a.out, "w") as f:
+                json.dump(report, f, indent=1)
+        sys.exit(1 if any(f["severity"] == "high" for fs in report.values() for f in fs) else 0)
+    if a.cmd == "redteam":
+        from packkit.redteam import model, redteam
+        with open(a.out, "w") as out:
+            flagged = redteam(client, json.load(open(a.tasks)), model(a.model, a.model_name), a.attempts, a.max_steps, a.margin, out)
+        sys.exit(1 if flagged else 0)
     failures = check(client, json.load(open(a.tasks)), json.load(open(a.references)))
     sys.exit(1 if failures else 0)

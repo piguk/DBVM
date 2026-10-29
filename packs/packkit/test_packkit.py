@@ -1,5 +1,5 @@
 """packkit.build against a fake service: it stops at the count asked, gives up on families that never yield a
-task, and refuses a pack whose generators mix up families.
+task, refuses a pack whose generators mix up families, and runs the pack's prepare first. And packkit.mutate.
 
     PYTHONPATH=packs:sdk/python python3 -m unittest packkit.test_packkit
 """
@@ -10,6 +10,7 @@ import types
 import unittest
 
 import packkit
+from packkit.mutate import mutations
 
 
 class FakeSession:
@@ -68,6 +69,36 @@ class Build(unittest.TestCase):
             return {"a": iter([candidate("b")]), "b": iter([candidate("b")])}
         with self.assertRaises(ValueError):
             packkit.build(FakeClient(), types.SimpleNamespace(candidates=candidates), "tpl", per_family=1, log=lambda *_: None)
+
+    def test_prepare_runs_before_the_candidates(self):
+        seen = []
+        def prepare(client, template, log):
+            seen.append(("prepare", template))
+        def candidates(rng):
+            seen.append("candidates")
+            return {"a": iter([candidate("a")])}
+        packkit.build(FakeClient(), types.SimpleNamespace(prepare=prepare, candidates=candidates), "tpl", per_family=1, log=lambda *_: None)
+        self.assertEqual(seen, [("prepare", "tpl"), "candidates"])
+
+
+class Mutate(unittest.TestCase):
+    def kinds(self, src, lang):
+        return [d.rsplit(" at line", 1)[0] for d, _ in mutations(src, lang)]
+
+    def test_python_operators_constants_and_conditions(self):
+        src = 'def f(a, b):\n    if a > 0 and not b:\n        return a * 2  # a + b\n    return "x-y"\n'
+        self.assertEqual(sorted(self.kinds(src, "python")),
+                         sorted(["> -> <", "0 -> 1", "and -> or", "not removed", "condition negated", "* -> /", "2 -> 3", "2 -> 1"]))
+
+    def test_python_leaves_unary_and_compound_operators_and_drops_what_does_not_compile(self):
+        src = "def f(a, *args, **kw) -> int:\n    a += -1\n    return a ** 2 // 3\n"
+        for d, m in mutations(src, "python"):
+            compile(m, "m", "exec")
+        self.assertEqual(sorted(self.kinds(src, "python")), sorted(["1 -> 2", "1 -> 0", "2 -> 3", "2 -> 1", "3 -> 4", "3 -> 2"]))
+
+    def test_c_leaves_pointers_strings_comments_and_indexes(self):
+        src = 'int g(int *p, int n) { if (n < 4) return p[n + 1]; /* a - b */ puts("a+b"); return *p - n; }\n'
+        self.assertEqual(sorted(self.kinds(src, "c")), sorted(["< -> >", "4 -> 5", "4 -> 3", "condition negated", "- -> +"]))
 
 
 if __name__ == "__main__":

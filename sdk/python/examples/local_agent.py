@@ -14,66 +14,15 @@ key, if it needs one, comes from OPENAI_API_KEY.
 import argparse
 import concurrent.futures
 import json
-import os
 import statistics
-import urllib.request
 
 from selfdb_env import Client
-
-SYSTEM = ("You work in a Linux sandbox through tools. Do the task, check your work, then call submit. "
-          "Each tool returns its output.")
-
-TOOLS = [
-    {"name": "bash", "description": "Run a shell command.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace the one occurrence of old with new in a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, "required": ["path", "old", "new"]}},
-    {"name": "list_dir", "description": "List a directory.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-    {"name": "submit", "description": "Finish: the work is done.", "parameters": {"type": "object", "properties": {}}},
-]
-
-# what one tool result may put in the context
-MAX_RESULT = 8000
+from selfdb_env.agent import Model, run_episode
 
 
-def chat(model, model_name, messages):
-    body = {"model": model_name, "messages": messages, "tools": [{"type": "function", "function": t} for t in TOOLS]}
-    req = urllib.request.Request(model.rstrip("/") + "/chat/completions", data=json.dumps(body).encode(), method="POST")
-    req.add_header("Content-Type", "application/json")
-    if os.environ.get("OPENAI_API_KEY"):
-        req.add_header("Authorization", "Bearer " + os.environ["OPENAI_API_KEY"])
-    with urllib.request.urlopen(req, timeout=600) as r:
-        return json.load(r)["choices"][0]["message"]
-
-
-def tool_result(r):
-    text = r["output"] if r["exit_code"] == 0 else "exit %d\n%s%s" % (r["exit_code"], r["output"], r["stderr"])
-    if r.get("entries") is not None:
-        text = "\n".join("%s %s" % (e["kind"], e["name"]) for e in r["entries"])
-    return text[-MAX_RESULT:]
-
-
-def rollout(session, instruction, model, model_name, max_steps):
-    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": instruction}]
-    steps = 0
+def rollout(session, instruction, model, max_steps):
     try:
-        while steps < max_steps:
-            msg = chat(model, model_name, messages)
-            messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
-            calls = msg.get("tool_calls") or []
-            if not calls:
-                messages.append({"role": "user", "content": "Use the tools; call submit when you are done."})
-                steps += 1
-                continue
-            for call in calls:
-                name, args = call["function"]["name"], json.loads(call["function"].get("arguments") or "{}")
-                if name == "submit":
-                    verdict = session.judge()
-                    return messages, verdict, steps
-                r = session.act(dict(args, tool=name))
-                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": tool_result(r)})
-                steps += 1
-        return messages, session.judge(), steps
+        return run_episode(session, instruction, model, max_steps)
     finally:
         session.close()
 
@@ -92,7 +41,8 @@ def main():
     with open(a.out, "w") as out, concurrent.futures.ThreadPoolExecutor(a.group) as pool:
         for t in tasks:
             sessions = env.rollouts(t["task_id"], [{"label": "g%d" % i, "seed": i} for i in range(a.group)])
-            results = list(pool.map(lambda s: rollout(s, t["instruction"], a.model, a.model_name, a.max_steps), sessions))
+            model = Model(a.model, a.model_name)
+            results = list(pool.map(lambda s: rollout(s, t["instruction"], model, a.max_steps), sessions))
             rewards = [v["reward"] or 0.0 for _, v, _ in results]
             mean, std = statistics.fmean(rewards), statistics.pstdev(rewards)
             for i, (messages, verdict, steps) in enumerate(results):
